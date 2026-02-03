@@ -1,0 +1,258 @@
+import { NextRequest } from 'next/server';
+import { supabase } from '@/lib/supabase';
+import { log } from '@/lib/logger';
+import { ok, err, withErrorHandler } from '@/lib/api-helpers';
+import {
+  countActiveVerifyingRuns,
+  dispatchClaimsForRun,
+  dispatchNextClaim,
+  INTER_CLAIM_COOLDOWN_MS,
+  MAX_CONCURRENT_RUNS,
+} from '@/lib/claim-dispatcher';
+import type { DbVerificationRun, DbAgentLog, DbClaimWithEvidence, DbProject } from '@/lib/db-types';
+
+const STUCK_CHECKING_MS = 15 * 60 * 1000; // 15 min — TOKEN_CREATION can take up to 12 min (Browserless retries + 6 min session)
+
+function claimStartTimes(logs: DbAgentLog[]): Map<string, number> {
+  const map = new Map<string, number>();
+  for (const logRow of logs) {
+    const match = logRow.message.match(/^claim-start:([a-f0-9-]+)$/i);
+    if (!match) continue;
+    const ts = new Date(logRow.created_at).getTime();
+    if (!Number.isNaN(ts)) map.set(match[1], ts);
+  }
+  return map;
+}
+
+export const GET = withErrorHandler(async (req: Request) => {
+  const { searchParams } = new URL((req as NextRequest).url);
+  const runId = searchParams.get('runId')?.trim();
+
+  if (!runId) {
+    return err('runId query parameter is required');
+  }
+
+  const [runResult, claimsResult, logsResult] = await Promise.all([
+    supabase
+      .from('verification_runs')
+      .select('*')
+      .eq('id', runId)
+      .single<DbVerificationRun>(),
+
+    supabase
+      .from('claims')
+      .select('*, evidence_items(*)')
+      .eq('verification_run_id', runId)
+      .order('created_at', { ascending: true })
+      .returns<DbClaimWithEvidence[]>(),
+
+    supabase
+      .from('agent_logs')
+      .select('*')
+      .eq('verification_run_id', runId)
+      .order('created_at', { ascending: true })
+      .returns<DbAgentLog[]>(),
+  ]);
+
+  if (runResult.error || !runResult.data) {
+    return err('Verification run not found', 404);
+  }
+
+  const run = runResult.data;
+  let claims = claimsResult.data ?? [];
+  const logs = logsResult.data ?? [];
+
+  // Fetch the associated project so callers don't need a second round-trip
+  const { data: project } = await supabase
+    .from('projects')
+    .select('*')
+    .eq('id', run.project_id)
+    .maybeSingle<DbProject>();
+
+  const origin = new URL((req as NextRequest).url).origin;
+
+  // ── Auto-heal stuck claims ────────────────────────────────────────────────
+  // Claims stuck in "checking" beyond the threshold get marked untestable so
+  // the run can complete and the queue can advance.
+  if (run.status !== 'complete' && run.status !== 'failed') {
+    const now = Date.now();
+    let healed = false;
+    const startTimes = claimStartTimes(logs);
+
+    for (const claim of claims) {
+      const startTs = startTimes.get(claim.id) ?? new Date(claim.created_at).getTime();
+      const age = now - startTs;
+      const stuckChecking = claim.status === 'checking' && age > STUCK_CHECKING_MS;
+
+      if (stuckChecking) {
+        console.warn(`[verify/status] Auto-healing stuck claim ${claim.id} (checking for ${Math.round(age / 1000)}s)`);
+        await supabase.from('claims').update({ status: 'untestable' }).eq('id', claim.id);
+        await log(runId, `Claim timed out — browser worker exceeded time limit`);
+        claim.status = 'untestable';
+        healed = true;
+      }
+    }
+
+    // Close the run when every claim is in a terminal state.
+    // IMPORTANT: `[].every(...)` is true in JS — never auto-complete when the
+    // claims query came back empty (race before rows exist, or transient error),
+    // or the run will flip to "complete" while workers are still enqueueing.
+    const allDone =
+      claims.length > 0 &&
+      claims.every((c) => c.status !== 'pending' && c.status !== 'checking');
+    if (allDone && run.status !== 'pending') {
+      await supabase.from('verification_runs').update({ status: 'complete' }).eq('id', runId);
+      await log(runId, 'Verification complete');
+      run.status = 'complete';
+      if (healed) {
+        console.log(`[verify/status] Auto-completed run ${runId} after healing stuck claims`);
+      } else {
+        console.log(`[verify/status] Closing stale verifying run ${runId} — all claims already terminal`);
+      }
+    }
+  }
+
+  // ── Resume stalled sequential dispatch ───────────────────────────────────
+  // If a daisy-chain link broke (serverless freeze, HTTP error), pending claims
+  // sit idle while no worker is in `checking`. Re-dispatch on the next poll.
+  // Require at least one terminal claim so we don't race initial dispatch
+  // (all-pending / no-checking is normal before the first worker stakes).
+  if (run.status === 'verifying') {
+    const pendingCount = claims.filter((c) => c.status === 'pending').length;
+    const checkingCount = claims.filter((c) => c.status === 'checking').length;
+    const terminalCount = claims.filter((c) =>
+      c.status !== 'pending' && c.status !== 'checking',
+    ).length;
+
+    if (pendingCount > 0 && checkingCount === 0 && terminalCount > 0) {
+      console.log(
+        `[verify/status] Resuming sequential dispatch for run ${runId} (${pendingCount} pending)`,
+      );
+      dispatchNextClaim(runId, origin, INTER_CLAIM_COOLDOWN_MS).catch((e) =>
+        console.error('[verify/status] Failed to resume claim dispatch:', e),
+      );
+    }
+  }
+
+  // ── Queue advancement: dispatch next pending run when a slot is free ─────
+  // Strategy: only the OLDEST LIVE pending run self-promotes when it polls.
+  // Dead pending runs (no pending claims — stale from crashed/re-run sessions)
+  // are auto-completed first so they don't block the queue.
+  if (run.status === 'pending') {
+    // Find the oldest pending run that actually has pending claims (live run)
+    const { data: pendingRuns } = await supabase
+      .from('verification_runs')
+      .select('id, created_at')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: true })
+      .limit(20)
+      .returns<{ id: string; created_at: string }[]>();
+
+    // Clean up orphan pending runs ahead in queue (no claim rows at all).
+    // Never mark runs with pending/checking claims — avoids cross-user griefing.
+    const ABANDONED_PENDING_MS = 5 * 60 * 1000;
+    for (const candidate of (pendingRuns ?? [])) {
+      if (candidate.id === runId) break;
+
+      const [{ count: totalClaims }, { count: activeClaimCount }] = await Promise.all([
+        supabase
+          .from('claims')
+          .select('id', { count: 'exact', head: true })
+          .eq('verification_run_id', candidate.id),
+        supabase
+          .from('claims')
+          .select('id', { count: 'exact', head: true })
+          .eq('verification_run_id', candidate.id)
+          .in('status', ['pending', 'checking']),
+      ]);
+
+      const candidateAge = Date.now() - new Date(candidate.created_at ?? 0).getTime();
+      const isOrphan =
+        (totalClaims ?? 0) === 0 &&
+        (activeClaimCount ?? 0) === 0 &&
+        candidateAge > ABANDONED_PENDING_MS;
+
+      if (isOrphan) {
+        await supabase
+          .from('verification_runs')
+          .update({ status: 'complete' })
+          .eq('id', candidate.id)
+          .eq('status', 'pending');
+        console.log(`[verify/status] Cleaned orphan pending run ${candidate.id}`);
+      }
+    }
+
+    // Re-query to find the true oldest live pending run
+    const { data: oldestLive } = await supabase
+      .from('verification_runs')
+      .select('id')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: true })
+      .limit(1)
+      .maybeSingle<{ id: string }>();
+
+    const isOldest = oldestLive?.id === runId;
+
+    if (isOldest) {
+      const freshActiveCount = await countActiveVerifyingRuns();
+
+      if (freshActiveCount < MAX_CONCURRENT_RUNS) {
+        const { count: ownPendingClaims } = await supabase
+          .from('claims')
+          .select('id', { count: 'exact', head: true })
+          .eq('verification_run_id', runId)
+          .eq('status', 'pending');
+
+        if ((ownPendingClaims ?? 0) > 0) {
+          const { data: selfPromoted } = await supabase
+            .from('verification_runs')
+            .update({ status: 'verifying' })
+            .eq('id', runId)
+            .eq('status', 'pending')
+            .select('id')
+            .maybeSingle<{ id: string }>();
+
+          if (selfPromoted) {
+            console.log(`[verify/status] Promoting run ${runId} → verifying`);
+            run.status = 'verifying';
+            await log(runId, 'Queue slot available — browser verification starting');
+            dispatchClaimsForRun(runId, origin).catch((e) =>
+              console.error('[verify/status] Failed to dispatch run:', e),
+            );
+          }
+        }
+      }
+    }
+  }
+
+  // ── Queue position ────────────────────────────────────────────────────────
+  let queuePosition: number | null = null;
+  if (run.status === 'pending') {
+    // Count only live pending runs created before this one
+    const { data: olderRuns } = await supabase
+      .from('verification_runs')
+      .select('id')
+      .eq('status', 'pending')
+      .lt('created_at', run.created_at)
+      .returns<{ id: string }[]>();
+
+    let liveAhead = 0;
+    for (const older of (olderRuns ?? [])) {
+      const { count } = await supabase
+        .from('claims')
+        .select('id', { count: 'exact', head: true })
+        .eq('verification_run_id', older.id)
+        .in('status', ['pending', 'checking']);
+      if ((count ?? 0) > 0) liveAhead++;
+    }
+    queuePosition = liveAhead + 1;
+  }
+
+  return ok({
+    run,
+    claims,
+    logs,
+    project: project ?? null,
+    queuePosition,
+  });
+});
