@@ -23,6 +23,14 @@ function Logo() {
   );
 }
 
+function XIcon() {
+  return (
+    <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-4.714-6.231-5.401 6.231H2.748l7.73-8.835L1.254 2.25H8.08l4.253 5.622zm-1.161 17.52h1.833L7.084 4.126H5.117z" />
+    </svg>
+  );
+}
+
 export function Navbar() {
   const [scrolled, setScrolled] = useState(false);
   const pathname = usePathname();
@@ -102,6 +110,15 @@ export function Navbar() {
           </div>
 
           <div className="flex items-center gap-5">
+            <a
+              href="https://x.com/larpscanbnb"
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-label="LARPSCAN on X"
+              className="text-zinc-500 hover:text-white transition-colors duration-150"
+            >
+              <XIcon />
+            </a>
             <div className="relative flex items-center border border-[#1f1f27] rounded-sm overflow-hidden bg-[#0a0a0e]">
               <motion.div
                 className="absolute top-0 bottom-0 w-1/2 bg-[#16161d]"
