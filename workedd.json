@@ -1,0 +1,27 @@
+{
+  "params": {
+    "name": "TestToken",
+    "symbol": "TST",
+    "meta": "bafkreifwcauxljcuke5zt2r6kno2cukc4mmgvnuimsaeiqki33lalhhjde",
+    "dexThresh": "1",
+    "salt": "0xec4028dbe01652654e26f4522aa515119b32f44132a75e04a18e7ad482c2fa14",
+    "taxRate": "200",
+    "migratorType": "1",
+    "quoteToken": "0x0000000000000000000000000000000000000000",
+    "quoteAmt": "0",
+    "permitData": "0x",
+    "extensionID": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "extensionData": "0x",
+    "dexId": "0",
+    "lpFeeProfile": "0",
+    "taxDuration": "3153600000",
+    "antiFarmerDuration": "259200",
+    "mktBps": "10000",
+    "deflationBps": "0",
+    "dividendBps": "0",
+    "lpBps": "0",
+    "minimumShareBalance": "10000000000000000000000",
+    "vaultFactory": "0xfab75Dc774cB9B38b91749B8833360B46a52345F",
+    "vaultData": "0x000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000010000000000000000000000001b634b1aefff672f9250844d5c5262e7493596b10000000000000000000000000000000000000000000000000000000000002710"
+  }
+}
