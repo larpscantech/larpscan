@@ -394,6 +394,8 @@ export default function DashboardPage() {
   const { locale } = useLocale();
   const isZh = locale === 'zh-TW';
   const [entryAnimation, setEntryAnimation] = useState(false);
+  const [entryChecked, setEntryChecked] = useState(false);
+  const [pageEntered, setPageEntered] = useState(false);
   // ── Input state ─────────────────────────────────────────────────────────────
   const [input, setInput]               = useState('');
   const [scanType, setScanType]         = useState<ScanType>('full');
@@ -444,7 +446,14 @@ export default function DashboardPage() {
       setEntryAnimation(true);
       window.sessionStorage.removeItem('larpscan_dashboard_entry');
     }
+    setEntryChecked(true);
   }, []);
+
+  useEffect(() => {
+    if (!entryChecked) return;
+    const t = window.setTimeout(() => setPageEntered(true), 40);
+    return () => window.clearTimeout(t);
+  }, [entryChecked, locale]);
 
   // ── Playwright / E2E test hook ───────────────────────────────────────────────
   // Expose window functions so automated tests can set the input and trigger
@@ -888,32 +897,53 @@ export default function DashboardPage() {
     return [liveRow, ...recentScans.filter((r) => r.id !== currentRunId)];
   }, [isActive, realProject, recentScans, currentRunId, phase, realClaims, elapsed, isRunning]);
 
+  if (!entryChecked) {
+    return (
+      <div className="min-h-screen bg-[#050507]">
+        <Navbar />
+      </div>
+    );
+  }
+
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-[#050507]">
-      <Navbar />
+      <motion.div
+        initial={{ opacity: 0, y: -18, filter: 'blur(6px)' }}
+        animate={pageEntered ? { opacity: 1, y: 0, filter: 'blur(0px)' } : { opacity: 0, y: -18, filter: 'blur(6px)' }}
+        transition={{ duration: entryAnimation ? 0.52 : 0.36, ease: [0.16, 1, 0.3, 1] }}
+      >
+        <Navbar />
+      </motion.div>
       <main className="pt-14">
         <AnimatePresence mode="wait" initial={false}>
           <motion.div
             key={`dashboard-${locale}`}
             initial={{
               opacity: 0,
-              y: entryAnimation ? 30 : 18,
-              scale: entryAnimation ? 0.985 : 1,
-              filter: entryAnimation ? 'blur(10px)' : 'blur(6px)',
+              y: entryAnimation ? 34 : 24,
+              scale: entryAnimation ? 0.985 : 0.992,
+              filter: entryAnimation ? 'blur(10px)' : 'blur(8px)',
             }}
-            animate={{ opacity: 1, y: 0, filter: 'blur(0px)' }}
+            animate={pageEntered
+              ? { opacity: 1, y: 0, scale: 1, filter: 'blur(0px)' }
+              : {
+                  opacity: 0,
+                  y: entryAnimation ? 34 : 24,
+                  scale: entryAnimation ? 0.985 : 0.992,
+                  filter: entryAnimation ? 'blur(10px)' : 'blur(8px)',
+                }}
             exit={{ opacity: 0, y: -18, filter: 'blur(6px)' }}
-            transition={{ duration: entryAnimation ? 0.55 : 0.28, ease: [0.16, 1, 0.3, 1] }}
+            transition={{ duration: entryAnimation ? 0.6 : 0.42, ease: [0.16, 1, 0.3, 1] }}
             className="max-w-[1240px] mx-auto px-8 py-14"
           >
 
           {/* Hero header */}
           <motion.div
             className="mb-12"
-            initial={entryAnimation ? { opacity: 0, y: 26 } : false}
-            animate={entryAnimation ? { opacity: 1, y: 0 } : undefined}
-            transition={{ duration: 0.48, delay: 0.06, ease: [0.16, 1, 0.3, 1] }}
+            initial={{ opacity: 0, y: entryAnimation ? 28 : 16 }}
+            animate={pageEntered ? { opacity: 1, y: 0 } : { opacity: 0, y: entryAnimation ? 28 : 16 }}
+            transition={{ duration: 0.52, delay: 0.06, ease: [0.16, 1, 0.3, 1] }}
           >
             <div className="flex items-start justify-between mb-4">
               <div>
@@ -951,9 +981,9 @@ export default function DashboardPage() {
 
           {/* Contract input */}
           <motion.div
-            initial={entryAnimation ? { opacity: 0, y: 24 } : false}
-            animate={entryAnimation ? { opacity: 1, y: 0 } : undefined}
-            transition={{ duration: 0.5, delay: 0.14, ease: [0.16, 1, 0.3, 1] }}
+            initial={{ opacity: 0, y: entryAnimation ? 26 : 18 }}
+            animate={pageEntered ? { opacity: 1, y: 0 } : { opacity: 0, y: entryAnimation ? 26 : 18 }}
+            transition={{ duration: 0.54, delay: 0.14, ease: [0.16, 1, 0.3, 1] }}
           >
             <ContractRow
               value={input}

@@ -10,11 +10,24 @@ import { useLocale } from '@/components/locale-provider';
 function Logo() {
   return (
     <div className="flex items-center gap-3">
-      <div className="relative w-6 h-6 flex-shrink-0">
-        <div className="absolute inset-0 rounded-sm border border-zinc-700" />
-        <div className="absolute top-0.5 left-0.5 right-0.5 bottom-0.5 rounded-[2px] border border-zinc-600" />
-        <div className="absolute top-1 left-1 w-2 h-2 bg-red-600 rounded-[1px]" />
-      </div>
+      <svg
+        className="w-7 h-7 flex-shrink-0 text-red-500"
+        viewBox="0 0 64 64"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+      >
+        <path d="M18 12H8v10" />
+        <path d="M46 12h10v10" />
+        <path d="M18 52H8V42" />
+        <path d="M46 52h10V42" />
+        <path d="M20 28l8 5-8 5" />
+        <path d="M44 28l-8 5 8 5" />
+        <path d="M25 43c2 4 5 6 7 6s5-2 7-6" />
+      </svg>
       <span className="text-[13px] font-bold tracking-tight">
         <span className="text-white">LARP</span>
         <span className="text-red-500">SCAN</span>

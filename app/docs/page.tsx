@@ -35,6 +35,21 @@ function Pill({ icon, label }: { icon: React.ReactNode; label: string }) {
   );
 }
 
+function InfoCard({
+  title,
+  body,
+}: {
+  title: string;
+  body: string;
+}) {
+  return (
+    <div className="border border-[#202028] bg-[#09090d] rounded-sm p-4">
+      <p className="text-[11px] uppercase tracking-[0.16em] text-red-500 mb-2">{title}</p>
+      <p className="text-zinc-400 leading-relaxed">{body}</p>
+    </div>
+  );
+}
+
 export default function DocsPage() {
   const { locale } = useLocale();
   const isZh = locale === 'zh-TW';
@@ -43,15 +58,16 @@ export default function DocsPage() {
     ? {
         headerLabel: '文件',
         heroTitleMain: 'LARPSCAN 文件',
-        heroTitleSub: '：以證據優先的驗證系統。',
+        heroTitleSub: '',
         heroBody:
-          'LARPSCAN 驗證的是產品真實行為，而不是行銷敘述。本頁涵蓋架構、流程、判定邏輯與安全運行模式。',
+          'LARPSCAN 驗證的是產品真實行為，而不是行銷敘述。本頁說明系統如何發現專案、提取宣稱、執行瀏覽器驗證、保存證據，以及何時重用既有結果。',
         pills: ['安全保護欄', '瀏覽器代理', '可重現判定'],
         tocLabel: '本頁內容',
-        toc: ['總覽', '驗證流程', '判定模型', '風險控制', 'API 端點', '運維指南'],
+        toc: ['總覽', '驗證流程', '證據輸出', '判定模型', '風險控制', 'API 端點', '運維指南'],
         sectionTitles: {
           overview: 'LARPSCAN 的核心工作',
           pipeline: '驗證流程',
+          evidence: '證據輸出',
           verdicts: '判定模型',
           risk: '風險控制',
           api: '核心 API 端點',
@@ -60,6 +76,7 @@ export default function DocsPage() {
         sectionSubtitles: {
           overview: '總覽',
           pipeline: '流程',
+          evidence: '輸出',
           verdicts: '分類',
           risk: '安全',
           api: 'api 參考',
@@ -67,6 +84,7 @@ export default function DocsPage() {
         },
         overviewParagraphs: [
           'LARPSCAN 接收合約地址、識別專案與網站面，再提取可驗證宣稱，最後以真實瀏覽器互動逐條驗證。',
+          '系統的目標不是生成敘事，而是把產品宣稱轉成可測試的 pass condition，並在每次驗證後留下清楚的可追溯證據。',
           '每次執行都會產生證據物件：截圖、日誌、判定理由、交易資訊與重播上下文，目標是可重現的信任。',
         ],
         flowCards: [
@@ -76,6 +94,18 @@ export default function DocsPage() {
           ['04 報告', '寫入判定並保存證據。'],
         ],
         flowSketch: '// 流程草圖',
+        flowNotes: [
+          ['專案發現', '由合約地址反推出名稱、符號、網站與社群資料。'],
+          ['宣稱提取', '從網站與文字上下文中萃取可驗證功能，而不是籠統敘事。'],
+          ['瀏覽器執行', '代理依序導覽、點擊、填寫、等待與重試，直到獲得正面或負面訊號。'],
+          ['結果重用', '若專案已有完成驗證結果，預設可直接讀取，只有 Force Reverify 才建立新執行。'],
+        ],
+        evidenceItems: [
+          ['截圖', '保存關鍵互動畫面與最終結果狀態。'],
+          ['代理日誌', '記錄每一步嘗試、等待、恢復與錯誤處理。'],
+          ['判定理由', '保留規則層與模型層最終得出結論的依據。'],
+          ['交易資訊', '若有鏈上互動，保存交易 hash、receipt 狀態與相關說明。'],
+        ],
         verdict: {
           verified: ['已驗證', '觀測到與宣稱一致的行為，且具備支撐證據。'],
           failed: ['LARP / 失敗', '宣稱功能不存在、故障，或與實際行為相矛盾。'],
@@ -90,6 +120,7 @@ export default function DocsPage() {
           '結構化證據日誌，支援事後審計。',
           '在語言模型判定前先套用規則層。',
           '模組化隔離，便於測試與安全迭代。',
+          '快取既有完成結果，避免不必要的重跑與額外風險。',
         ],
         apiRows: [
           ['POST /api/project/discover', '根據合約地址解析專案身份資訊。'],
@@ -103,21 +134,23 @@ export default function DocsPage() {
         opsParagraphs: [
           '為了穩定運行，請保持代理提示詞可重現、強制交易安全上限，並以日誌與證據卡片監控，而非只看模型敘述。',
           '調整行為時建議小步迭代，並搭配可回放的測試 URL 與明確 pass condition。',
+          '如果某一站點需要重新驗證，使用 Force Reverify；否則優先讀取最近一次完成結果，加快回應並保留一致性。',
         ],
         openDashboard: '開啟儀表板',
       }
     : {
         headerLabel: 'documentation',
         heroTitleMain: 'LARPSCAN docs',
-        heroTitleSub: ' for evidence-first verification.',
+        heroTitleSub: '',
         heroBody:
-          'LARPSCAN verifies what products actually do, not what marketing claims. This page covers architecture, workflow, verdict logic, and safe operating mode.',
+          'LARPSCAN verifies what products actually do, not what marketing claims. This page explains discovery, claim extraction, browser execution, evidence storage, result reuse, and operating rules.',
         pills: ['safety guardrails', 'browser agent', 'deterministic verdicts'],
         tocLabel: 'on this page',
-        toc: ['overview', 'verification pipeline', 'verdict model', 'risk controls', 'api endpoints', 'operations guide'],
+        toc: ['overview', 'verification pipeline', 'evidence output', 'verdict model', 'risk controls', 'api endpoints', 'operations guide'],
         sectionTitles: {
           overview: 'What LARPSCAN does',
           pipeline: 'Verification pipeline',
+          evidence: 'Evidence output',
           verdicts: 'Verdict model',
           risk: 'Risk controls',
           api: 'Core API endpoints',
@@ -126,6 +159,7 @@ export default function DocsPage() {
         sectionSubtitles: {
           overview: 'overview',
           pipeline: 'workflow',
+          evidence: 'artifacts',
           verdicts: 'classification',
           risk: 'safety',
           api: 'api reference',
@@ -133,6 +167,7 @@ export default function DocsPage() {
         },
         overviewParagraphs: [
           'LARPSCAN takes a contract address, discovers project identity and web surfaces, extracts claims, then verifies each claim through real browser interaction.',
+          'The system is designed to turn product language into explicit pass conditions, then collect enough runtime evidence to support a deterministic conclusion.',
           'Every run produces evidence artifacts: screenshots, logs, verdict rationale, transaction metadata, and replay context. The target is trust through reproducibility.',
         ],
         flowCards: [
@@ -142,17 +177,30 @@ export default function DocsPage() {
           ['04 Report', 'Assign verdicts and persist evidence artifacts.'],
         ],
         flowSketch: '// flow sketch',
+        flowNotes: [
+          ['Project discovery', 'Resolve token identity, website, and social context from the supplied contract address.'],
+          ['Claim extraction', 'Convert product language into concrete behaviors the browser agent can test.'],
+          ['Browser execution', 'Navigate, click, type, wait, retry, and inspect live state until enough signals are gathered.'],
+          ['Result reuse', 'If a project already has a completed result, reuse it by default unless Force Reverify is enabled.'],
+        ],
+        evidenceItems: [
+          ['Screenshots', 'Capture critical surfaces, transitions, and final states for review.'],
+          ['Agent logs', 'Store the sequence of actions, waits, retries, and recoveries.'],
+          ['Verdict rationale', 'Preserve the reasoning that led to the final classification.'],
+          ['Transaction metadata', 'Attach hashes, receipt status, and related notes when on-chain interaction happens.'],
+        ],
         verdict: {
           verified: ['verified', 'Claim behavior is observed with supporting evidence from live interaction.'],
           failed: ['larp / failed', 'Claimed functionality is absent, broken, or contradicted by observed behavior.'],
           untestable: ['untestable', 'Surface appears real, but execution is blocked by auth gates, insufficient funds, captchas, or external constraints outside verifier control.'],
         },
         riskItems: [
-          'Paper mode first: no live trading execution path.',
+          'No live trading execution path in the verifier.',
           'Transaction value guardrails with explicit safety limits.',
           'Structured evidence logging for post-run auditability.',
           'Deterministic rule layer before any language-model interpretation.',
           'Module-level isolation for testability and controlled changes.',
+          'Reuse of completed results by default to avoid unnecessary reruns.',
         ],
         apiRows: [
           ['POST /api/project/discover', 'Resolve token project identity from contract address.'],
@@ -166,6 +214,7 @@ export default function DocsPage() {
         opsParagraphs: [
           'For stable operation, keep browser-agent prompts deterministic, enforce value safety limits, and monitor runs with logs plus evidence cards rather than model narrative alone.',
           'When tuning behavior, prefer small iterative changes with replayable test URLs and explicit pass conditions for each claim.',
+          'Use Force Reverify only when you intentionally want a fresh run. Otherwise the dashboard can surface the latest completed result immediately.',
         ],
         openDashboard: 'open dashboard',
       };
@@ -208,10 +257,11 @@ export default function DocsPage() {
               <nav className="flex flex-col gap-3 text-[12px] uppercase tracking-[0.16em]">
                 <a href="#overview" className="text-zinc-500 hover:text-zinc-300 transition-colors">{copy.toc[0]}</a>
                 <a href="#pipeline" className="text-zinc-500 hover:text-zinc-300 transition-colors">{copy.toc[1]}</a>
-                <a href="#verdicts" className="text-zinc-500 hover:text-zinc-300 transition-colors">{copy.toc[2]}</a>
-                <a href="#risk-controls" className="text-zinc-500 hover:text-zinc-300 transition-colors">{copy.toc[3]}</a>
-                <a href="#api" className="text-zinc-500 hover:text-zinc-300 transition-colors">{copy.toc[4]}</a>
-                <a href="#ops" className="text-zinc-500 hover:text-zinc-300 transition-colors">{copy.toc[5]}</a>
+                <a href="#evidence" className="text-zinc-500 hover:text-zinc-300 transition-colors">{copy.toc[2]}</a>
+                <a href="#verdicts" className="text-zinc-500 hover:text-zinc-300 transition-colors">{copy.toc[3]}</a>
+                <a href="#risk-controls" className="text-zinc-500 hover:text-zinc-300 transition-colors">{copy.toc[4]}</a>
+                <a href="#api" className="text-zinc-500 hover:text-zinc-300 transition-colors">{copy.toc[5]}</a>
+                <a href="#ops" className="text-zinc-500 hover:text-zinc-300 transition-colors">{copy.toc[6]}</a>
               </nav>
             </aside>
 
@@ -235,6 +285,25 @@ export default function DocsPage() {
                 <div className="border border-[#202028] bg-[#09090d] rounded-sm p-4 font-mono text-[12px] text-zinc-300">
                   <p className="text-zinc-500 mb-2">{copy.flowSketch}</p>
                   <p>discover -&gt; extract_text -&gt; claims_extract -&gt; verify_run -&gt; verify_status</p>
+                </div>
+                <div className="grid md:grid-cols-2 gap-4">
+                  {copy.flowNotes.map(([title, body]) => (
+                    <InfoCard key={title} title={title} body={body} />
+                  ))}
+                </div>
+              </DocBlock>
+
+              <DocBlock title={copy.sectionTitles.evidence} subtitle={copy.sectionSubtitles.evidence}>
+                <div id="evidence" className="-mt-20 pt-20" />
+                <p>
+                  {isZh
+                    ? 'LARPSCAN 不只給你一個標籤，還會輸出一整組可檢查的證據，用來回答「為什麼得到這個結論？」'
+                    : 'LARPSCAN does not just return a label. It returns a bundle of inspectable artifacts that answer why a verdict was assigned.'}
+                </p>
+                <div className="grid md:grid-cols-2 gap-4">
+                  {copy.evidenceItems.map(([title, body]) => (
+                    <InfoCard key={title} title={title} body={body} />
+                  ))}
                 </div>
               </DocBlock>
 
