@@ -136,7 +136,7 @@ function HeroSection() {
         titleB1: '多些',
         titleB2: '證明。',
         body: '瀏覽器代理會審核真實產品流程，只回傳證據。沒有花俏承諾，沒有猜測。',
-        enter: '進入控制台',
+        enter: '進入儀表板',
         method: '我們的方法',
       }
     : {
@@ -145,7 +145,7 @@ function HeroSection() {
         titleB1: 'prove more',
         titleB2: '.',
         body: 'A browser agent audits the real product flow and returns only evidence. No glossy promises, no guessing.',
-        enter: 'enter console',
+        enter: 'enter dashboard',
         method: 'our method',
       };
 
@@ -212,9 +212,14 @@ function HeroSection() {
         >
             <Link
               href="/dashboard"
-            className="inline-flex items-center gap-2 bg-red-600 hover:bg-red-500 text-white rounded-sm px-8 py-3.5 text-[11px] font-semibold uppercase tracking-[0.18em] transition-colors duration-150"
+              onClick={() => {
+                if (typeof window !== 'undefined') {
+                  window.sessionStorage.setItem('larpscan_dashboard_entry', '1');
+                }
+              }}
+              className="inline-flex items-center gap-2 bg-red-600 hover:bg-red-500 text-white rounded-sm px-8 py-3.5 text-[11px] font-semibold uppercase tracking-[0.18em] transition-colors duration-150"
             >
-            {copy.enter} <ArrowRight className="w-3.5 h-3.5" />
+              {copy.enter} <ArrowRight className="w-3.5 h-3.5" />
             </Link>
             <a
             href="#method"
@@ -365,7 +370,17 @@ export default function HomeLandingPage() {
     setMounted(true);
   }, []);
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (window.sessionStorage.getItem('larpscan_intro_done') === '1') {
+      setIntroComplete(true);
+    }
+  }, []);
+
   const handleIntroComplete = () => {
+    if (typeof window !== 'undefined') {
+      window.sessionStorage.setItem('larpscan_intro_done', '1');
+    }
     setIntroComplete(true);
   };
 

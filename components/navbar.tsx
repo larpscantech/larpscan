@@ -146,6 +146,11 @@ export function Navbar() {
             </div>
             <Link
               href="/dashboard"
+              onClick={() => {
+                if (typeof window !== 'undefined') {
+                  window.sessionStorage.setItem('larpscan_dashboard_entry', '1');
+                }
+              }}
               className="text-[10px] font-semibold uppercase tracking-[0.22em] px-5 py-2.5 rounded-sm bg-red-600 text-white hover:bg-red-500 transition-all duration-150"
             >
               <AnimatePresence mode="wait" initial={false}>

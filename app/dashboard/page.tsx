@@ -393,6 +393,7 @@ function ClaimsSection({
 export default function DashboardPage() {
   const { locale } = useLocale();
   const isZh = locale === 'zh-TW';
+  const [entryAnimation, setEntryAnimation] = useState(false);
   // ── Input state ─────────────────────────────────────────────────────────────
   const [input, setInput]               = useState('');
   const [scanType, setScanType]         = useState<ScanType>('full');
@@ -435,6 +436,15 @@ export default function DashboardPage() {
 
   // Load on mount and after each completed run
   useEffect(() => { void fetchRecentScans(); }, [fetchRecentScans]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const shouldAnimate = window.sessionStorage.getItem('larpscan_dashboard_entry') === '1';
+    if (shouldAnimate) {
+      setEntryAnimation(true);
+      window.sessionStorage.removeItem('larpscan_dashboard_entry');
+    }
+  }, []);
 
   // ── Playwright / E2E test hook ───────────────────────────────────────────────
   // Expose window functions so automated tests can set the input and trigger
@@ -886,15 +896,25 @@ export default function DashboardPage() {
         <AnimatePresence mode="wait" initial={false}>
           <motion.div
             key={`dashboard-${locale}`}
-            initial={{ opacity: 0, y: 18, filter: 'blur(6px)' }}
+            initial={{
+              opacity: 0,
+              y: entryAnimation ? 30 : 18,
+              scale: entryAnimation ? 0.985 : 1,
+              filter: entryAnimation ? 'blur(10px)' : 'blur(6px)',
+            }}
             animate={{ opacity: 1, y: 0, filter: 'blur(0px)' }}
             exit={{ opacity: 0, y: -18, filter: 'blur(6px)' }}
-            transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
+            transition={{ duration: entryAnimation ? 0.55 : 0.28, ease: [0.16, 1, 0.3, 1] }}
             className="max-w-[1240px] mx-auto px-8 py-14"
           >
 
           {/* Hero header */}
-          <div className="mb-12">
+          <motion.div
+            className="mb-12"
+            initial={entryAnimation ? { opacity: 0, y: 26 } : false}
+            animate={entryAnimation ? { opacity: 1, y: 0 } : undefined}
+            transition={{ duration: 0.48, delay: 0.06, ease: [0.16, 1, 0.3, 1] }}
+          >
             <div className="flex items-start justify-between mb-4">
               <div>
                 <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-zinc-600 mb-3">
@@ -927,19 +947,25 @@ export default function DashboardPage() {
                 ? '極簡介面，硬證據。系統會從真實產品面提取宣稱，再透過真實瀏覽器互動逐條驗證。'
                 : 'Minimal interface, hard evidence. We extract claims from live product surfaces, then verify each claim through real browser interaction.'}
             </p>
-          </div>
+          </motion.div>
 
           {/* Contract input */}
-          <ContractRow
-            value={input}
-            onChange={setInput}
-            onSubmit={handleSubmit}
-            isLoading={isRunning}
-            scanType={scanType}
-            onScanTypeChange={setScanType}
-            forceReverify={forceReverify}
-            onForceReverifyChange={setForceReverify}
-          />
+          <motion.div
+            initial={entryAnimation ? { opacity: 0, y: 24 } : false}
+            animate={entryAnimation ? { opacity: 1, y: 0 } : undefined}
+            transition={{ duration: 0.5, delay: 0.14, ease: [0.16, 1, 0.3, 1] }}
+          >
+            <ContractRow
+              value={input}
+              onChange={setInput}
+              onSubmit={handleSubmit}
+              isLoading={isRunning}
+              scanType={scanType}
+              onScanTypeChange={setScanType}
+              forceReverify={forceReverify}
+              onForceReverifyChange={setForceReverify}
+            />
+          </motion.div>
 
           {/* Error banner */}
           <AnimatePresence>
