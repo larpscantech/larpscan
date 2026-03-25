@@ -312,10 +312,10 @@ function StatementSection() {
           transition={{ duration: 0.8, delay: 0.12, ease: [0.16, 1, 0.3, 1] }}
         >
           {locale === 'zh-TW'
-            ? '如果功能無法通過真實互動，'
-            : 'if a feature cannot survive real interaction,'}
+            ? '如果產品無法在真實壓力下證明自己，'
+            : 'if the product cannot prove itself under real pressure,'}
           <span className="text-zinc-600">
-            {locale === 'zh-TW' ? ' 那它就不是功能。' : ' it is not a feature.'}
+            {locale === 'zh-TW' ? ' 那它就只是 larp。' : ' it is just larp.'}
           </span>
         </motion.h2>
       </motion.div>

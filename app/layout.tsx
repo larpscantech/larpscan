@@ -16,7 +16,7 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: 'LARPSCAN — Verification for Crypto Products',
+  title: 'Larpscan',
   description:
     'Empirically verify crypto project claims with browser-run evidence and deterministic verdicts.',
 };
