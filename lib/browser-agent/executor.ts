@@ -239,7 +239,20 @@ function detectBlockerFromText(text: string): BlockerType | undefined {
  * cleared even if the LLM planner never explicitly fills the field.
  */
 async function clearDevBuyFields(page: Page): Promise<void> {
-  const DEV_BUY_RE = /dev.?buy|initial.?buy|launch.?buy|buy.?amount|purchase.?amount/i;
+  // Only zero out inputs that are DIRECTLY labeled as a "dev buy" field.
+  // We intentionally avoid broad ancestor walks that match shared form containers
+  // (which caused Token Name, Symbol, etc. to be wiped on bnbshare.fun).
+  //
+  // An input qualifies iff at least one of the following is true:
+  //   1. Its own name/placeholder/aria-label matches the dev-buy pattern.
+  //   2. A <label for="id"> pointing to it matches the pattern.
+  //   3. It is nested inside a <label> that matches the pattern.
+  //   4. Its immediate parent (depth 1) has only ONE input child AND contains
+  //      a label-like element (label/span/div with short text) matching the pattern.
+  //      We do NOT walk further because at depth 2+ we risk matching shared form
+  //      containers that list all field labels including "Dev Buy".
+
+  const DEV_BUY_RE = /dev.?buy|initial.?buy|launch.?buy/i;
 
   const inputs = await page
     .locator('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])')
@@ -250,20 +263,40 @@ async function clearDevBuyFields(page: Page): Promise<void> {
     if (!vis) continue;
 
     const isDevBuy = await inp.evaluate((el) => {
-      const DEV = /dev.?buy|initial.?buy|launch.?buy|buy.?amount|purchase.?amount/i;
-      const name = ((el as HTMLInputElement).name ?? '').toLowerCase();
-      const ph   = ((el as HTMLInputElement).placeholder ?? '').toLowerCase();
-      const aria = (el.getAttribute('aria-label') ?? '').toLowerCase();
-      if (DEV.test(`${name} ${ph} ${aria}`)) return true;
+      const DEV = /dev.?buy|initial.?buy|launch.?buy/i;
+      const input = el as HTMLInputElement;
 
-      let node: Element | null = (el as HTMLElement).parentElement;
-      for (let depth = 0; depth < 5 && node; depth++, node = node.parentElement) {
-        if (['FORM', 'BODY', 'HTML', 'MAIN', 'SECTION'].includes(node.tagName)) break;
-        const text = Array.from(node.children)
-          .filter((c) => !['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'SCRIPT'].includes(c.tagName))
-          .map((c) => c.textContent ?? '').join(' ');
-        if (DEV.test(text)) return true;
+      // Rule 1: own attributes
+      const ownText = `${input.name ?? ''} ${input.placeholder ?? ''} ${input.getAttribute('aria-label') ?? ''}`;
+      if (DEV.test(ownText)) return true;
+
+      // Rule 2: <label for="id">
+      if (input.id) {
+        const lbl = document.querySelector<HTMLLabelElement>(`label[for="${input.id}"]`);
+        if (lbl && DEV.test(lbl.textContent ?? '')) return true;
       }
+
+      // Rule 3: input is inside a <label>
+      const parentLabel = input.closest('label');
+      if (parentLabel && DEV.test(parentLabel.textContent ?? '')) return true;
+
+      // Rule 4: immediate parent wrapper that owns ONLY this one input
+      const parent = input.parentElement;
+      if (parent) {
+        const inputsInParent = parent.querySelectorAll(
+          'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea, select',
+        ).length;
+        if (inputsInParent === 1) {
+          // Safe to read all non-input child text in this wrapper
+          const wrapperText = Array.from(parent.children)
+            .filter(c => !['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'SCRIPT'].includes(c.tagName))
+            .map(c => (c.textContent ?? '').trim())
+            .filter(t => t.length > 0 && t.length < 60)
+            .join(' ');
+          if (DEV.test(wrapperText)) return true;
+        }
+      }
+
       return false;
     }).catch(() => false);
 
@@ -1683,31 +1716,27 @@ async function performStep(page: Page, step: AgentStep, baseDomain: string): Pro
 
         if (DEV_BUY_RE.test(`${name} ${ph} ${aria} ${id} ${labelText}`)) return true;
 
-        // Walk up MAX 2 ancestor levels only — this catches div-wrapped labels
-        // without reaching the <form> root (which contains all field labels).
-        // Also bail out if a container has more than 4 direct children (it's a
-        // field-group or form section, not a single-field wrapper).
-        let node: Element | null = (el as HTMLElement).parentElement;
-        for (let depth = 0; depth < 2 && node; depth++, node = node.parentElement) {
-          const tag = node.tagName;
-          if (['FORM', 'BODY', 'HTML', 'MAIN', 'SECTION', 'ARTICLE', 'NAV'].includes(tag)) break;
-          if (node.children.length > 5) break;  // too many siblings → this is a form group, not a field wrapper
-
-          // Only look at immediate TEXT children and short sibling elements
-          const directText = Array.from(node.childNodes)
-            .filter((n) => n.nodeType === Node.TEXT_NODE)
-            .map((n) => n.textContent ?? '')
-            .join(' ')
-            .toLowerCase();
-
-          const siblingText = Array.from(node.children)
-            .filter((c) => !['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'SCRIPT', 'STYLE'].includes(c.tagName))
-            .filter((c) => (c.textContent ?? '').length < 60)  // skip long descriptive texts
-            .map((c) => c.textContent ?? '')
-            .join(' ')
-            .toLowerCase();
-
-          if (DEV_BUY_RE.test(`${directText} ${siblingText}`)) return true;
+        // Walk up MAX 1 ancestor level (immediate parent only).
+        // Stop if the container owns more than one input — it's a shared form
+        // section, not a single-field wrapper, and matching there would cause
+        // every field in the form to look like a dev-buy field.
+        const parent = (el as HTMLElement).parentElement;
+        if (parent) {
+          const tag = parent.tagName;
+          if (!['FORM', 'BODY', 'HTML', 'MAIN', 'SECTION', 'ARTICLE', 'NAV'].includes(tag)) {
+            const inputsInParent = parent.querySelectorAll(
+              'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea, select',
+            ).length;
+            if (inputsInParent === 1) {
+              const wrapperText = Array.from(parent.children)
+                .filter(c => !['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'SCRIPT', 'STYLE'].includes(c.tagName))
+                .map(c => (c.textContent ?? '').trim())
+                .filter(t => t.length > 0 && t.length < 60)
+                .join(' ')
+                .toLowerCase();
+              if (DEV_BUY_RE.test(wrapperText)) return true;
+            }
+          }
         }
 
         return false;
