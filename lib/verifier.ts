@@ -293,12 +293,22 @@ async function recordInteraction(
   }
 
   try {
+    // Video recording requires ffmpeg, which is NOT bundled with @sparticuz/chromium
+    // and is not present in Vercel / AWS Lambda environments. Attempting to use
+    // recordVideo in serverless crashes the context with "ffmpeg-linux not found".
+    // Disable recording on any serverless runtime and rely on screenshots instead.
+    const enableRecording = !Boolean(
+      process.env.VERCEL ||
+      process.env.AWS_REGION ||
+      process.env.AWS_LAMBDA_FUNCTION_NAME,
+    );
+
     context = await browser.newContext({
       userAgent:
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
         '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       viewport:    { width: 1280, height: 720 },
-      recordVideo: { dir: recordingsDir, size: { width: 1280, height: 720 } },
+      ...(enableRecording ? { recordVideo: { dir: recordingsDir, size: { width: 1280, height: 720 } } } : {}),
     });
 
     // Install signing bridge FIRST so it's available when addInitScript runs.
