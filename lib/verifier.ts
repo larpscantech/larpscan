@@ -1,7 +1,8 @@
 import path    from 'path';
 import fs      from 'fs/promises';
 import { randomUUID } from 'crypto';
-import { launchChromium } from './browser';
+import { launchChromium, isServerlessRuntime, ensureFFmpegForPlaywright, isFFmpegReady } from './browser';
+import { supabase } from './supabase';
 import {
   analyzePageState,
   planWorkflow,
@@ -293,15 +294,11 @@ async function recordInteraction(
   }
 
   try {
-    // Video recording requires ffmpeg, which is NOT bundled with @sparticuz/chromium
-    // and is not present in Vercel / AWS Lambda environments. Attempting to use
-    // recordVideo in serverless crashes the context with "ffmpeg-linux not found".
-    // Disable recording on any serverless runtime and rely on screenshots instead.
-    const enableRecording = !Boolean(
-      process.env.VERCEL ||
-      process.env.AWS_REGION ||
-      process.env.AWS_LAMBDA_FUNCTION_NAME,
-    );
+    // Ensure ffmpeg is available before requesting recordVideo.
+    // On serverless runtimes we copy the ffmpeg-static binary into /tmp so
+    // Playwright can find it.  On local dev the binary is already installed.
+    await ensureFFmpegForPlaywright();
+    const enableRecording = isFFmpegReady() || !isServerlessRuntime();
 
     context = await browser.newContext({
       userAgent:
@@ -612,12 +609,40 @@ async function recordInteraction(
           await fs.copyFile(rawPath, finalPath);
           await fs.unlink(rawPath).catch(() => {});
         });
-        // /tmp is not web-accessible on serverless — skip setting videoUrl
+
         if (!recordingsDir.startsWith('/tmp')) {
+          // Local dev — serve directly from /public/recordings
           videoUrl = `/recordings/${claimId}.webm`;
           console.log(`[verifier:record] Video saved → ${videoUrl}`);
         } else {
-          console.log(`[verifier:record] Video written to /tmp (serverless — not web-accessible)`);
+          // Serverless — upload to Supabase Storage for a public URL
+          try {
+            const fileBuffer = await fs.readFile(finalPath);
+
+            // Create bucket if it doesn't exist yet (idempotent).
+            await supabase.storage.createBucket('recordings', { public: true }).catch(() => {});
+
+            const { error: uploadErr } = await supabase.storage
+              .from('recordings')
+              .upload(`${claimId}.webm`, fileBuffer, {
+                contentType: 'video/webm',
+                upsert: true,
+              });
+
+            if (uploadErr) {
+              console.warn(`[verifier:record] Supabase upload error: ${uploadErr.message}`);
+            } else {
+              const { data } = supabase.storage
+                .from('recordings')
+                .getPublicUrl(`${claimId}.webm`);
+              videoUrl = data.publicUrl;
+              console.log(`[verifier:record] Video uploaded → ${videoUrl}`);
+            }
+          } catch (uploadEx) {
+            console.warn('[verifier:record] Supabase upload failed (non-fatal):', uploadEx);
+          }
+          // Clean up from /tmp regardless
+          await fs.unlink(finalPath).catch(() => {});
         }
       }
     } catch (e) {
@@ -708,16 +733,10 @@ export async function verifyClaim(
   }
 
   // ── Session 2: Record + plan + execute ────────────────────────────────────
-  // On Vercel (and other serverless runtimes) process.cwd() is /var/task which
-  // is read-only. Use /tmp for the recordings directory instead.
-  // Videos stored in /tmp are not web-accessible, so videoUrl stays undefined
-  // in serverless — recordings are ephemeral there anyway.
-  const isServerless = Boolean(
-    process.env.VERCEL ||
-    process.env.AWS_REGION ||
-    process.env.AWS_LAMBDA_FUNCTION_NAME,
-  );
-  const recordingsDir = isServerless
+  // process.cwd() is /var/task (read-only) on Vercel — use /tmp for the
+  // intermediate recording file.  After recording completes the webm is
+  // uploaded to Supabase Storage and deleted from /tmp.
+  const recordingsDir = isServerlessRuntime()
     ? path.join('/tmp', 'recordings')
     : path.join(process.cwd(), 'public', 'recordings');
   await fs.mkdir(recordingsDir, { recursive: true });

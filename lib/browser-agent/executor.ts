@@ -672,19 +672,20 @@ async function detectNewFormFields(
                 ? `[placeholder="${CSS.escape((el as HTMLInputElement).placeholder)}"]`
                 : 'input',
           labelText: (() => {
-            const DEV_BUY_RE = /dev.?buy|initial.?buy|launch.?buy|buy.?amount|purchase.?amount/i;
             const id = el.id;
             if (id) { const l = document.querySelector(`label[for="${CSS.escape(id)}"]`); if (l) return (l.textContent ?? '').toLowerCase(); }
             const p = el.closest('label'); if (p) return (p.textContent ?? '').toLowerCase();
-            // Walk up ancestors to capture div-wrapped labels
+            // Walk up MAX 2 levels, stop if container looks like a form group
             let node: Element | null = (el as HTMLElement).parentElement;
-            for (let depth = 0; depth < 5 && node; depth++, node = node.parentElement) {
+            for (let depth = 0; depth < 2 && node; depth++, node = node.parentElement) {
               const tag = node.tagName;
               if (['FORM', 'BODY', 'HTML', 'MAIN', 'SECTION', 'ARTICLE', 'NAV'].includes(tag)) break;
-              const childTexts = Array.from(node.children)
+              if (node.children.length > 5) break;
+              const siblingText = Array.from(node.children)
                 .filter((c) => !['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'SCRIPT', 'STYLE'].includes(c.tagName))
+                .filter((c) => (c.textContent ?? '').length < 60)
                 .map((c) => c.textContent ?? '').join(' ').toLowerCase();
-              if (childTexts.trim()) return childTexts;
+              if (siblingText.trim()) return siblingText;
             }
             return '';
           })(),
@@ -925,10 +926,13 @@ export async function executeSteps(
       // inputs. This handles the case where SIWE auth is blocked (e.g. Privy
       // returning 403 from datacenter IPs) but the form inputs are still
       // interactable — wallet-gating only prevents submission, not field entry.
+      // TOKEN_CREATION one-shot form-fill pass — runs exactly once (adaptiveCallCount === 0),
+      // then adaptiveCallCount is incremented so the condition never fires again.
       if (
         options?.featureType === 'TOKEN_CREATION' &&
         adaptiveCallCount === 0
       ) {
+        adaptiveCallCount++;  // consume one adaptive slot so this never loops
         const visibleInputs = await page.$$eval(
           'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([disabled]), textarea:not([disabled])',
           (els) => els.filter((el) => {
@@ -949,9 +953,10 @@ export async function executeSteps(
           if (fillSteps.length > 0) {
             console.log(`[executor] TOKEN_CREATION form-fill pass: injecting ${fillSteps.length} fill step(s)`);
             stepsToRun.unshift(...fillSteps);
-            continue;  // re-enter loop to execute the injected fill steps
+            continue;  // queue now has fill steps — re-enter to execute them
           }
         }
+        // no inputs found — fall through to normal adaptive step below
       }
 
       // Queue empty but budget remains — ask the LLM what to do next.
@@ -1659,8 +1664,9 @@ async function performStep(page: Page, step: AgentStep, baseDomain: string): Pro
       if (!found) throw new Error(`Input not found: "${step.selector}"`);
 
       // Final guard: inspect the actual DOM element to detect dev buy fields.
-      // Walk up to 5 ancestor levels so we catch div-wrapped labels (very common
-      // in React component libraries that don't use <label for=...>).
+      // Walk up MAX 2 ancestor levels (immediate parent + grandparent) so we
+      // catch div-wrapped labels without accidentally matching the whole form
+      // (which would make every field look like a dev-buy field).
       const isDevBuyField = await inputEl.evaluate((el) => {
         const DEV_BUY_RE = /dev.?buy|initial.?buy|launch.?buy|buy.?amount|purchase.?amount/i;
 
@@ -1677,21 +1683,31 @@ async function performStep(page: Page, step: AgentStep, baseDomain: string): Pro
 
         if (DEV_BUY_RE.test(`${name} ${ph} ${aria} ${id} ${labelText}`)) return true;
 
-        // Walk ancestor chain (up to 5 levels) collecting text from non-interactive
-        // siblings and direct children — catches div-based label patterns.
+        // Walk up MAX 2 ancestor levels only — this catches div-wrapped labels
+        // without reaching the <form> root (which contains all field labels).
+        // Also bail out if a container has more than 4 direct children (it's a
+        // field-group or form section, not a single-field wrapper).
         let node: Element | null = (el as HTMLElement).parentElement;
-        for (let depth = 0; depth < 5 && node; depth++, node = node.parentElement) {
+        for (let depth = 0; depth < 2 && node; depth++, node = node.parentElement) {
           const tag = node.tagName;
           if (['FORM', 'BODY', 'HTML', 'MAIN', 'SECTION', 'ARTICLE', 'NAV'].includes(tag)) break;
+          if (node.children.length > 5) break;  // too many siblings → this is a form group, not a field wrapper
 
-          // Text from every child element that isn't an interactive control
-          const childTexts = Array.from(node.children)
+          // Only look at immediate TEXT children and short sibling elements
+          const directText = Array.from(node.childNodes)
+            .filter((n) => n.nodeType === Node.TEXT_NODE)
+            .map((n) => n.textContent ?? '')
+            .join(' ')
+            .toLowerCase();
+
+          const siblingText = Array.from(node.children)
             .filter((c) => !['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'SCRIPT', 'STYLE'].includes(c.tagName))
+            .filter((c) => (c.textContent ?? '').length < 60)  // skip long descriptive texts
             .map((c) => c.textContent ?? '')
             .join(' ')
             .toLowerCase();
 
-          if (DEV_BUY_RE.test(childTexts)) return true;
+          if (DEV_BUY_RE.test(`${directText} ${siblingText}`)) return true;
         }
 
         return false;
