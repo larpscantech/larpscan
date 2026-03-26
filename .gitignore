@@ -1,2 +1,3 @@
 public/recordings/
 node_modules
+.next/
