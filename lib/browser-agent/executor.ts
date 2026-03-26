@@ -491,6 +491,7 @@ async function decideAdaptiveStep(
   passCondition:      string,
   runningNarratives:  string[],  // one entry per past step — what happened + what page said
   walletAddress?:     string,
+  featureType?:       string,
 ): Promise<AgentStep | null> {
   // Capture screenshot + buttons + current page messages in parallel.
   // The screenshot gives the model full visual context — it can see below-fold
@@ -515,9 +516,21 @@ async function decideAdaptiveStep(
     ? currentMessages.map((m) => `  [${m.type.toUpperCase()}] ${m.text}`).join('\n')
     : '  (none)';
 
+  const tokenCreationExtra = featureType === 'TOKEN_CREATION' ? `
+TOKEN_CREATION CRITICAL RULES (override everything else):
+- A "Connect your wallet" message or "wallet_required" status does NOT mean the form is unusable.
+  Wallet auth only blocks the final SUBMIT — the input fields themselves are always fillable.
+- If you see ANY input fields (Token Name, Symbol, Twitter handle, etc.), fill them NOW.
+  Do NOT return null just because a wallet connection message is visible.
+- Fill order: Token Name → Token Symbol → Description → Website → Twitter → Telegram →
+  scroll down → Dev Buy (set to "0") → Enable Fee Sharing (click toggle) → Twitter/X handle.
+- After all fields are filled, click the "Create Token" submit button.
+- If submit fails due to wallet auth, that is still valid evidence — do NOT return null before trying.
+` : '';
+
   const SYSTEM = `You are a smart human QA tester. Think like a human reading the page.
 You are given a screenshot of the current state AND a step-by-step narrative of what has happened.
-
+${tokenCreationExtra}
 CRITICAL — READ THE PAGE MESSAGES before deciding anything:
 - If a message says "error" or "failed" → identify WHY and fix it (fill a missing field, change a value)
 - If a message says "success", "confirmed", "created", "minted" → the objective is achieved → return null
@@ -906,9 +919,42 @@ export async function executeSteps(
     if (stepsToRun.length > 0) {
       step = stepsToRun.shift();
     } else if (adaptiveCallCount < MAX_ADAPTIVE && observations.length < STEP_BUDGET) {
+      // ── TOKEN_CREATION forced form-fill pass ──────────────────────────────
+      // When the plan queue empties on a TOKEN_CREATION run and no form fields
+      // have been filled yet, perform an immediate scan-and-fill of ALL visible
+      // inputs. This handles the case where SIWE auth is blocked (e.g. Privy
+      // returning 403 from datacenter IPs) but the form inputs are still
+      // interactable — wallet-gating only prevents submission, not field entry.
+      if (
+        options?.featureType === 'TOKEN_CREATION' &&
+        adaptiveCallCount === 0
+      ) {
+        const visibleInputs = await page.$$eval(
+          'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([disabled]), textarea:not([disabled])',
+          (els) => els.filter((el) => {
+            const s = window.getComputedStyle(el);
+            return s.display !== 'none' && s.visibility !== 'hidden' &&
+              (el as HTMLInputElement).offsetWidth > 0;
+          }).length,
+        ).catch(() => 0);
+
+        if (visibleInputs > 0) {
+          console.log(`[executor] TOKEN_CREATION form-fill pass: ${visibleInputs} visible input(s) found — scanning and filling`);
+          const fillSteps = await detectNewFormFields(
+            page,
+            [],  // treat all inputs as "new" so nothing is skipped
+            stepsToRun,
+            options?.investigationWalletAddress,
+          );
+          if (fillSteps.length > 0) {
+            console.log(`[executor] TOKEN_CREATION form-fill pass: injecting ${fillSteps.length} fill step(s)`);
+            stepsToRun.unshift(...fillSteps);
+            continue;  // re-enter loop to execute the injected fill steps
+          }
+        }
+      }
+
       // Queue empty but budget remains — ask the LLM what to do next.
-      // This is the core of the smarter loop: instead of stopping when the
-      // static plan runs out, observe the current state and decide one more action.
       console.log(`[executor] Queue empty — calling adaptive step decision (call ${adaptiveCallCount + 1}/${MAX_ADAPTIVE})`);
       const adaptive = await decideAdaptiveStep(
         page,
@@ -916,6 +962,7 @@ export async function executeSteps(
         options?.passCondition ?? '',
         runningNarratives,
         options?.investigationWalletAddress,
+        options?.featureType,
       ).catch(() => null);
       adaptiveCallCount++;
       if (!adaptive) {
@@ -1013,6 +1060,7 @@ export async function executeSteps(
               options.passCondition ?? '',
               runningNarratives,
               options.investigationWalletAddress,
+              options.featureType,
             ).catch(() => null);
             adaptiveCallCount++;
             if (adaptive) {
@@ -1127,6 +1175,7 @@ export async function executeSteps(
           options.passCondition ?? '',
           runningNarratives,
           options.investigationWalletAddress,
+          options.featureType,
         ).catch(() => null);
         if (fix) {
           stepsToRun.unshift(fix);
@@ -1328,7 +1377,7 @@ export async function executeSteps(
         console.log('[executor] Noop threshold — trying adaptive recovery step');
         const adaptive = await decideAdaptiveStep(
           page, options.claim, options.passCondition ?? '', runningNarratives,
-          options.investigationWalletAddress,
+          options.investigationWalletAddress, options.featureType,
         ).catch(() => null);
         adaptiveCallCount++;
         if (adaptive) {
