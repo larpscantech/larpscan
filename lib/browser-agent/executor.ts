@@ -526,11 +526,12 @@ async function decideAdaptiveStep(
   walletAddress?:     string,
   featureType?:       string,
 ): Promise<AgentStep | null> {
-  // Capture screenshot + buttons + current page messages in parallel.
+  // Capture screenshot + buttons + page messages + live form fields in parallel.
   // The screenshot gives the model full visual context — it can see below-fold
   // buttons, loaded previews, and UI state a text snippet would miss entirely.
   // The page messages tell it what the page is explicitly communicating right now.
-  const [screenshotBuf, btns, currentMessages] = await Promise.all([
+  // liveFormFields provides EXACT CSS selectors so the model never has to guess them.
+  const [screenshotBuf, btns, currentMessages, liveFormFields] = await Promise.all([
     page.screenshot({ type: 'jpeg', quality: 60, fullPage: false }).catch(() => null as Buffer | null),
     page.$$eval(
       'button:not([disabled]), [role="button"]:not([aria-disabled="true"])',
@@ -540,6 +541,22 @@ async function decideAdaptiveStep(
         .slice(0, 10),
     ).catch(() => [] as string[]),
     capturePageMessages(page),
+    page.$$eval(
+      'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([disabled]), textarea:not([disabled])',
+      (els) => els
+        .filter((el) => {
+          const s = window.getComputedStyle(el);
+          return s.display !== 'none' && s.visibility !== 'hidden';
+        })
+        .map((el) => {
+          const ph  = (el as HTMLInputElement).placeholder ?? '';
+          const nm  = (el as HTMLInputElement).name ?? '';
+          const sel = nm ? `[name="${nm}"]` : ph ? `[placeholder="${ph}"]` : 'input';
+          const val = ((el as HTMLInputElement).value ?? '').trim();
+          return `${sel}${val ? ` (currently: "${val.slice(0, 20)}")` : ' (empty)'}`;
+        })
+        .slice(0, 14),
+    ).catch(() => [] as string[]),
   ]);
 
   const url = page.url();
@@ -614,6 +631,9 @@ Rules:
     currentMsgStr,
     '',
     `Visible enabled buttons: [${btns.join(' | ')}]`,
+    liveFormFields.length > 0
+      ? `\nActual form field selectors (use EXACTLY these for fill_input — do NOT invent selectors):\n${liveFormFields.map((f) => `  ${f}`).join('\n')}`
+      : '',
   ].filter((l) => l !== undefined).join('\n');
 
   // Build multimodal content when screenshot is available; fall back to text-only
@@ -674,6 +694,7 @@ async function detectNewFormFields(
   inputsBefore:    string[],
   alreadyQueued:   AgentStep[],
   walletAddress?:  string,
+  maxSteps        = 4,
 ): Promise<AgentStep[]> {
   const newSteps: AgentStep[] = [];
 
@@ -760,7 +781,7 @@ async function detectNewFormFields(
     }
   }
 
-  return newSteps.slice(0, 4);  // cap per scroll
+  return newSteps.slice(0, maxSteps);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -982,6 +1003,7 @@ export async function executeSteps(
             [],  // treat all inputs as "new" so nothing is skipped
             stepsToRun,
             options?.investigationWalletAddress,
+            12,  // lift cap so all fields (including social handles) are covered
           );
           if (fillSteps.length > 0) {
             console.log(`[executor] TOKEN_CREATION form-fill pass: injecting ${fillSteps.length} fill step(s)`);
@@ -1661,12 +1683,13 @@ async function performStep(page: Page, step: AgentStep, baseDomain: string): Pro
         const matchIndex = await page.$$eval(
           'input:not([type="hidden"]), textarea, select',
           (nodes, tok) => {
-            const visible = nodes.filter((el) => {
+            // Use the full DOM index (not a visibility-filtered sub-index) so
+            // page.locator().nth(matchIndex) points to the same element.
+            const scored = nodes.map((el, domIdx) => {
               const s = window.getComputedStyle(el);
-              return s.display !== 'none' && s.visibility !== 'hidden';
-            });
-
-            const scored = visible.map((el, visibleIdx) => {
+              if (s.display === 'none' || s.visibility === 'hidden') {
+                return { domIdx, score: -Infinity };
+              }
               const id = (el as HTMLElement).id;
               const lbl = id
                 ? (document.querySelector(`label[for="${id}"]`)?.textContent ?? '')
@@ -1680,12 +1703,21 @@ async function performStep(page: Page, step: AgentStep, baseDomain: string): Pro
               const requiredBoost = (el as HTMLInputElement).required ? 1 : 0;
               const type = ((el as HTMLInputElement).type ?? '').toLowerCase();
               const typeBoost = /text|email|number|search|url/.test(type) ? 1 : 0;
-              const score = (tok.length > 1 && text.includes(tok.toLowerCase()) ? 2 : 0) + requiredBoost + typeBoost;
-              return { visibleIdx, score };
+              // Word-level overlap: split tok into meaningful keywords and count
+              // how many appear in the input's combined text. This handles
+              // hallucinated selectors like "[placeholder="Twitter handle (optional)"]"
+              // where "twitter" still matches the Twitter field's label text.
+              const words = tok
+                .split(' ')
+                .filter((w: string) => w.length > 3 && !['placeholder', 'selector', 'input', 'textarea', 'select'].includes(w));
+              const wordHits = words.filter((w: string) => text.includes(w)).length;
+              const score = (wordHits > 0 ? wordHits + 1 : 0) + requiredBoost + typeBoost;
+              return { domIdx, score };
             });
 
             scored.sort((a, b) => b.score - a.score);
-            return scored[0]?.visibleIdx ?? 0;
+            const best = scored.find((x) => isFinite(x.score));
+            return best?.domIdx ?? 0;
           },
           token,
         ).catch(() => 0);

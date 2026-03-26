@@ -50,7 +50,18 @@ export async function ensureFFmpegForPlaywright(): Promise<void> {
       revision = browsersJson.browsers?.find(b => b.name === 'ffmpeg')?.revision ?? revision;
     } catch { /* use fallback */ }
 
+    // ffmpeg-static exports the path to its bundled binary.
+    // Guard: if the binary doesn't exist in the deployment (e.g. Lambda bundles
+    // sometimes omit large native binaries), skip setup rather than crashing.
+    const ffmpegSource = (await import('ffmpeg-static')).default as string;
+    if (!ffmpegSource || !fsSync.existsSync(ffmpegSource)) {
+      console.warn('[browser] ffmpeg-static binary not present at expected path — recording disabled');
+      return;
+    }
+
     // Tell Playwright to look in /tmp for all browser binaries.
+    // Only set this after confirming ffmpeg source exists so we don't redirect
+    // Playwright's browser path when recording is unavailable.
     const tmpBrowsersPath = '/tmp/playwright-browsers';
     process.env.PLAYWRIGHT_BROWSERS_PATH = tmpBrowsersPath;
 
@@ -58,9 +69,6 @@ export async function ensureFFmpegForPlaywright(): Promise<void> {
     const ffmpegTarget = path.join(ffmpegDir, 'ffmpeg-linux');
 
     if (!fsSync.existsSync(ffmpegTarget)) {
-      // ffmpeg-static exports the path to its bundled binary.
-      const ffmpegSource = (await import('ffmpeg-static')).default as string;
-
       await fs.mkdir(ffmpegDir, { recursive: true });
       await fs.copyFile(ffmpegSource, ffmpegTarget);
       await fs.chmod(ffmpegTarget, 0o755);
