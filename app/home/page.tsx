@@ -7,36 +7,25 @@ import { AnimatePresence, motion, useInView } from 'framer-motion';
 import { Navbar } from '@/components/navbar';
 import { useLocale } from '@/components/locale-provider';
 
-// Draw phase: 0 – 800 ms  |  Fill phase: 800 – 2400 ms  |  Exit: 2700 ms
-const DRAW_END_MS  = 800;
-const FILL_END_MS  = 2400;
-const EXIT_MS      = 2700;
+// Fill phase: 0 – 1800 ms  |  Exit: 2100 ms
+const FILL_END_MS = 1800;
+const EXIT_MS     = 2100;
 
 function IntroAnimation({ onComplete }: { onComplete: () => void }) {
   const { locale } = useLocale();
 
-  // Single state tick so React batches one render per frame
-  const [tick, setTick] = useState<{
-    fillProgress: number;
-    waveT: number;
-    buildValue: number;
-  }>({ fillProgress: 0, waveT: 0, buildValue: 0 });
+  const [tick, setTick] = useState({ fillProgress: 0, waveT: 0, buildValue: 0 });
 
   useEffect(() => {
     let raf = 0;
     const origin = performance.now();
 
     const step = (now: number) => {
-      const elapsed     = now - origin;
-      const fillElapsed = Math.max(0, elapsed - DRAW_END_MS);
-      const fillRatio   = Math.min(1, fillElapsed / (FILL_END_MS - DRAW_END_MS));
-      const eased       = 1 - Math.pow(1 - fillRatio, 2.5);
+      const elapsed   = now - origin;
+      const fillRatio = Math.min(1, elapsed / FILL_END_MS);
+      const eased     = 1 - Math.pow(1 - fillRatio, 2.5);
 
-      setTick({
-        fillProgress: eased,
-        waveT:        elapsed * 0.006,
-        buildValue:   Math.round(eased * 100),
-      });
+      setTick({ fillProgress: eased, waveT: elapsed * 0.006, buildValue: Math.round(eased * 100) });
 
       if (elapsed < FILL_END_MS) raf = requestAnimationFrame(step);
     };
@@ -48,15 +37,14 @@ function IntroAnimation({ onComplete }: { onComplete: () => void }) {
 
   const { fillProgress, waveT, buildValue } = tick;
 
-  // Wave polygon that rises from bottom (fillProgress=0) to top (fillProgress=1)
   const topY = 200 * (1 - fillProgress);
-  const amp  = 9 * Math.max(0, 1 - fillProgress * 1.1);  // flatten near 100%
-  const sin  = (phase: number) => amp * Math.sin(waveT + phase);
+  const amp  = 10 * Math.max(0, 1 - fillProgress * 1.1);
+  const sin  = (p: number) => amp * Math.sin(waveT + p);
 
   const wavePath = fillProgress > 0.001
     ? [
         `M 0 ${topY + sin(0)}`,
-        `C 35 ${topY - amp + sin(1)},  70 ${topY + amp + sin(2)}, 100 ${topY + sin(3)}`,
+        `C 40 ${topY - amp + sin(1)}, 80 ${topY + amp + sin(2)}, 100 ${topY + sin(3)}`,
         `C 130 ${topY - amp + sin(4)}, 165 ${topY + amp + sin(1.5)}, 200 ${topY + sin(2.5)}`,
         `L 200 200 L 0 200 Z`,
       ].join(' ')
@@ -67,12 +55,11 @@ function IntroAnimation({ onComplete }: { onComplete: () => void }) {
       className="fixed inset-0 z-[200] bg-[#050507] flex items-center justify-center overflow-hidden"
       exit={{ opacity: 0, transition: { duration: 0.3 } }}
     >
-      {/* Ambient red glow */}
       <motion.div
         className="absolute inset-0 pointer-events-none"
         style={{
-          background: 'radial-gradient(circle at 50% 48%, rgba(220,38,38,0.14) 0%, rgba(220,38,38,0.05) 30%, transparent 58%)',
-          filter: 'blur(36px)',
+          background: 'radial-gradient(circle at 50% 48%, rgba(220,38,38,0.12) 0%, rgba(220,38,38,0.04) 35%, transparent 60%)',
+          filter: 'blur(40px)',
         }}
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
@@ -81,18 +68,13 @@ function IntroAnimation({ onComplete }: { onComplete: () => void }) {
 
       <div className="relative z-10 flex flex-col items-center px-8">
         <motion.div
-          className="relative w-[300px] h-[300px] sm:w-[400px] sm:h-[400px]"
-          initial={{ opacity: 0, scale: 0.9 }}
+          className="relative w-[280px] h-[280px] sm:w-[380px] sm:h-[380px]"
+          initial={{ opacity: 0, scale: 0.92 }}
           animate={{ opacity: 1, scale: 1 }}
-          transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+          transition={{ duration: 0.35, ease: [0.16, 1, 0.3, 1] }}
         >
-          {/* Inner bloom */}
-          <div className="absolute inset-[18%] rounded-full pointer-events-none"
-            style={{ background: 'radial-gradient(circle, rgba(220,38,38,0.2) 0%, transparent 70%)', filter: 'blur(18px)' }} />
-
           <svg viewBox="0 0 200 200" className="w-full h-full">
             <defs>
-              {/* Clip to cross + dot only — wave cannot escape the shape */}
               <mask id="ls-mask" maskUnits="userSpaceOnUse">
                 <rect x="0" y="0" width="200" height="200" fill="black" />
                 <path d="M100 28 V172 M28 100 H172"
@@ -100,52 +82,18 @@ function IntroAnimation({ onComplete }: { onComplete: () => void }) {
                 <circle cx="155" cy="155" r="16" fill="white" />
               </mask>
               <linearGradient id="ls-fill" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%"  stopColor="#ff9da6" />
-                <stop offset="50%" stopColor="#ff4d5a" />
-                <stop offset="100%" stopColor="#e0323c" />
+                <stop offset="0%"   stopColor="#ff8a94" />
+                <stop offset="50%"  stopColor="#f03848" />
+                <stop offset="100%" stopColor="#c42040" />
               </linearGradient>
             </defs>
 
-            {/* ── 1. Dark skeleton — always shown ───────────────────────────── */}
+            {/* Cross — always fully visible, dark base */}
             <path d="M100 28 V172 M28 100 H172"
-              stroke="#1e1520" strokeWidth="28" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+              stroke="#1a1218" strokeWidth="28" strokeLinecap="round" strokeLinejoin="round" fill="none" />
             <circle cx="155" cy="155" r="16" fill="#1a1218" />
 
-            {/* ── 2. DRAW — vertical arm (bright chalk, draws top-to-bottom) ── */}
-            <motion.path
-              d="M100 28 V172"
-              stroke="#c42040"
-              strokeWidth="28"
-              strokeLinecap="round"
-              fill="none"
-              initial={{ pathLength: 0, opacity: 1 }}
-              animate={{ pathLength: 1, opacity: 1 }}
-              transition={{ duration: 0.55, ease: [0.4, 0, 0.2, 1] }}
-            />
-
-            {/* ── 2. DRAW — horizontal arm (draws left-to-right, 0.22s delay) ─ */}
-            <motion.path
-              d="M28 100 H172"
-              stroke="#c42040"
-              strokeWidth="28"
-              strokeLinecap="round"
-              fill="none"
-              initial={{ pathLength: 0, opacity: 1 }}
-              animate={{ pathLength: 1, opacity: 1 }}
-              transition={{ duration: 0.45, delay: 0.22, ease: [0.4, 0, 0.2, 1] }}
-            />
-
-            {/* ── 2. DRAW — dot pops in ────────────────────────────────────── */}
-            <motion.circle
-              cx="155" cy="155" r="15"
-              fill="#c42040"
-              style={{ transformOrigin: '155px 155px' }}
-              initial={{ scale: 0 }}
-              animate={{ scale: 1 }}
-              transition={{ duration: 0.2, delay: 0.56, ease: [0.16, 1, 0.3, 1] }}
-            />
-
-            {/* ── 3. WAVE FILL — masked strictly to cross shape ────────────── */}
+            {/* Wavy red fill rises through the cross */}
             {wavePath && (
               <g mask="url(#ls-mask)">
                 <path d={wavePath} fill="url(#ls-fill)" />
@@ -154,17 +102,16 @@ function IntroAnimation({ onComplete }: { onComplete: () => void }) {
           </svg>
         </motion.div>
 
-        {/* BUILD counter */}
         <motion.div
-          className="mt-6 flex items-center gap-12"
+          className="mt-8 flex items-center gap-10"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
-          transition={{ duration: 0.4, delay: 0.25 }}
+          transition={{ duration: 0.4, delay: 0.15 }}
         >
-          <span className="text-[16px] sm:text-[20px] text-zinc-400 uppercase tracking-[0.12em]">
+          <span className="text-[15px] sm:text-[18px] text-zinc-500 uppercase tracking-[0.14em]">
             {locale === 'zh-TW' ? '構建' : 'BUILD'}
           </span>
-          <span className="font-mono text-[16px] sm:text-[20px] text-red-300 tabular-nums min-w-[3ch]">
+          <span className="font-mono text-[15px] sm:text-[18px] text-red-400 tabular-nums min-w-[3ch]">
             {buildValue}
           </span>
         </motion.div>
