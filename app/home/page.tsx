@@ -80,11 +80,6 @@ function IntroAnimation({ onComplete }: { onComplete: () => void }) {
                 <stop offset="45%" stopColor="#ff646d" />
                 <stop offset="100%" stopColor="#ff4d57" />
               </linearGradient>
-              <linearGradient id="larpscan-wave-stroke" x1="0" y1="0" x2="1" y2="0">
-                <stop offset="0%" stopColor="#ffd0d5" stopOpacity="0.18" />
-                <stop offset="50%" stopColor="#fff3f5" stopOpacity="0.92" />
-                <stop offset="100%" stopColor="#ffd0d5" stopOpacity="0.18" />
-              </linearGradient>
             </defs>
 
             {/* base outline */}
@@ -108,27 +103,6 @@ function IntroAnimation({ onComplete }: { onComplete: () => void }) {
                 initial={{ y: 200 }}
                 animate={{ y: 0 }}
                 transition={{ duration: 2.2, ease: [0.16, 1, 0.3, 1] }}
-              />
-              <motion.path
-                d="M-10 120 C 18 108, 50 128, 84 118 C 118 108, 146 128, 178 118 C 196 112, 212 118, 220 118"
-                fill="none"
-                stroke="url(#larpscan-wave-stroke)"
-                strokeWidth="3"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                initial={{ y: 92 }}
-                animate={{
-                  y: -4,
-                  d: [
-                    'M-10 120 C 18 108, 50 128, 84 118 C 118 108, 146 128, 178 118 C 196 112, 212 118, 220 118',
-                    'M-10 112 C 22 124, 52 100, 84 112 C 118 124, 148 100, 180 112 C 198 118, 212 112, 220 112',
-                    'M-10 120 C 18 108, 50 128, 84 118 C 118 108, 146 128, 178 118 C 196 112, 212 118, 220 118'
-                  ]
-                }}
-                transition={{
-                  y: { duration: 2.2, ease: [0.16, 1, 0.3, 1] },
-                  d: { duration: 1.05, repeat: Infinity, ease: 'easeInOut' }
-                }}
               />
             </g>
           </svg>
@@ -241,12 +215,6 @@ function HeroSection() {
             >
               {copy.enter} <ArrowRight className="w-3.5 h-3.5" />
             </Link>
-            <a
-            href="#method"
-            className="inline-flex items-center text-[11px] font-semibold uppercase tracking-[0.18em] text-zinc-500 hover:text-zinc-300 transition-colors"
-            >
-            {copy.method}
-            </a>
         </motion.div>
           </div>
         </section>

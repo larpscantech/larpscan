@@ -324,10 +324,27 @@ function substituteFeeShareSocialHandle(step: AgentStep, handle: string): AgentS
   return { ...step, value: v.split(FEE_SHARE_SOCIAL_HANDLE_FILL_TOKEN).join(handle) };
 }
 
-/** Applies wallet + fee-share tokens in order for fill_input steps */
+const DEV_BUY_PATTERN = /dev.?buy|initial.?buy|launch.?buy|buy.?amount|purchase.?amount/i;
+
+/** Force dev buy / initial purchase fields to "0" based on the selector text. */
+function substituteDevBuyToZero(step: AgentStep): AgentStep {
+  if (step.action !== 'fill_input') return step;
+  const selector = (step.selector ?? '').toLowerCase();
+  const value    = (typeof step.value === 'string' ? step.value : '').toLowerCase();
+  // Also catch the case where the LLM fills a generic 'amount' field with a
+  // BNB-style float (e.g. "0.5", "1.0") inside a TOKEN_CREATION context.
+  if (DEV_BUY_PATTERN.test(selector) || DEV_BUY_PATTERN.test(value)) {
+    console.log(`[executor] Dev buy override: selector="${step.selector}" value="${step.value}" → "0"`);
+    return { ...step, value: '0' };
+  }
+  return step;
+}
+
+/** Applies wallet + fee-share + dev-buy tokens in order for fill_input steps */
 function applyFillInputSubstitutions(step: AgentStep, opts?: { investigationWalletAddress?: string }): AgentStep {
   let s = substituteInvestigationWallet(step, opts?.investigationWalletAddress);
   s = substituteFeeShareSocialHandle(s, FEE_SHARE_X_HANDLE_VALUE);
+  s = substituteDevBuyToZero(s);
   return s;
 }
 
@@ -1531,7 +1548,30 @@ async function performStep(page: Page, step: AgentStep, baseDomain: string): Pro
 
       if (!found) throw new Error(`Input not found: "${step.selector}"`);
 
-      await inputEl.fill(step.value, { timeout: 5_000 });
+      // Final guard: inspect the actual DOM element to detect dev buy fields
+      // that the planner may have described with an ambiguous selector.
+      const isDevBuyField = await inputEl.evaluate((el) => {
+        const name      = ((el as HTMLInputElement).name        ?? '').toLowerCase();
+        const ph        = ((el as HTMLInputElement).placeholder ?? '').toLowerCase();
+        const aria      = (el.getAttribute('aria-label')        ?? '').toLowerCase();
+        const id        = ((el as HTMLElement).id               ?? '').toLowerCase();
+        const labelEl   = el.id
+          ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`)
+          : el.closest('label');
+        const labelText = (labelEl?.textContent ?? '').toLowerCase();
+        const prev      = (el as HTMLElement).previousElementSibling;
+        const prevText  = (prev?.tagName === 'LABEL' || prev?.tagName === 'SPAN' || prev?.tagName === 'P')
+          ? (prev.textContent ?? '').toLowerCase() : '';
+        const combined  = `${name} ${ph} ${aria} ${id} ${labelText} ${prevText}`;
+        return /dev.?buy|initial.?buy|launch.?buy|buy.?amount|purchase.?amount/.test(combined);
+      }).catch(() => false);
+
+      const finalFillValue = isDevBuyField ? '0' : step.value;
+      if (isDevBuyField && step.value !== '0') {
+        console.log(`[executor] DOM dev buy field detected — overriding value "${step.value}" → "0"`);
+      }
+
+      await inputEl.fill(finalFillValue, { timeout: 5_000 });
       await page.waitForTimeout(800);
       break;
     }

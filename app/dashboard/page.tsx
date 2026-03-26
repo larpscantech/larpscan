@@ -488,11 +488,11 @@ export default function DashboardPage() {
   }, []);
 
   // ── Core verification pipeline ────────────────────────────────────────────────
-  const startVerification = useCallback(async () => {
+  const startVerification = useCallback(async (overrideAddress?: string) => {
     const myRunId = ++runIdRef.current;
     const alive   = () => runIdRef.current === myRunId;
     const sleep   = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-    const address = input.trim();
+    const address = (overrideAddress ?? input).trim();
 
     // ── Hard reset all state ──────────────────────────────────────────────────
     setDisplayedLogs([]);
@@ -826,13 +826,21 @@ export default function DashboardPage() {
       elapsed: `${elapsed}s`,
     });
     console.groupEnd();
-  }, [input, scanType, addLog, elapsed, fetchRecentScans]);
+  }, [input, scanType, forceReverify, addLog, elapsed, fetchRecentScans]);
 
   // ── Reset ──────────────────────────────────────────────────────────────────
   const handleSubmit = useCallback(() => {
     if (!input.trim() || (phase !== 'idle' && phase !== 'complete')) return;
     startVerification();
   }, [input, phase, startVerification]);
+
+  // ── Load a previous scan from the recent-scans table ───────────────────────
+  const handleSelectRecentScan = useCallback((v: import('@/lib/types').RecentVerification) => {
+    if (phase !== 'idle' && phase !== 'complete') return;
+    setInput(v.project.contractAddress);
+    // Pass the address directly so startVerification doesn't race with setState
+    startVerification(v.project.contractAddress);
+  }, [phase, startVerification]);
 
   const handleReset = useCallback(() => {
     console.log(`${TAG} Reset triggered`, STYLE);
@@ -1048,7 +1056,7 @@ export default function DashboardPage() {
           {!isActive && <EmptyState />}
 
           <SectionDivider label={isZh ? '近期掃描' : 'Recent Scans'} />
-          <RecentVerificationsTable verifications={tableData} />
+          <RecentVerificationsTable verifications={tableData} onSelect={handleSelectRecentScan} />
           </motion.div>
         </AnimatePresence>
       </main>

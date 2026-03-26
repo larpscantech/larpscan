@@ -1,6 +1,6 @@
 'use client';
 
-import { Copy } from 'lucide-react';
+import { Copy, ArrowUpRight } from 'lucide-react';
 import { StatusBadge } from './status-badge';
 import { truncateAddressPump } from '@/lib/utils';
 import type { RecentVerification } from '@/lib/types';
@@ -8,6 +8,7 @@ import { useLocale } from '@/components/locale-provider';
 
 interface RecentVerificationsTableProps {
   verifications: RecentVerification[];
+  onSelect?: (v: RecentVerification) => void;
 }
 
 function CopyBtn({ address }: { address: string }) {
@@ -47,12 +48,12 @@ function QABar({ verified, total }: { verified: number; total: number }) {
   );
 }
 
-export function RecentVerificationsTable({ verifications }: RecentVerificationsTableProps) {
+export function RecentVerificationsTable({ verifications, onSelect }: RecentVerificationsTableProps) {
   const { locale } = useLocale();
   const isZh = locale === 'zh-TW';
   const COL_HEADERS = isZh
-    ? ['代幣', '合約地址', '狀態', 'QA 分數', '預估時間']
-    : ['Token', 'Contract Address', 'Status', 'QA Score', 'Est. Time'];
+    ? ['代幣', '合約地址', '狀態', 'QA 分數', '預估時間', '']
+    : ['Token', 'Contract Address', 'Status', 'QA Score', 'Est. Time', ''];
 
   return (
     <div className="rounded-sm border border-[#1c1c22] bg-[#09090d] overflow-hidden">
@@ -88,24 +89,39 @@ export function RecentVerificationsTable({ verifications }: RecentVerificationsT
             </tr>
           </thead>
           <tbody>
-            {verifications.map((v, i) => (
+            {verifications.map((v, i) => {
+              const isComplete = v.status === 'complete';
+              const isClickable = isComplete && Boolean(onSelect);
+              return (
               <tr
                 key={v.id}
+                onClick={isClickable ? () => onSelect!(v) : undefined}
                 className={[
-                  'group transition-all duration-150 hover:bg-[#101015]',
+                  'group transition-all duration-150',
+                  isClickable
+                    ? 'cursor-pointer hover:bg-[#0f0f14] active:bg-[#13080a]'
+                    : 'hover:bg-[#101015]',
                   i < verifications.length - 1 ? 'border-b border-[#1f1f27]' : '',
                 ].join(' ')}
               >
                 {/* Token */}
                 <td className="px-7 py-4">
                   <div className="flex items-center gap-3">
-                    <div className="w-8 h-8 rounded-sm bg-[#101015] border border-[#1f1f27] flex items-center justify-center flex-shrink-0 group-hover:border-zinc-600/60 transition-colors">
+                    <div className={[
+                      'w-8 h-8 rounded-sm bg-[#101015] border flex items-center justify-center flex-shrink-0 transition-colors',
+                      isClickable
+                        ? 'border-[#1f1f27] group-hover:border-red-600/30'
+                        : 'border-[#1f1f27] group-hover:border-zinc-600/60',
+                    ].join(' ')}>
                       <span className="text-[10px] font-bold text-zinc-500">
                         {v.project.logoInitial ?? v.project.name[0]}
                       </span>
                     </div>
                     <div>
-                      <p className="text-[13px] font-semibold text-white leading-tight">
+                      <p className={[
+                        'text-[13px] font-semibold leading-tight transition-colors',
+                        isClickable ? 'text-white group-hover:text-red-400' : 'text-white',
+                      ].join(' ')}>
                         {v.project.name}
                       </p>
                       <p className="text-[10px] text-zinc-600 font-mono mt-0.5">
@@ -143,8 +159,16 @@ export function RecentVerificationsTable({ verifications }: RecentVerificationsT
                     {v.estTime ?? '—'}
                   </span>
                 </td>
+
+                {/* View arrow — only shown for clickable complete rows */}
+                <td className="px-4 py-4 w-8">
+                  {isClickable && (
+                    <ArrowUpRight className="w-3.5 h-3.5 text-zinc-700 group-hover:text-red-500 transition-colors" />
+                  )}
+                </td>
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       </div>

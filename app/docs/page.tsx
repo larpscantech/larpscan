@@ -1,5 +1,6 @@
 'use client';
 
+import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { ArrowRight, ShieldCheck, Bot, Scale } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
@@ -53,6 +54,12 @@ function InfoCard({
 export default function DocsPage() {
   const { locale } = useLocale();
   const isZh = locale === 'zh-TW';
+  const [entered, setEntered] = useState(false);
+
+  useEffect(() => {
+    const t = setTimeout(() => setEntered(true), 30);
+    return () => clearTimeout(t);
+  }, []);
 
   const copy = isZh
     ? {
@@ -221,21 +228,27 @@ export default function DocsPage() {
 
   return (
     <div className="min-h-screen bg-[#050507] text-white">
-      <Navbar />
+      <motion.div
+        initial={{ opacity: 0, y: -18, filter: 'blur(6px)' }}
+        animate={entered ? { opacity: 1, y: 0, filter: 'blur(0px)' } : { opacity: 0, y: -18, filter: 'blur(6px)' }}
+        transition={{ duration: 0.45, ease: [0.16, 1, 0.3, 1] }}
+      >
+        <Navbar />
+      </motion.div>
       <main className="pt-20">
         <AnimatePresence mode="wait" initial={false}>
           <motion.div
             key={`docs-${locale}`}
-            initial={{ opacity: 0, y: 18, filter: 'blur(6px)' }}
-            animate={{ opacity: 1, y: 0, filter: 'blur(0px)' }}
+            initial={{ opacity: 0, y: 22, filter: 'blur(8px)' }}
+            animate={entered ? { opacity: 1, y: 0, filter: 'blur(0px)' } : { opacity: 0, y: 22, filter: 'blur(8px)' }}
             exit={{ opacity: 0, y: -18, filter: 'blur(6px)' }}
-            transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
+            transition={{ duration: 0.48, delay: 0.06, ease: [0.16, 1, 0.3, 1] }}
             className="max-w-[1240px] mx-auto px-8 pb-24"
           >
           <motion.header
-            initial={{ opacity: 0, y: 18 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.45 }}
+            initial={{ opacity: 0, y: 20 }}
+            animate={entered ? { opacity: 1, y: 0 } : { opacity: 0, y: 20 }}
+            transition={{ duration: 0.52, delay: 0.14, ease: [0.16, 1, 0.3, 1] }}
             className="py-14"
           >
             <p className="text-[10px] uppercase tracking-[0.32em] text-zinc-600 mb-5">{copy.headerLabel}</p>
@@ -369,3 +382,4 @@ export default function DocsPage() {
     </div>
   );
 }
+
