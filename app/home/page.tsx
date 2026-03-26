@@ -10,32 +10,23 @@ import { useLocale } from '@/components/locale-provider';
 function IntroAnimation({ onComplete }: { onComplete: () => void }) {
   const { locale } = useLocale();
   const [buildValue, setBuildValue] = useState(0);
-  const [wavePhase, setWavePhase] = useState(0);
-  const progress = buildValue / 100;
-  const fillTop = 200 - 200 * progress;
-  const waveA = Math.sin(wavePhase) * 4;
-  const waveB = Math.cos(wavePhase * 1.15) * 4;
-  const wavePath = `M 0 ${fillTop + waveA} C 34 ${fillTop - 6 + waveB}, 68 ${fillTop + 6 - waveA}, 100 ${fillTop + waveA} C 132 ${fillTop - 6 + waveA}, 166 ${fillTop + 6 + waveB}, 200 ${fillTop + waveB} L 200 200 L 0 200 Z`;
 
   useEffect(() => {
-    const start = performance.now();
     const totalMs = 2200;
-    let raf = 0;
-
-    const tick = (now: number) => {
-      const elapsed = now - start;
+    const startedAt = Date.now();
+    const interval = window.setInterval(() => {
+      const elapsed = Date.now() - startedAt;
       const ratio = Math.min(1, elapsed / totalMs);
       const eased = 1 - Math.pow(1 - ratio, 3);
       setBuildValue(Math.min(100, Math.round(eased * 100)));
-      setWavePhase(elapsed * 0.012);
-      if (ratio < 1) raf = requestAnimationFrame(tick);
-    };
-
-    raf = requestAnimationFrame(tick);
+      if (ratio >= 1) {
+        window.clearInterval(interval);
+      }
+    }, 32);
     const t = setTimeout(onComplete, 2550);
 
     return () => {
-      cancelAnimationFrame(raf);
+      window.clearInterval(interval);
       clearTimeout(t);
     };
   }, [onComplete]);
@@ -72,16 +63,27 @@ function IntroAnimation({ onComplete }: { onComplete: () => void }) {
           />
           <svg viewBox="0 0 200 200" className="w-full h-full">
             <defs>
-              <clipPath id="larpscan-plus-fill">
-                <path d={wavePath} />
-              </clipPath>
-              <clipPath id="larpscan-dot-fill">
-                <path d={wavePath} />
-              </clipPath>
+              <mask id="larpscan-mark-mask" maskUnits="userSpaceOnUse">
+                <rect x="0" y="0" width="200" height="200" fill="black" />
+                <path
+                  d="M100 28 V172 M28 100 H172"
+                  stroke="white"
+                  strokeWidth="28"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  fill="none"
+                />
+                <circle cx="155" cy="155" r="16" fill="white" />
+              </mask>
               <linearGradient id="larpscan-fill" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#ffb3b3" />
-                <stop offset="32%" stopColor="#ff6b6b" />
-                <stop offset="100%" stopColor="#fff1f1" />
+                <stop offset="0%" stopColor="#ff8a93" />
+                <stop offset="45%" stopColor="#ff646d" />
+                <stop offset="100%" stopColor="#ff4d57" />
+              </linearGradient>
+              <linearGradient id="larpscan-wave-stroke" x1="0" y1="0" x2="1" y2="0">
+                <stop offset="0%" stopColor="#ffd0d5" stopOpacity="0.18" />
+                <stop offset="50%" stopColor="#fff3f5" stopOpacity="0.92" />
+                <stop offset="100%" stopColor="#ffd0d5" stopOpacity="0.18" />
               </linearGradient>
             </defs>
 
@@ -96,20 +98,38 @@ function IntroAnimation({ onComplete }: { onComplete: () => void }) {
             />
             <circle cx="155" cy="155" r="16" stroke="#2d2528" strokeWidth="2" fill="none" />
 
-            {/* filled shape */}
-            <g clipPath="url(#larpscan-plus-fill)">
-              <path
-                d="M100 28 V172 M28 100 H172"
-                stroke="url(#larpscan-fill)"
-                strokeWidth="28"
+            <g mask="url(#larpscan-mark-mask)">
+              <motion.rect
+                x="0"
+                y="0"
+                width="200"
+                height="200"
+                fill="url(#larpscan-fill)"
+                initial={{ y: 200 }}
+                animate={{ y: 0 }}
+                transition={{ duration: 2.2, ease: [0.16, 1, 0.3, 1] }}
+              />
+              <motion.path
+                d="M-10 120 C 18 108, 50 128, 84 118 C 118 108, 146 128, 178 118 C 196 112, 212 118, 220 118"
+                fill="none"
+                stroke="url(#larpscan-wave-stroke)"
+                strokeWidth="3"
                 strokeLinecap="round"
                 strokeLinejoin="round"
-                fill="none"
+                initial={{ y: 92 }}
+                animate={{
+                  y: -4,
+                  d: [
+                    'M-10 120 C 18 108, 50 128, 84 118 C 118 108, 146 128, 178 118 C 196 112, 212 118, 220 118',
+                    'M-10 112 C 22 124, 52 100, 84 112 C 118 124, 148 100, 180 112 C 198 118, 212 112, 220 112',
+                    'M-10 120 C 18 108, 50 128, 84 118 C 118 108, 146 128, 178 118 C 196 112, 212 118, 220 118'
+                  ]
+                }}
+                transition={{
+                  y: { duration: 2.2, ease: [0.16, 1, 0.3, 1] },
+                  d: { duration: 1.05, repeat: Infinity, ease: 'easeInOut' }
+                }}
               />
-            </g>
-
-            <g clipPath="url(#larpscan-dot-fill)">
-              <circle cx="155" cy="155" r="16" fill="url(#larpscan-fill)" />
             </g>
           </svg>
         </motion.div>
@@ -365,6 +385,7 @@ export default function HomeLandingPage() {
   const { locale } = useLocale();
   const [introComplete, setIntroComplete] = useState(false);
   const [mounted, setMounted] = useState(false);
+  const [introChecked, setIntroChecked] = useState(false);
 
   useEffect(() => {
     setMounted(true);
@@ -372,19 +393,20 @@ export default function HomeLandingPage() {
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    if (window.sessionStorage.getItem('larpscan_intro_done') === '1') {
+    if (window.localStorage.getItem('larpscan_intro_done') === '1') {
       setIntroComplete(true);
     }
+    setIntroChecked(true);
   }, []);
 
   const handleIntroComplete = () => {
     if (typeof window !== 'undefined') {
-      window.sessionStorage.setItem('larpscan_intro_done', '1');
+      window.localStorage.setItem('larpscan_intro_done', '1');
     }
     setIntroComplete(true);
   };
 
-  if (!mounted) return null;
+  if (!mounted || !introChecked) return null;
 
   return (
     <div className="min-h-screen bg-[#050507] text-white overflow-x-hidden">

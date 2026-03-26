@@ -1,5 +1,5 @@
 import { parse } from 'node-html-parser';
-import { chromium } from 'playwright';
+import { launchChromium } from './browser';
 
 // Tags stripped before extracting text (valid for both fetch + Playwright paths)
 // NOTE: nav is stripped from TEXT extraction but nav links are captured first
@@ -205,10 +205,7 @@ async function fetchViaHttp(url: string): Promise<string> {
 async function fetchViaPlaywright(url: string): Promise<string> {
   console.log('[scraper] SPA detected — launching Playwright render...');
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-  });
+  const browser = await launchChromium({ headless: true });
 
   try {
     const context = await browser.newContext({

@@ -2,7 +2,24 @@ import { NextRequest } from 'next/server';
 import { supabase } from '@/lib/supabase';
 import { logBatch } from '@/lib/logger';
 import { ok, err, withErrorHandler } from '@/lib/api-helpers';
-import type { DbVerificationRun } from '@/lib/db-types';
+import type { DbClaimWithEvidence, DbVerificationRun } from '@/lib/db-types';
+
+const INFRA_FAILURE_PATTERN = /missing executable|critical failure in launching the browser|preventing any interaction with the site|site-level issue/i;
+
+function hasInfrastructureFailure(claims: DbClaimWithEvidence[]): boolean {
+  return claims.some((claim) => {
+    if (claim.status !== 'failed') return false;
+
+    return claim.evidence_items.some((item) => {
+      const data = item.data;
+      if (!data) return false;
+
+      const summary = typeof data.evidenceSummary === 'string' ? data.evidenceSummary : '';
+      const reasoning = typeof data.reasoning === 'string' ? data.reasoning : '';
+      return INFRA_FAILURE_PATTERN.test(`${summary}\n${reasoning}`);
+    });
+  });
+}
 
 export const POST = withErrorHandler(async (req: Request) => {
   const body = await (req as NextRequest).json().catch(() => ({}));
@@ -36,7 +53,18 @@ export const POST = withErrorHandler(async (req: Request) => {
       .maybeSingle<DbVerificationRun>();
 
     if (existingRun) {
-      return ok({ runId: existingRun.id, run: existingRun, reused: true });
+      const { data: existingClaims } = await supabase
+        .from('claims')
+        .select('*, evidence_items(*)')
+        .eq('verification_run_id', existingRun.id)
+        .returns<DbClaimWithEvidence[]>();
+
+      const claims = existingClaims ?? [];
+      const hasMeaningfulOutcome = claims.some((claim) => claim.status !== 'failed');
+
+      if (claims.length > 0 && hasMeaningfulOutcome && !hasInfrastructureFailure(claims)) {
+        return ok({ runId: existingRun.id, run: existingRun, reused: true });
+      }
     }
   }
 

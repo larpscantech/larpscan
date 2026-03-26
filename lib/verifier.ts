@@ -1,7 +1,7 @@
 import path    from 'path';
 import fs      from 'fs/promises';
 import { randomUUID } from 'crypto';
-import { chromium } from 'playwright';
+import { launchChromium } from './browser';
 import {
   analyzePageState,
   planWorkflow,
@@ -135,10 +135,7 @@ async function analyzeWebsite(baseUrl: string): Promise<AnalysisResult> {
   let screenshotDataUrl: string | undefined;
   let surfaceStatus:    number | null = null;
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-  });
+  const browser = await launchChromium({ headless: true });
 
   try {
     const context = await browser.newContext({
@@ -260,10 +257,7 @@ async function recordInteraction(
     disabledControls: [], blockers: [], hasModal: false, apiSignals: [],
   };
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-  });
+  const browser = await launchChromium({ headless: true });
 
   let context: Awaited<ReturnType<typeof browser.newContext>> | null = null;
   let allObservations: AgentObservation[] = [];
