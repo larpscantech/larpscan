@@ -11,6 +11,19 @@ const config: NextConfig = {
     'playwright',
     'playwright-core',
   ],
+
+  experimental: {
+    // Vercel's file-system tracer only follows JS require() chains — it never
+    // sees the native binary that ffmpeg-static exports as a path string.
+    // outputFileTracingIncludes forces the binary into the Lambda bundle for
+    // the one route that needs it.
+    outputFileTracingIncludes: {
+      '/api/verify/run': [
+        './node_modules/ffmpeg-static/**/*',
+        './node_modules/@sparticuz/chromium/**/*',
+      ],
+    },
+  },
 };
 
 export default config;

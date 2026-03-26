@@ -297,8 +297,11 @@ async function recordInteraction(
     // Ensure ffmpeg is available before requesting recordVideo.
     // On serverless runtimes we copy the ffmpeg-static binary into /tmp so
     // Playwright can find it.  On local dev the binary is already installed.
+    // Set ENABLE_PLAYWRIGHT_VIDEO=true to opt in to recording on Vercel.
+    // It is off by default because ffmpeg is often absent in serverless bundles.
+    const videoEnvEnabled = process.env.ENABLE_PLAYWRIGHT_VIDEO === 'true';
     await ensureFFmpegForPlaywright();
-    const enableRecording = isFFmpegReady() || !isServerlessRuntime();
+    const enableRecording = videoEnvEnabled && (isFFmpegReady() || !isServerlessRuntime());
 
     context = await browser.newContext({
       userAgent:

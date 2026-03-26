@@ -6,6 +6,10 @@ import { routeVerification, type StructuredClaim } from '@/lib/verification-grap
 import { ok, err, withErrorHandler } from '@/lib/api-helpers';
 import type { DbClaim, DbProject, DbVerificationRun } from '@/lib/db-types';
 
+// Force Node.js runtime — required for native binaries (Playwright, ffmpeg-static).
+// The edge runtime does not support child processes or filesystem access.
+export const runtime = 'nodejs';
+
 // Allow up to 5 minutes — Playwright verification is slow per claim.
 // On Vercel Pro this can be up to 300s; self-hosted has no limit.
 export const maxDuration = 300;
