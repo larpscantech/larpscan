@@ -23,9 +23,13 @@ create table if not exists projects (
   website          text,
   twitter          text,
   logo_url         text,
+  description      text,
   chain            text        not null default 'bsc',
   created_at       timestamptz default now()
 );
+
+-- Migration: add description to existing databases
+-- alter table projects add column if not exists description text;
 
 -- ── verification_runs ─────────────────────────────────────────────────────────
 -- One row per scan request. Tracks pipeline progress.

@@ -26,9 +26,54 @@ const NAV_VERBS = new Set([
   'sell', 'bridge', 'vote', 'govern', 'farm', 'pool', 'lend', 'borrow',
 ]);
 
+// Known URL-shortener / redirect-wrapper hostnames whose landing page content
+// is useless — we must follow them to get the real destination.
+const SHORT_LINK_HOSTS = new Set([
+  't.co', 'bit.ly', 'tinyurl.com', 'ow.ly', 'buff.ly', 'rebrand.ly',
+  'short.io', 'cutt.ly', 'rb.gy', 'lnkd.in', 'linktr.ee', 'beacons.ai',
+]);
+
 function normalizeUrl(raw: string): string {
   const t = raw.trim();
   return /^https?:\/\//i.test(t) ? t : `https://${t}`;
+}
+
+/** Follow HTTP redirect chain and return the final destination URL.
+ *  Falls back to the original URL on any error. */
+async function resolveRedirects(url: string): Promise<string> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8_000);
+    try {
+      const res = await fetch(url, {
+        method: 'HEAD',
+        redirect: 'follow',
+        signal: controller.signal,
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+            '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        },
+      });
+      const final = res.url;
+      if (final && final !== url) {
+        console.log(`[scraper] Redirect resolved: ${url} → ${final}`);
+      }
+      return final || url;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return url;
+  }
+}
+
+function isShortLink(url: string): boolean {
+  try {
+    return SHORT_LINK_HOSTS.has(new URL(url).hostname);
+  } catch {
+    return false;
+  }
 }
 
 function extractFromHtml(html: string): string {
@@ -215,13 +260,24 @@ async function fetchViaPlaywright(url: string): Promise<string> {
     });
     const page = await context.newPage();
 
-    // Navigate and wait for the network to quiet down (JS rendered)
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 20_000 });
+    // Use 'domcontentloaded' so pages with continuous rAF animation loops
+    // (or long-running background fetches) don't stall the scrape forever.
+    // We add an extra wait after load to let JS-rendered content paint.
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 });
 
-    // Give any lazy-loaded content an extra moment to paint
-    await page.waitForTimeout(1_500);
+    // Wait for either a known JS-framework mount signal or a fixed time cap
+    await Promise.race([
+      page.waitForFunction(
+        () => document.querySelectorAll('[data-reactroot],[id="__next"],#app,#root,[data-v-app]').length > 0,
+        { timeout: 6_000 },
+      ).catch(() => null),
+      page.waitForTimeout(4_000),
+    ]);
 
-    const baseOrigin = new URL(url).origin;
+    // Use the actual loaded URL (after any JS/meta redirects) as the base
+    // so nav links from the final destination are not discarded as external.
+    const finalUrl   = page.url();
+    const baseOrigin = new URL(finalUrl || url).origin;
 
     // Extract nav links from live DOM BEFORE grabbing full HTML
     const primaryLinks: RawLink[] = await page.$$eval(
@@ -271,7 +327,17 @@ async function fetchViaPlaywright(url: string): Promise<string> {
  *     using a headless Playwright browser that executes the JavaScript.
  */
 export async function fetchWebsiteText(rawUrl: string): Promise<string> {
-  const url = normalizeUrl(rawUrl);
+  const normalized = normalizeUrl(rawUrl);
+
+  // Always resolve redirect chains for known short-link hosts;
+  // also resolve for any URL to catch unexpected wrapping.
+  const url = isShortLink(normalized)
+    ? await resolveRedirects(normalized)
+    : normalized;
+
+  if (url !== normalized) {
+    console.log(`[scraper] Using resolved URL: ${url}`);
+  }
   console.log(`[scraper] Fetching ${url}`);
 
   // ── Step 1: plain fetch ───────────────────────────────────────────────────
@@ -295,9 +361,21 @@ export async function fetchWebsiteText(rawUrl: string): Promise<string> {
       const rendered = await fetchViaPlaywright(url);
       const renderedTextOnly = rendered.split('\n\n--- Navigation paths')[0];
       if (renderedTextOnly.length > textOnly.length) return rendered;
+      // Playwright ran but returned equally empty content — log for visibility
+      console.warn(`[scraper] Playwright returned no more content than HTTP (${renderedTextOnly.length} chars) — site may block headless browsers`);
     } catch (e) {
-      console.warn('[scraper] Playwright fallback also failed:', e);
+      console.warn('[scraper] Playwright fallback failed:', (e as Error)?.message ?? e);
     }
+  }
+
+  // If both strategies yielded too little content, throw so the API route can
+  // return a clear 422 rather than silently returning an empty string.
+  if (text.length < 50) {
+    throw new Error(
+      `Could not extract meaningful content from ${url} — ` +
+      `both HTTP fetch (${textOnly.length} chars) and Playwright returned too little text. ` +
+      `The site may require authentication, block headless browsers, or have bot protection enabled.`,
+    );
   }
 
   return text;

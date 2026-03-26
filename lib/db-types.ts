@@ -59,6 +59,7 @@ export interface DbProject {
   website: string | null;
   twitter: string | null;
   logo_url: string | null;
+  description: string | null;
   chain: string;
   created_at: string;
 }
