@@ -232,6 +232,51 @@ function detectBlockerFromText(text: string): BlockerType | undefined {
 // Fill inputs inside a newly opened modal
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Proactively find every visible numeric input whose surrounding DOM context
+ * mentions "dev buy" (or similar) and set its value to "0".
+ * Called at key points in TOKEN_CREATION flows so the default 0.5 BNB is
+ * cleared even if the LLM planner never explicitly fills the field.
+ */
+async function clearDevBuyFields(page: Page): Promise<void> {
+  const DEV_BUY_RE = /dev.?buy|initial.?buy|launch.?buy|buy.?amount|purchase.?amount/i;
+
+  const inputs = await page
+    .locator('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])')
+    .all();
+
+  for (const inp of inputs) {
+    const vis = await inp.isVisible().catch(() => false);
+    if (!vis) continue;
+
+    const isDevBuy = await inp.evaluate((el) => {
+      const DEV = /dev.?buy|initial.?buy|launch.?buy|buy.?amount|purchase.?amount/i;
+      const name = ((el as HTMLInputElement).name ?? '').toLowerCase();
+      const ph   = ((el as HTMLInputElement).placeholder ?? '').toLowerCase();
+      const aria = (el.getAttribute('aria-label') ?? '').toLowerCase();
+      if (DEV.test(`${name} ${ph} ${aria}`)) return true;
+
+      let node: Element | null = (el as HTMLElement).parentElement;
+      for (let depth = 0; depth < 5 && node; depth++, node = node.parentElement) {
+        if (['FORM', 'BODY', 'HTML', 'MAIN', 'SECTION'].includes(node.tagName)) break;
+        const text = Array.from(node.children)
+          .filter((c) => !['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'SCRIPT'].includes(c.tagName))
+          .map((c) => c.textContent ?? '').join(' ');
+        if (DEV.test(text)) return true;
+      }
+      return false;
+    }).catch(() => false);
+
+    if (!isDevBuy) continue;
+
+    const current = await inp.inputValue().catch(() => '');
+    if (current !== '0') {
+      await inp.fill('0', { timeout: 3_000 }).catch(() => {});
+      console.log(`[executor] clearDevBuyFields: cleared field (was "${current}") → "0"`);
+    }
+  }
+}
+
 async function fillModalInputs(page: Page): Promise<string[]> {
   const filled: string[] = [];
 
@@ -614,12 +659,20 @@ async function detectNewFormFields(
                 ? `[placeholder="${CSS.escape((el as HTMLInputElement).placeholder)}"]`
                 : 'input',
           labelText: (() => {
+            const DEV_BUY_RE = /dev.?buy|initial.?buy|launch.?buy|buy.?amount|purchase.?amount/i;
             const id = el.id;
             if (id) { const l = document.querySelector(`label[for="${CSS.escape(id)}"]`); if (l) return (l.textContent ?? '').toLowerCase(); }
             const p = el.closest('label'); if (p) return (p.textContent ?? '').toLowerCase();
-            const prev = (el as HTMLElement).previousElementSibling;
-            if (prev?.tagName === 'LABEL' || prev?.tagName === 'SPAN' || prev?.tagName === 'P')
-              return (prev.textContent ?? '').toLowerCase();
+            // Walk up ancestors to capture div-wrapped labels
+            let node: Element | null = (el as HTMLElement).parentElement;
+            for (let depth = 0; depth < 5 && node; depth++, node = node.parentElement) {
+              const tag = node.tagName;
+              if (['FORM', 'BODY', 'HTML', 'MAIN', 'SECTION', 'ARTICLE', 'NAV'].includes(tag)) break;
+              const childTexts = Array.from(node.children)
+                .filter((c) => !['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'SCRIPT', 'STYLE'].includes(c.tagName))
+                .map((c) => c.textContent ?? '').join(' ').toLowerCase();
+              if (childTexts.trim()) return childTexts;
+            }
             return '';
           })(),
         })),
@@ -1428,6 +1481,9 @@ async function performStep(page: Page, step: AgentStep, baseDomain: string): Pro
       const isSubmitAction = /^(create token|launch token|deploy token|deploy|mint|submit|create\s+token|launch\s+token)$/i.test(step.text.trim());
       if (isSubmitAction) {
         await injectFakeImagesIfNeeded(page);
+        // Always zero out dev buy fields before any token-creation submission
+        // so the default pre-filled values (e.g. 0.5 BNB) never reach the wallet.
+        await clearDevBuyFields(page);
       }
 
       const textRegex = new RegExp(step.text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
@@ -1492,6 +1548,11 @@ async function performStep(page: Page, step: AgentStep, baseDomain: string): Pro
       const text = await el.textContent().catch(() => '') ?? '';
       if (!isSafeToInteract(text)) throw new Error(`Blocked by safety filter: "${text}"`);
 
+      // Zero out dev buy fields before any submit-like click
+      if (/create|launch|deploy|mint|submit/i.test(text)) {
+        await clearDevBuyFields(page);
+      }
+
       await el.click({ timeout: 5_000 });
       await page.waitForTimeout(2_000);
       break;
@@ -1548,22 +1609,43 @@ async function performStep(page: Page, step: AgentStep, baseDomain: string): Pro
 
       if (!found) throw new Error(`Input not found: "${step.selector}"`);
 
-      // Final guard: inspect the actual DOM element to detect dev buy fields
-      // that the planner may have described with an ambiguous selector.
+      // Final guard: inspect the actual DOM element to detect dev buy fields.
+      // Walk up to 5 ancestor levels so we catch div-wrapped labels (very common
+      // in React component libraries that don't use <label for=...>).
       const isDevBuyField = await inputEl.evaluate((el) => {
-        const name      = ((el as HTMLInputElement).name        ?? '').toLowerCase();
-        const ph        = ((el as HTMLInputElement).placeholder ?? '').toLowerCase();
-        const aria      = (el.getAttribute('aria-label')        ?? '').toLowerCase();
-        const id        = ((el as HTMLElement).id               ?? '').toLowerCase();
+        const DEV_BUY_RE = /dev.?buy|initial.?buy|launch.?buy|buy.?amount|purchase.?amount/i;
+
+        const name  = ((el as HTMLInputElement).name        ?? '').toLowerCase();
+        const ph    = ((el as HTMLInputElement).placeholder ?? '').toLowerCase();
+        const aria  = (el.getAttribute('aria-label')        ?? '').toLowerCase();
+        const id    = ((el as HTMLElement).id               ?? '').toLowerCase();
+
+        // Try formal label association first
         const labelEl   = el.id
           ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`)
           : el.closest('label');
         const labelText = (labelEl?.textContent ?? '').toLowerCase();
-        const prev      = (el as HTMLElement).previousElementSibling;
-        const prevText  = (prev?.tagName === 'LABEL' || prev?.tagName === 'SPAN' || prev?.tagName === 'P')
-          ? (prev.textContent ?? '').toLowerCase() : '';
-        const combined  = `${name} ${ph} ${aria} ${id} ${labelText} ${prevText}`;
-        return /dev.?buy|initial.?buy|launch.?buy|buy.?amount|purchase.?amount/.test(combined);
+
+        if (DEV_BUY_RE.test(`${name} ${ph} ${aria} ${id} ${labelText}`)) return true;
+
+        // Walk ancestor chain (up to 5 levels) collecting text from non-interactive
+        // siblings and direct children — catches div-based label patterns.
+        let node: Element | null = (el as HTMLElement).parentElement;
+        for (let depth = 0; depth < 5 && node; depth++, node = node.parentElement) {
+          const tag = node.tagName;
+          if (['FORM', 'BODY', 'HTML', 'MAIN', 'SECTION', 'ARTICLE', 'NAV'].includes(tag)) break;
+
+          // Text from every child element that isn't an interactive control
+          const childTexts = Array.from(node.children)
+            .filter((c) => !['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'SCRIPT', 'STYLE'].includes(c.tagName))
+            .map((c) => c.textContent ?? '')
+            .join(' ')
+            .toLowerCase();
+
+          if (DEV_BUY_RE.test(childTexts)) return true;
+        }
+
+        return false;
       }).catch(() => false);
 
       const finalFillValue = isDevBuyField ? '0' : step.value;

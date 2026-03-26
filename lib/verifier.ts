@@ -602,8 +602,13 @@ async function recordInteraction(
           await fs.copyFile(rawPath, finalPath);
           await fs.unlink(rawPath).catch(() => {});
         });
-        videoUrl = `/recordings/${claimId}.webm`;
-        console.log(`[verifier:record] Video saved → ${videoUrl}`);
+        // /tmp is not web-accessible on serverless — skip setting videoUrl
+        if (!recordingsDir.startsWith('/tmp')) {
+          videoUrl = `/recordings/${claimId}.webm`;
+          console.log(`[verifier:record] Video saved → ${videoUrl}`);
+        } else {
+          console.log(`[verifier:record] Video written to /tmp (serverless — not web-accessible)`);
+        }
       }
     } catch (e) {
       console.warn('[verifier:record] Video save failed (non-fatal):', e);
@@ -693,7 +698,18 @@ export async function verifyClaim(
   }
 
   // ── Session 2: Record + plan + execute ────────────────────────────────────
-  const recordingsDir = path.join(process.cwd(), 'public', 'recordings');
+  // On Vercel (and other serverless runtimes) process.cwd() is /var/task which
+  // is read-only. Use /tmp for the recordings directory instead.
+  // Videos stored in /tmp are not web-accessible, so videoUrl stays undefined
+  // in serverless — recordings are ephemeral there anyway.
+  const isServerless = Boolean(
+    process.env.VERCEL ||
+    process.env.AWS_REGION ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME,
+  );
+  const recordingsDir = isServerless
+    ? path.join('/tmp', 'recordings')
+    : path.join(process.cwd(), 'public', 'recordings');
   await fs.mkdir(recordingsDir, { recursive: true });
 
   const recording = await recordInteraction(

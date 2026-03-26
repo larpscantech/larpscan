@@ -188,6 +188,12 @@ CRITICAL RULES
       → treat the JS error as background noise and focus on the positive signals.
   (c) NEVER return LARP based solely on a JS error with no other evidence — if a JS error
       prevented the feature from rendering, that is FAILED (broken), not LARP (doesn't exist).
+- Server-side / infrastructure errors (ENOENT, mkdir, EPERM, spawn, /var/task/, 500 Internal Server Error):
+  These are errors thrown by the TARGET SITE's own backend, not by our testing tool.
+  (a) If the form/UI was still interactable despite the server error → still attempt to evaluate the claim.
+  (b) If the server error prevented the page from loading at all → return SITE_BROKEN.
+  (c) NEVER automatically FAILED all claims because one server error was observed — evaluate each
+      claim individually based on what the agent was actually able to observe and interact with.
 
 Respond with JSON only:
 {
