@@ -1,12 +1,88 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { StatusBadge } from './status-badge';
 import { cn } from '@/lib/utils';
 import type { Claim, Verdict } from '@/lib/types';
 import type { BadgeVariant } from './status-badge';
+
+/** Fetches a remote video into a blob URL so the browser can seek freely
+ *  without depending on sparse keyframes + range requests. */
+function BufferedVideo({ src, poster, className }: {
+  src: string;
+  poster?: string;
+  className?: string;
+}) {
+  const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  const [progress, setProgress] = useState(0);
+  const revokeRef = useRef<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await fetch(src);
+      const total = Number(res.headers.get('content-length') || 0);
+      const reader = res.body?.getReader();
+      if (!reader) { setBlobUrl(src); return; }
+
+      const chunks: ArrayBuffer[] = [];
+      let loaded = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
+        loaded += value.length;
+        if (total > 0) setProgress(Math.min(99, Math.round((loaded / total) * 100)));
+      }
+
+      const blob = new Blob(chunks, { type: 'video/webm' });
+      const url = URL.createObjectURL(blob);
+      revokeRef.current = url;
+      setBlobUrl(url);
+      setProgress(100);
+    } catch {
+      setBlobUrl(src);
+    }
+  }, [src]);
+
+  useEffect(() => {
+    load();
+    return () => { if (revokeRef.current) URL.revokeObjectURL(revokeRef.current); };
+  }, [load]);
+
+  if (!blobUrl) {
+    return (
+      <div className={cn('flex items-center justify-center bg-black', className)} style={{ minHeight: 160 }}>
+        {poster && (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img src={poster} alt="" className="absolute inset-0 w-full h-full object-cover opacity-30" />
+        )}
+        <div className="relative flex flex-col items-center gap-2">
+          <div className="w-32 h-1 rounded-full bg-zinc-800 overflow-hidden">
+            <div
+              className="h-full bg-emerald-600 rounded-full transition-all duration-300"
+              style={{ width: `${progress}%` }}
+            />
+          </div>
+          <span className="text-[10px] text-zinc-500">Loading recording{progress > 0 ? ` ${progress}%` : '…'}</span>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    // eslint-disable-next-line jsx-a11y/media-has-caption
+    <video
+      src={blobUrl}
+      controls
+      muted
+      playsInline
+      poster={poster}
+      className={className}
+    />
+  );
+}
 
 function verdictToBadge(verdict: Verdict): BadgeVariant {
   switch (verdict) {
@@ -206,13 +282,8 @@ export function AuditClaimCard({
                                 Agent Recording
                               </span>
                             </div>
-                            {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
-                            <video
+                            <BufferedVideo
                               src={claim.videoUrl}
-                              controls
-                              muted
-                              playsInline
-                              preload="metadata"
                               poster={claim.screenshotDataUrl}
                               className="w-full max-h-64 bg-black"
                             />

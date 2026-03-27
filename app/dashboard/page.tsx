@@ -757,11 +757,11 @@ export default function DashboardPage() {
 
       if (!alive()) { clearInterval(rotateTimer); console.groupEnd(); return; }
 
-      // Poll /api/verify/status until the run is complete or all claims resolved.
-      // Each claim runs in its own Lambda so results appear incrementally.
-      let revealedCount = 0;
-      const maxPollMs = 10 * 60 * 1000; // 10 minute safety cap
+      // Poll /api/verify/status until ALL claims are done, then reveal
+      // everything at once so the UI doesn't glitch with partial results.
+      const maxPollMs = 10 * 60 * 1000;
       const pollStart = Date.now();
+      let finalStatus: { claims: DbClaimWithEvidence[]; logs: { message: string }[] } | null = null;
 
       while (alive() && Date.now() - pollStart < maxPollMs) {
         await sleep(5_000);
@@ -774,26 +774,12 @@ export default function DashboardPage() {
             logs:   { message: string }[];
           }>('/api/verify/status', `/api/verify/status?runId=${runId}`);
 
-          // Update claims in real-time as verdicts arrive
-          setRealClaims(statusRes.claims);
-
-          // Reveal newly resolved claims
-          const resolvedClaims = statusRes.claims.filter(
-            (c) => c.status !== 'pending' && c.status !== 'checking',
-          );
-          for (let i = revealedCount; i < resolvedClaims.length; i++) {
-            const c = resolvedClaims[i];
-            setResolvedResultsCount(i + 1);
-            addLog(`Claim ${String(i + 1).padStart(2, '0')} → ${c.status.toUpperCase()}`);
-            console.log(`${TAG} Revealed claim ${i + 1}: ${c.status}`, STYLE);
-          }
-          revealedCount = resolvedClaims.length;
-
-          // Done when run is complete or all claims have a final status
-          if (
+          const allDone =
             statusRes.run.status === 'complete' ||
-            resolvedClaims.length === statusRes.claims.length
-          ) {
+            statusRes.claims.every((c) => c.status !== 'pending' && c.status !== 'checking');
+
+          if (allDone) {
+            finalStatus = statusRes;
             console.log(`${TAG} All claims resolved`, STYLE);
             break;
           }
@@ -804,6 +790,19 @@ export default function DashboardPage() {
 
       clearInterval(rotateTimer);
       setCheckingClaimIndex(-1);
+
+      // Reveal all results at once
+      if (finalStatus) {
+        setRealClaims(finalStatus.claims);
+        for (let i = 0; i < finalStatus.claims.length; i++) {
+          if (!alive()) break;
+          await sleep(450);
+          setResolvedResultsCount(i + 1);
+          const c = finalStatus.claims[i];
+          addLog(`Claim ${String(i + 1).padStart(2, '0')} → ${c.status.toUpperCase()}`);
+          console.log(`${TAG} Revealed claim ${i + 1}: ${c.status}`, STYLE);
+        }
+      }
     }
 
     if (!alive()) { console.groupEnd(); return; }
