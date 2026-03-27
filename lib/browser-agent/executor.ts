@@ -211,24 +211,34 @@ function buildStepNarrative(obs: AgentObservation): string {
 
 function detectBlockerFromText(text: string): BlockerType | undefined {
   // auth_required — Privy social login modal (check BEFORE wallet_required)
-  if (/login with twitter|login with github|login with tiktok|login with twitch/i.test(text)) return 'auth_required';
-  if (/log in or sign up/i.test(text))                        return 'auth_required';
+  if (/login with twitter|login with github|login with tiktok|login with twitch|login with discord/i.test(text)) return 'auth_required';
+  if (/log in or sign up|sign up to continue|create an account to continue/i.test(text)) return 'auth_required';
   if (/continue with a wallet/i.test(text))                   return 'auth_required';
+  if (/verify your email|email verification required/i.test(text)) return 'auth_required';
   // auth_required — English + Traditional Chinese
+  if (/sign in to continue|log in to continue|please sign in|please log in/i.test(text)) return 'auth_required';
   if (/sign in|log in|\blogin\b/i.test(text))                 return 'auth_required';
   if (/登入|登錄|請登入|需要登入/.test(text))                   return 'auth_required';
   // wallet_required — English + Traditional Chinese (after auth checks)
-  if (/connect wallet|wallet required/i.test(text))           return 'wallet_required';
+  if (/connect wallet|wallet required|wallet not connected|please connect/i.test(text)) return 'wallet_required';
   if (/連接錢包|連結錢包|請連接錢包|未連接錢包|錢包未連接/.test(text)) return 'wallet_required';
-  // bot_protection — English + Traditional Chinese
-  if (/just a moment|checking your browser/i.test(text))      return 'bot_protection';
-  if (/正在驗證您的瀏覽器|請稍候.*驗證/.test(text))              return 'bot_protection';
+  // bot_protection — English + Traditional Chinese + common CAPTCHA variants
+  if (/just a moment|checking your browser|verify you are human|are you a robot/i.test(text)) return 'bot_protection';
+  if (/complete the captcha|solve the challenge|hcaptcha|recaptcha/i.test(text)) return 'bot_protection';
+  if (/access denied|forbidden.*cloudflare|blocked by.*protection/i.test(text)) return 'bot_protection';
+  if (/正在驗證您的瀏覽器|請稍候.*驗證|驗證碼/.test(text))       return 'bot_protection';
+  // rate_limited
+  if (/too many requests|rate limit|slow down|try again later/i.test(text)) return 'rate_limited';
+  if (/請求過多|操作太頻繁/.test(text))                         return 'rate_limited';
   // coming_soon — English + Traditional Chinese
-  if (/coming soon|under construction/i.test(text))           return 'coming_soon';
-  if (/即將推出|敬請期待|建設中|即將上線/.test(text))            return 'coming_soon';
+  if (/coming soon|under construction|under maintenance|scheduled maintenance/i.test(text)) return 'coming_soon';
+  if (/即將推出|敬請期待|建設中|即將上線|維護中/.test(text))      return 'coming_soon';
   // route_missing — English + Traditional Chinese
-  if (/page not found|\b404\b/i.test(text))                   return 'route_missing';
+  if (/page not found|\b404\b|this page doesn.?t exist/i.test(text)) return 'route_missing';
   if (/頁面不存在|找不到頁面/.test(text))                       return 'route_missing';
+  // geo_blocked
+  if (/not available in your region|country not supported|geographic restriction|unavailable in your location/i.test(text)) return 'geo_blocked';
+  if (/您所在地區不支援|地區限制/.test(text))                    return 'geo_blocked';
   return undefined;
 }
 
@@ -2007,21 +2017,39 @@ export async function handleWalletPopups(
   const preConnected = await page.evaluate(
     ({ short, end }: { short: string; end: string }) => {
       const text = document.body?.innerText?.toLowerCase() ?? '';
-      if (text.includes(short) || text.includes(end)) return true;
+      // Only consider pre-connected if the actual wallet address is visible in DOM.
+      // Previously, "no connect button + page has content" was treated as connected,
+      // but many dApps simply don't show a connect button on certain pages (e.g.
+      // landing pages, docs) — that doesn't mean a wallet is connected.
+      const addrVisible = text.includes(short) && text.includes(end);
+      if (addrVisible) return 'address_visible';
+
+      // Secondary signal: truncated address format (0x1b2...3f4a) in DOM
+      const truncatedPattern = new RegExp(short + '[.…]{2,}' + end);
+      if (truncatedPattern.test(text)) return 'truncated_address';
+
+      // Check for connected-state UI signals (avatar + no connect button)
       const connectBtns = Array.from(document.querySelectorAll('button, [role="button"]'))
         .filter((el) => {
-          const t = ((el as HTMLElement).innerText ?? '').toLowerCase();
+          const t = ((el as HTMLElement).innerText ?? '').toLowerCase().trim();
           const s = window.getComputedStyle(el as Element);
-          return s.display !== 'none' && /^connect wallet$|^connect$/i.test(t.trim());
+          return s.display !== 'none' && s.visibility !== 'hidden' &&
+            /^connect wallet$|^connect$|^connect your wallet$/i.test(t);
         });
-      return connectBtns.length === 0 && document.body.innerText.trim().length > 100;
+      const hasProfileIndicator = !!document.querySelector(
+        '[class*="avatar" i], [class*="profile" i], [data-testid*="account"], ' +
+        '[class*="account-info" i], [class*="user-menu" i], [class*="wallet-info" i]'
+      );
+      if (connectBtns.length === 0 && hasProfileIndicator) return 'profile_indicator';
+
+      return null;
     },
     { short: shortAddr, end: shortAddrEnd },
-  ).catch(() => false);
+  ).catch(() => null);
 
   if (preConnected) {
     walletConnected = true;
-    log.push('[wallet] Wallet already connected — address visible or no connect button in DOM');
+    log.push(`[wallet] Wallet already connected — signal: ${preConnected}`);
     return { detectedRequests, walletConnected, rejectedRequests, log };
   }
 
@@ -2030,24 +2058,33 @@ export async function handleWalletPopups(
     const walletKeywords = [
       'connect wallet', 'connect your wallet', 'connect metamask',
       'walletconnect', 'wallet connect', 'connect web3',
-      '連接錢包', '連結錢包', '請連接錢包', 'connect',
+      'connect a wallet', 'link wallet', 'attach wallet',
+      '連接錢包', '連結錢包', '請連接錢包',
     ];
     const allText = document.body?.innerText?.toLowerCase() ?? '';
     const hasKeyword = walletKeywords.some((kw) => allText.includes(kw));
 
-    // Also check for visible connect modal buttons
-    const connectBtns = Array.from(document.querySelectorAll('button, [role="button"]'))
+    // Check for visible connect buttons (broader selector set)
+    const connectBtns = Array.from(document.querySelectorAll(
+      'button, [role="button"], a[href*="connect"], [data-testid*="connect"]'
+    ))
       .filter((el) => {
-        const t = ((el as HTMLElement).innerText ?? el.textContent ?? '').toLowerCase();
+        const t = ((el as HTMLElement).innerText ?? el.textContent ?? '').toLowerCase().trim();
         const s = window.getComputedStyle(el as Element);
-        return (
-          s.display !== 'none' &&
-          s.visibility !== 'hidden' &&
-          /connect|wallet|metamask|walletconnect|連接|連結/.test(t)
-        );
+        if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+        // Match "Connect Wallet", "Connect", but not "Connected" or "Disconnect"
+        return /^connect\b|connect wallet|connect your wallet|連接錢包|連結錢包/i.test(t) &&
+          !/disconnect|connected|已連接/i.test(t);
       });
 
-    return hasKeyword || connectBtns.length > 0;
+    // Check for wallet modal containers (Web3Modal, RainbowKit, ConnectKit, etc.)
+    const walletModal = document.querySelector(
+      '[class*="w3m-modal"], [data-rk], [class*="ck-modal"], ' +
+      '[class*="WalletModal"], [class*="walletModal"], [class*="wallet-modal"], ' +
+      '[data-privy-dialog], [class*="dynamic-modal"], [class*="thirdweb-modal"]'
+    );
+
+    return hasKeyword || connectBtns.length > 0 || !!walletModal;
   }).catch(() => false);
 
   if (connectPromptVisible) {
@@ -2084,15 +2121,22 @@ export async function handleWalletPopups(
       // Helper: find and click any "Connect Wallet" trigger on the page.
       // Deliberately broad — matches partial text like "Connect Wallet to Mint".
       async function clickPrimaryConnectBtn(): Promise<boolean> {
-        // Ordered list of progressively broader selectors
+        const btnSelector = 'button, [role="button"], a, div[class*="btn"], span[class*="btn"]';
         const candidates = [
           // Exact common labels
-          page.locator('button, [role="button"], a').filter({ hasText: /^connect wallet$/i }).first(),
-          page.locator('button, [role="button"], a').filter({ hasText: /^connect$/i }).first(),
+          page.locator(btnSelector).filter({ hasText: /^connect wallet$/i }).first(),
+          page.locator(btnSelector).filter({ hasText: /^connect$/i }).first(),
           // Partial — covers "Connect Wallet to Mint", "Connect Wallet →", etc.
-          page.locator('button, [role="button"], a').filter({ hasText: /connect wallet/i }).first(),
-          // Last resort: any prominent "connect" button not inside a wallet picker dialog
-          page.locator('nav button, header button, [role="banner"] button').filter({ hasText: /connect/i }).first(),
+          page.locator(btnSelector).filter({ hasText: /connect wallet/i }).first(),
+          page.locator(btnSelector).filter({ hasText: /connect your wallet/i }).first(),
+          // Chinese variants
+          page.locator(btnSelector).filter({ hasText: /連接錢包|連結錢包/ }).first(),
+          // Web3Modal / w3m trigger button
+          page.locator('w3m-button, w3m-connect-button, [class*="w3m-"] button').first(),
+          // data-testid patterns
+          page.locator('[data-testid*="connect" i] button, [data-testid*="wallet" i] button').first(),
+          // Last resort: any prominent "connect" button in nav/header
+          page.locator('nav button, header button, [role="banner"] button, main button').filter({ hasText: /connect/i }).first(),
         ];
 
         for (const btn of candidates) {
@@ -2174,9 +2218,9 @@ export async function handleWalletPopups(
         }
       }
 
-      // ── Step 3: wallet picker — MetaMask / Injected ─────────────────────
-      // Skip wallets that require a QR scan, extension install, or OAuth.
-      const WALLET_PICKER_SKIP = /walletconnect|wallet connect|coinbase|rainbow|email|phone|google|apple|github|twitter|tiktok|twitch/i;
+      // ── Step 3: wallet picker — MetaMask / Injected / Trust / OKX ────────
+      // Skip wallets that require a QR scan, external app, or OAuth.
+      const WALLET_PICKER_SKIP = /walletconnect|wallet connect|coinbase wallet|coinbase smart|rainbow|email|phone|google|apple|github|twitter|tiktok|twitch|discord|telegram|farcaster|passkey|social|magic link|web3auth|qr code|scan to connect/i;
 
       async function tryClickWalletOption(label: string, locator: ReturnType<typeof page.locator>): Promise<boolean> {
         const vis = await locator.isVisible({ timeout: 2_000 }).catch(() => false);
@@ -2184,43 +2228,54 @@ export async function handleWalletPopups(
         const t = await locator.textContent().catch(() => '');
         await locator.click().catch(() => {});
         log.push(`[wallet] Clicked wallet picker option: "${(t ?? label).trim().slice(0, 50)}"`);
-        // Give RainbowKit a moment to render the loading state ("Opening MetaMask...")
         await page.waitForTimeout(500);
-        // RainbowKit v2 shows "Opening MetaMask... Confirm connection in the
-        // extension" and hangs waiting for the browser extension to respond.
-        // Force-fire wagmi's accountsChanged + connect listeners directly so
-        // the connection completes without the extension popup.
         await page.evaluate(() => {
           const w = window as unknown as Record<string, unknown>;
           if (typeof w['__chainverifyTriggerConnect'] === 'function') {
             (w['__chainverifyTriggerConnect'] as () => void)();
           }
         }).catch(() => {});
-        // personal_sign round-trip (sign → verify → re-render) can take 3-5s
         await page.waitForTimeout(4_000);
         return true;
       }
 
+      // Ordered preference: MetaMask → Trust → OKX → Phantom → Rabby → Injected → generic
       const pickerClicked =
-        // 1. MetaMask (detected via EIP-6963 rdns io.metamask)
         await tryClickWalletOption('MetaMask',
-          page.locator('button, [role="button"]').filter({ hasText: /^metamask$/i }).first(),
+          page.locator('button, [role="button"], li, div[role="option"]').filter({ hasText: /^metamask$/i }).first(),
         ) ||
-        // 2. MetaMask (partial — "MetaMask Browser Extension" etc.)
         await tryClickWalletOption('MetaMask',
-          page.locator('button, [role="button"]').filter({ hasText: /metamask/i }).first(),
+          page.locator('button, [role="button"], li, div[role="option"]').filter({ hasText: /metamask/i }).first(),
         ) ||
-        // 3. Injected / Browser Wallet (wagmi / ConnectKit)
+        await tryClickWalletOption('Trust Wallet',
+          page.locator('button, [role="button"], li, div[role="option"]').filter({ hasText: /trust wallet|trustwallet/i }).first(),
+        ) ||
+        await tryClickWalletOption('OKX Wallet',
+          page.locator('button, [role="button"], li, div[role="option"]').filter({ hasText: /okx wallet|okx/i }).first(),
+        ) ||
+        await tryClickWalletOption('Phantom',
+          page.locator('button, [role="button"], li, div[role="option"]').filter({ hasText: /^phantom$/i }).first(),
+        ) ||
+        await tryClickWalletOption('Rabby',
+          page.locator('button, [role="button"], li, div[role="option"]').filter({ hasText: /rabby/i }).first(),
+        ) ||
         await tryClickWalletOption('Injected/Browser',
-          page.locator('button, [role="button"]').filter({ hasText: /injected|browser wallet|detected wallet/i }).first(),
+          page.locator('button, [role="button"], li, div[role="option"]').filter({ hasText: /injected|browser wallet|detected wallet|browser extension/i }).first(),
         ) ||
-        // 4. Any wallet-modal button that isn't a social/QR option
+        // Generic fallback: any wallet-modal button that isn't a social/QR option
         await (async () => {
           const modalBtns = page.locator(
             '[role="dialog"] button, dialog button, ' +
             '[data-privy-dialog] button, [data-rk] button, ' +
             '[class*="WalletModal"] button, [class*="walletModal"] button, ' +
-            '[class*="wallet-list"] button, [class*="connectorList"] button',
+            '[class*="wallet-list"] button, [class*="connectorList"] button, ' +
+            // Web3Modal / ConnectKit / Dynamic / Thirdweb selectors
+            '[class*="w3m-"] button, [class*="ck-"] button, ' +
+            '[data-testid*="wallet"] button, [class*="dynamic-"] button, ' +
+            '[class*="tw-connect"] button, [class*="thirdweb"] button, ' +
+            // Generic modal containers
+            '[class*="modal"] button, [class*="Modal"] button, ' +
+            '[class*="overlay"] button, [class*="Overlay"] button',
           );
           const count = await modalBtns.count().catch(() => 0);
           for (let i = 0; i < count; i++) {
@@ -2239,29 +2294,44 @@ export async function handleWalletPopups(
           return false;
         })();
 
-      // ── Step 4: Retry once — re-announce EIP-6963 and retry if first pass failed
+      // ── Step 4: Retry with backoff — re-announce EIP-6963 and retry if first pass failed
       if (!pickerClicked) {
-        log.push('[wallet] No wallet picker found on first pass — re-announcing EIP-6963 and retrying');
-        await page.evaluate(() => {
-          window.dispatchEvent(new CustomEvent('eip6963:requestProvider'));
-        }).catch(() => {});
-        await page.waitForTimeout(2_000);
+        const retryDelays = [2_000, 3_000, 4_000]; // exponential-ish backoff
+        let retrySuccess = false;
 
-        // Try clicking primary connect button again (maybe it wasn't open yet)
-        if (!primaryClicked) {
-          await clickPrimaryConnectBtn();
-          await page.waitForTimeout(2_000);
+        for (let attempt = 0; attempt < retryDelays.length && !retrySuccess; attempt++) {
+          log.push(`[wallet] Retry attempt ${attempt + 1}/${retryDelays.length} — re-announcing EIP-6963`);
+
+          await page.evaluate(() => {
+            window.dispatchEvent(new CustomEvent('eip6963:requestProvider'));
+            const w = window as unknown as Record<string, unknown>;
+            if (typeof w['__chainverifyTriggerConnect'] === 'function') {
+              (w['__chainverifyTriggerConnect'] as () => void)();
+            }
+          }).catch(() => {});
+          await page.waitForTimeout(retryDelays[attempt]!);
+
+          // On first retry, try clicking the primary connect button again
+          if (attempt === 0 && !primaryClicked) {
+            const clicked = await clickPrimaryConnectBtn();
+            if (clicked) await page.waitForTimeout(2_000);
+          }
+
+          // Try MetaMask first, then any visible wallet option
+          retrySuccess = await tryClickWalletOption(`MetaMask (retry ${attempt + 1})`,
+            page.locator('button, [role="button"], li').filter({ hasText: /metamask/i }).first(),
+          );
+          if (!retrySuccess) {
+            retrySuccess = await tryClickWalletOption(`Injected (retry ${attempt + 1})`,
+              page.locator('button, [role="button"], li').filter({ hasText: /injected|browser wallet|detected/i }).first(),
+            );
+          }
         }
 
-        // One more MetaMask attempt (also fires force-connect helper inside tryClickWalletOption)
-        const retryClicked = await tryClickWalletOption('MetaMask (retry)',
-          page.locator('button, [role="button"]').filter({ hasText: /metamask/i }).first(),
-        );
-        if (retryClicked) {
+        if (retrySuccess) {
           log.push('[wallet] Wallet picker clicked on retry');
         } else {
-          // Last resort: fire the connect helper directly without needing the modal
-          log.push('[wallet] No modal option found — firing __chainverifyTriggerConnect directly');
+          log.push('[wallet] All retries exhausted — firing __chainverifyTriggerConnect as last resort');
           await page.evaluate(() => {
             const w = window as unknown as Record<string, unknown>;
             if (typeof w['__chainverifyTriggerConnect'] === 'function') {
@@ -2275,42 +2345,136 @@ export async function handleWalletPopups(
       // ── Confirmation: wait for signing bridge round-trip + DOM update ────
       // wagmi/RainbowKit: eth_requestAccounts → personal_sign → re-render.
       // Privy: personal_sign → auth.privy.io validate → re-render.
-      // Budget: 6s covers both slow paths.
+      // Budget: 6s covers both slow paths, then retry once if not yet confirmed.
       await page.waitForTimeout(6_000);
 
-      const shortAddr    = walletAddress.slice(0, 6).toLowerCase();
-      const shortAddrEnd = walletAddress.slice(-4).toLowerCase();
+      const confirmShort = walletAddress.slice(0, 6).toLowerCase();
+      const confirmEnd   = walletAddress.slice(-4).toLowerCase();
 
-      const connectedInDom = await page.evaluate(
+      // Multi-signal connection confirmation
+      const connectionStatus = await page.evaluate(
         ({ short, end }: { short: string; end: string }) => {
           const text = document.body?.innerText?.toLowerCase() ?? '';
-          if (text.includes(short) || text.includes(end)) return true;
+          const signals: string[] = [];
+
+          // Signal 1: wallet address visible in DOM
+          if (text.includes(short) && text.includes(end)) signals.push('address_full');
+          const truncRe = new RegExp(short + '[.…]{2,}' + end);
+          if (truncRe.test(text)) signals.push('address_truncated');
+
+          // Signal 2: connect button disappeared
           const connectBtns = Array.from(document.querySelectorAll('button, [role="button"]'))
             .filter((el) => {
-              const t = ((el as HTMLElement).innerText ?? '').toLowerCase();
+              const t = ((el as HTMLElement).innerText ?? '').toLowerCase().trim();
               const s = window.getComputedStyle(el as Element);
-              return s.display !== 'none' && /^connect wallet$|^connect$/i.test(t.trim());
+              return s.display !== 'none' && s.visibility !== 'hidden' &&
+                /^connect wallet$|^connect$|^connect your wallet$/i.test(t);
             });
-          return connectBtns.length === 0 && document.body.innerText.length > 200;
+          if (connectBtns.length === 0) signals.push('no_connect_btn');
+
+          // Signal 3: disconnect/logout button appeared (strong positive signal)
+          const disconnectBtns = Array.from(document.querySelectorAll('button, [role="button"], [role="menuitem"]'))
+            .filter((el) => {
+              const t = ((el as HTMLElement).innerText ?? '').toLowerCase().trim();
+              return /disconnect|log ?out|sign ?out/i.test(t);
+            });
+          if (disconnectBtns.length > 0) signals.push('disconnect_btn');
+
+          // Signal 4: profile/avatar/account UI elements
+          const profileEl = document.querySelector(
+            '[class*="avatar" i], [class*="profile" i], [data-testid*="account"], ' +
+            '[class*="account-info" i], [class*="user-menu" i], [class*="wallet-info" i], ' +
+            '[class*="identicon" i], [class*="jazzicon" i], [class*="blockie" i]'
+          );
+          if (profileEl) signals.push('profile_ui');
+
+          // Signal 5: auth token in storage
+          try {
+            const hasAuthToken =
+              !!localStorage.getItem('privy:token') ||
+              !!localStorage.getItem('privy:session') ||
+              !!sessionStorage.getItem('privy:token') ||
+              !!localStorage.getItem('auth_token') ||
+              !!localStorage.getItem('access_token') ||
+              !!localStorage.getItem('jwt') ||
+              !!sessionStorage.getItem('auth_token');
+            if (hasAuthToken) signals.push('auth_token');
+          } catch(e) {}
+
+          // Signal 6: wagmi store shows connected
+          try {
+            var wagmi = localStorage.getItem('wagmi.store');
+            if (wagmi && wagmi.includes('"current"') && !wagmi.includes('"current":null')) {
+              signals.push('wagmi_connected');
+            }
+          } catch(e) {}
+
+          // Negative signals
+          const authModalVisible =
+            /log in or sign up/i.test(text) ||
+            /login with twitter|login with github|login with tiktok|login with twitch|login with discord/i.test(text) ||
+            /continue with a wallet/i.test(text) ||
+            /create an account/i.test(text) ||
+            /sign up to continue/i.test(text);
+
+          const errorVisible =
+            /connection failed|connection rejected|user rejected|user denied/i.test(text) ||
+            /wallet connection error|failed to connect/i.test(text);
+
+          return {
+            signals,
+            authModalVisible,
+            errorVisible,
+            pageLength: text.length,
+          };
         },
-        { short: shortAddr, end: shortAddrEnd },
-      ).catch(() => false);
+        { short: confirmShort, end: confirmEnd },
+      ).catch(() => ({ signals: [] as string[], authModalVisible: false, errorVisible: false, pageLength: 0 }));
 
-      const authModalStillVisible = await page.evaluate(() => {
-        const text = document.body?.innerText?.toLowerCase() ?? '';
-        return (
-          /log in or sign up/i.test(text) ||
-          /login with twitter|login with github|login with tiktok/i.test(text) ||
-          /continue with a wallet/i.test(text)
-        );
-      }).catch(() => false);
+      log.push(`[wallet] Connection signals: [${connectionStatus.signals.join(', ')}]`);
 
-      if (connectedInDom && !authModalStillVisible) {
-        walletConnected = true;
-        log.push('[wallet] Wallet connected confirmed — address/state visible in DOM');
-      } else if (authModalStillVisible) {
+      const hasStrongPositive = connectionStatus.signals.some(
+        (s) => s === 'address_full' || s === 'address_truncated' || s === 'disconnect_btn' || s === 'auth_token',
+      );
+      const hasWeakPositive = connectionStatus.signals.some(
+        (s) => s === 'no_connect_btn' || s === 'profile_ui' || s === 'wagmi_connected',
+      );
+      const weakPositiveCount = connectionStatus.signals.filter(
+        (s) => s === 'no_connect_btn' || s === 'profile_ui' || s === 'wagmi_connected',
+      ).length;
+
+      if (connectionStatus.authModalVisible) {
         walletConnected = false;
-        log.push('[wallet] Auth/login modal still visible — Privy session not established, wallet NOT connected');
+        log.push('[wallet] Auth/login modal still visible — wallet NOT connected');
+      } else if (connectionStatus.errorVisible) {
+        walletConnected = false;
+        log.push('[wallet] Connection error visible in DOM — wallet NOT connected');
+      } else if (hasStrongPositive) {
+        walletConnected = true;
+        log.push('[wallet] Wallet connected confirmed — strong signal in DOM');
+      } else if (weakPositiveCount >= 2) {
+        // Two weak signals together (e.g. no connect button + profile UI) are sufficient
+        walletConnected = true;
+        log.push('[wallet] Wallet connected confirmed — multiple weak signals in DOM');
+      } else if (hasWeakPositive && pickerClicked) {
+        // If we clicked a picker option AND have at least one weak signal, retry once
+        log.push('[wallet] Weak signal detected, retrying confirmation in 3s...');
+        await page.waitForTimeout(3_000);
+        const retryCheck = await page.evaluate(
+          ({ short, end }: { short: string; end: string }) => {
+            const text = document.body?.innerText?.toLowerCase() ?? '';
+            return text.includes(short) || text.includes(end) ||
+              !!document.querySelector('[class*="avatar" i], [class*="identicon" i], [class*="jazzicon" i]');
+          },
+          { short: confirmShort, end: confirmEnd },
+        ).catch(() => false);
+        if (retryCheck) {
+          walletConnected = true;
+          log.push('[wallet] Wallet connected confirmed on retry');
+        } else {
+          walletConnected = false;
+          log.push('[wallet] Wallet connection not confirmed after retry');
+        }
       } else {
         walletConnected = false;
         log.push(
@@ -2377,7 +2541,6 @@ export async function handleWalletPopups(
  * inside closures can cause the script to fail silently in the browser.
  */
 function buildWalletMockScript(addr: string): string {
-  // Escape the address for safe embedding in a JS string literal
   const safeAddr = addr.replace(/[^a-zA-Z0-9]/g, '');
 
   return `
@@ -2387,6 +2550,23 @@ function buildWalletMockScript(addr: string): string {
 
   var addr = "0x${safeAddr.replace(/^0x/i, '')}";
   var listeners = {};
+  var BSC_RPC = 'https://bsc-dataseed1.binance.org/';
+
+  // Proxy read calls to real BSC so dApps see accurate on-chain data
+  async function proxyRpc(method, params) {
+    try {
+      var resp = await fetch(BSC_RPC, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: method, params: params })
+      });
+      var data = await resp.json();
+      return data.result;
+    } catch(e) {
+      console.warn('[mock] RPC proxy failed for ' + method + ':', e && e.message);
+      return null;
+    }
+  }
 
   var mock = {
     isMetaMask:       true,
@@ -2395,12 +2575,14 @@ function buildWalletMockScript(addr: string): string {
     selectedAddress:  addr,
     chainId:          '0x38',
     networkVersion:   '56',
+    _metamask:        { isUnlocked: function() { return Promise.resolve(true); } },
     isConnected:      function() { return true; },
 
     request: async function(req) {
       var m = req.method;
       var p = req.params || [];
-      console.log('[mock] request:', m, JSON.stringify(p).slice(0, 80));
+      console.log('[mock] request:', m, JSON.stringify(p).slice(0, 120));
+
       if (m === 'eth_accounts' || m === 'eth_requestAccounts') {
         setTimeout(function() {
           (listeners['accountsChanged'] || []).forEach(function(cb) { cb([addr]); });
@@ -2410,28 +2592,43 @@ function buildWalletMockScript(addr: string): string {
       }
       if (m === 'eth_chainId')     return '0x38';
       if (m === 'net_version')     return '56';
-      if (m === 'eth_blockNumber') return '0x1000000';
-      if (m === 'eth_getBalance')  return '0x38D7EA4C68000';
-      if (m === 'eth_gasPrice')    return '0x3B9ACA00';
-      if (m === 'eth_estimateGas') return '0x35B60';  // 220k — enough for complex calls
-      if (m === 'eth_getCode')     return '0x';
-      if (m === 'eth_call') {
-        // Proxy to real BSC so the dApp gets accurate on-chain reads (vault factory
-        // registry, fee config lookups, etc.) instead of empty bytes.
-        try {
-          var callResp = await fetch('https://bsc-dataseed1.binance.org/', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: p })
-          });
-          var callData = await callResp.json();
-          return callData.result || '0x';
-        } catch(e) {
-          return '0x';
-        }
+
+      // Proxy read-heavy methods to real RPC for accurate dApp state
+      if (m === 'eth_blockNumber' || m === 'eth_getBalance' || m === 'eth_gasPrice' ||
+          m === 'eth_getCode' || m === 'eth_getTransactionCount' || m === 'eth_call' ||
+          m === 'eth_getTransactionReceipt' || m === 'eth_getTransactionByHash' ||
+          m === 'eth_getLogs' || m === 'eth_getBlockByNumber' || m === 'eth_getBlockByHash' ||
+          m === 'eth_feeHistory') {
+        var result = await proxyRpc(m, p);
+        if (result !== null && result !== undefined) return result;
+        // Fallbacks for when RPC is unreachable
+        if (m === 'eth_blockNumber') return '0x1000000';
+        if (m === 'eth_getBalance')  return '0x38D7EA4C68000';
+        if (m === 'eth_gasPrice')    return '0x3B9ACA00';
+        if (m === 'eth_getCode')     return '0x';
+        if (m === 'eth_getTransactionCount') return '0x0';
+        if (m === 'eth_call')        return '0x';
+        return null;
       }
-      if (m === 'wallet_switchEthereumChain') return null;
-      if (m === 'wallet_addEthereumChain')    return null;
+
+      if (m === 'eth_estimateGas') {
+        var est = await proxyRpc(m, p);
+        return est || '0x55730'; // 350k fallback — enough for complex calls
+      }
+
+      if (m === 'wallet_switchEthereumChain') {
+        var targetChain = p[0] && p[0].chainId;
+        if (targetChain === '0x38') return null; // already on BSC
+        // Accept the switch silently — some dApps check for BSC with different hex casing
+        console.log('[mock] wallet_switchEthereumChain to ' + targetChain + ' — staying on BSC');
+        return null;
+      }
+
+      if (m === 'wallet_addEthereumChain') {
+        // Accept silently — we're always on BSC
+        console.log('[mock] wallet_addEthereumChain — acknowledged');
+        return null;
+      }
 
       if (m === 'personal_sign' || m === 'eth_sign') {
         console.log('[mock] personal_sign requested — calling chainverifySign');
@@ -2452,7 +2649,7 @@ function buildWalletMockScript(addr: string): string {
         }
       }
 
-      if (m === 'eth_signTypedData' || m === 'eth_signTypedData_v4') {
+      if (m === 'eth_signTypedData' || m === 'eth_signTypedData_v3' || m === 'eth_signTypedData_v4') {
         if (typeof window.chainverifySign !== 'function') {
           var e3 = new Error('ChainVerify: no signing bridge');
           e3.code = 4001;
@@ -2468,23 +2665,21 @@ function buildWalletMockScript(addr: string): string {
         }
       }
 
-      if (m === 'eth_getTransactionCount') {
-        // Return real nonce so the frontend builds txs with the correct sequence number
-        try {
-          var nonceResp = await fetch('https://bsc-dataseed1.binance.org/', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getTransactionCount', params: p })
-          });
-          var nonceData = await nonceResp.json();
-          return nonceData.result || '0x0';
-        } catch(e) {
-          return '0x0';
-        }
+      if (m === 'eth_maxFeePerGas') {
+        var gasPrice = await proxyRpc('eth_gasPrice', []);
+        if (gasPrice) return gasPrice;
+        return '0xBA43B7400';
       }
-      if (m === 'eth_maxFeePerGas')        return '0xBA43B7400';  // 5 gwei
       if (m === 'eth_maxPriorityFeePerGas') return '0x3B9ACA00';
       if (m === 'wallet_requestPermissions') return [{ eth_accounts: {} }];
+      if (m === 'wallet_getPermissions')     return [{ eth_accounts: {} }];
+      if (m === 'wallet_watchAsset')         return true;
+      if (m === 'wallet_revokePermissions')  return null;
+      if (m === 'web3_clientVersion')        return 'MetaMask/v11.0.0';
+      if (m === 'web3_sha3') {
+        // Minimal Keccak-256 — most dApps don't call this directly
+        return null;
+      }
 
       if (m === 'eth_sendTransaction') {
         console.log('[mock] eth_sendTransaction — forwarding to signing bridge');
@@ -2505,6 +2700,17 @@ function buildWalletMockScript(addr: string): string {
         }
       }
 
+      if (m === 'eth_sendRawTransaction') {
+        console.log('[mock] eth_sendRawTransaction — proxying to RPC');
+        var rawResult = await proxyRpc(m, p);
+        return rawResult;
+      }
+
+      if (m === 'eth_subscribe' || m === 'eth_unsubscribe') {
+        return null;
+      }
+
+      console.log('[mock] Unhandled method:', m, '— returning null');
       return null;
     },
 
@@ -2517,7 +2723,44 @@ function buildWalletMockScript(addr: string): string {
       if (listeners[event]) listeners[event] = listeners[event].filter(function(f) { return f !== cb; });
       return this;
     },
-    enable: async function() { return [addr]; }
+    removeAllListeners: function(event) {
+      if (event) { listeners[event] = []; } else { listeners = {}; }
+      return this;
+    },
+    once: function(event, cb) {
+      var self = this;
+      function wrapper() { self.removeListener(event, wrapper); cb.apply(null, arguments); }
+      return this.on(event, wrapper);
+    },
+    emit: function(event) {
+      var args = Array.prototype.slice.call(arguments, 1);
+      (listeners[event] || []).forEach(function(cb) { try { cb.apply(null, args); } catch(e) {} });
+      return this;
+    },
+    enable: async function() { return [addr]; },
+    send: function(methodOrPayload, paramsOrCallback) {
+      // Legacy web3.js 0.x compatibility
+      if (typeof methodOrPayload === 'string') {
+        return mock.request({ method: methodOrPayload, params: paramsOrCallback || [] });
+      }
+      // Batch or legacy { method, params } object
+      if (methodOrPayload && methodOrPayload.method) {
+        return mock.request(methodOrPayload).then(function(result) {
+          if (typeof paramsOrCallback === 'function') paramsOrCallback(null, { result: result });
+          return result;
+        });
+      }
+      return Promise.resolve(null);
+    },
+    sendAsync: function(payload, callback) {
+      mock.request({ method: payload.method, params: payload.params || [] })
+        .then(function(result) {
+          callback(null, { id: payload.id, jsonrpc: '2.0', result: result });
+        })
+        .catch(function(err) {
+          callback(err, null);
+        });
+    }
   };
 
   // Lock ethereum as non-configurable getter so Privy/wagmi cannot delete it
@@ -2534,32 +2777,31 @@ function buildWalletMockScript(addr: string): string {
     console.log('[mock] window.ethereum set (fallback) for', addr);
   }
 
-  // EIP-6963 — announce as MetaMask, but with a custom rdns so wallet libraries
-  // (AppKit, RainbowKit) route through the standard EIP-6963 connector path
-  // instead of MetaMask SDK (which waits for the browser extension popup).
-  // We keep name:"MetaMask" so the wallet appears in the modal with the right
-  // label and our selector (/metamask/i) still finds and clicks it.
+  // Also set window.web3 for legacy dApps that check for it
+  try {
+    if (!window.web3 || !window.web3.currentProvider) {
+      window.web3 = { currentProvider: mock };
+    }
+  } catch(e) {}
+
+  // EIP-6963 — announce as MetaMask with custom rdns to bypass MetaMask SDK
   var EIP6963_INFO = {
     uuid:  'chainverify-investigation-metamask',
     name:  'MetaMask',
-    icon:  '',
-    rdns:  'io.metamask.injected'   // custom rdns → bypasses MetaMask SDK connector
+    icon:  'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"/>',
+    rdns:  'io.metamask.injected'
   };
   function announceProvider() {
     window.dispatchEvent(new CustomEvent('eip6963:announceProvider', {
-      detail: { info: EIP6963_INFO, provider: mock }
+      detail: Object.freeze({ info: Object.freeze(EIP6963_INFO), provider: mock })
     }));
   }
   announceProvider();
   window.addEventListener('eip6963:requestProvider', announceProvider);
   console.log('[mock] EIP-6963 announcement registered');
 
-  // ── wagmi v2 / AppKit localStorage pre-connect ───────────────────────────
-  // wagmi v2 only auto-reconnects if a prior connection is stored in
-  // localStorage. AppKit (Reown/WalletConnect) uses @appkit/* keys.
-  // We pre-populate both so either library auto-reconnects on mount.
+  // ── wagmi v2 / AppKit / RainbowKit / ConnectKit localStorage pre-connect ──
   try {
-    // wagmi.store — connectorUid=io.metamask (EIP-6963 rdns for MetaMask)
     var wagmiState = JSON.stringify({
       state: {
         chainId: 56,
@@ -2573,11 +2815,15 @@ function buildWalletMockScript(addr: string): string {
             }]
           ]
         },
-        current: 'io.metamask.injected'
+        current: 'io.metamask.injected',
+        status: 'connected'
       },
       version: 2
     });
     localStorage.setItem('wagmi.store', wagmiState);
+    localStorage.setItem('wagmi.connected', 'true');
+    localStorage.setItem('wagmi.wallet', '"io.metamask.injected"');
+    localStorage.setItem('wagmi.recentConnectorId', '"io.metamask.injected"');
 
     // AppKit (Reown) connection state keys
     localStorage.setItem('@appkit/connection_status',   'connected');
@@ -2587,22 +2833,41 @@ function buildWalletMockScript(addr: string): string {
     localStorage.setItem('@appkit/connected_connector_name', 'MetaMask');
     localStorage.setItem('@appkit/connected_account_type',   'eoa');
 
-    console.log('[mock] wagmi.store + AppKit localStorage pre-populated for auto-reconnect');
+    // RainbowKit
+    localStorage.setItem('rk-recent', JSON.stringify(['metaMask']));
+
+    // ConnectKit
+    localStorage.setItem('connectkit-lastUsedConnector', 'metaMask');
+
+    // Dynamic.xyz
+    localStorage.setItem('dynamic_authenticated_user', JSON.stringify({ address: addr }));
+
+    // ethers.js v5 legacy
+    localStorage.setItem('WEB3_CONNECT_CACHED_PROVIDER', '"injected"');
+
+    console.log('[mock] localStorage pre-populated for wagmi/AppKit/RainbowKit/ConnectKit/Dynamic/ethers');
   } catch(lsErr) {
     console.log('[mock] localStorage write failed:', lsErr && lsErr.message);
   }
 
   // ── Force-connect helper ─────────────────────────────────────────────────
-  // Fallback for sites that use a custom wagmi storage key or clear storage
-  // after init. Fires provider-level events so wagmi's accountsChanged
-  // subscription updates state without needing the extension popup.
   window.__chainverifyTriggerConnect = function() {
-    console.log('[mock] __chainverifyTriggerConnect called — firing accountsChanged + connect');
+    console.log('[mock] __chainverifyTriggerConnect called — firing accountsChanged + connect + chainChanged');
     (listeners['accountsChanged'] || []).forEach(function(cb) { try { cb([addr]); } catch(e) {} });
     (listeners['connect'] || []).forEach(function(cb) { try { cb({ chainId: '0x38' }); } catch(e) {} });
+    (listeners['chainChanged'] || []).forEach(function(cb) { try { cb('0x38'); } catch(e) {} });
     mock.request({ method: 'eth_requestAccounts', params: [] }).catch(function() {});
   };
-  console.log('[mock] __chainverifyTriggerConnect installed');
+
+  // ── Periodic re-announcement for late-loading wallet libraries ──────────
+  var announceCount = 0;
+  var announceInterval = setInterval(function() {
+    announceProvider();
+    announceCount++;
+    if (announceCount >= 10) clearInterval(announceInterval);
+  }, 1000);
+
+  console.log('[mock] Wallet mock installed: ' + addr + ' on BSC (0x38)');
 })();
 `;
 }

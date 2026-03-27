@@ -8,9 +8,39 @@ import { cn } from '@/lib/utils';
 import type { Claim, Verdict } from '@/lib/types';
 import type { BadgeVariant } from './status-badge';
 
-/** Fetches a remote video into a blob URL so the browser can seek freely
- *  without depending on sparse keyframes + range requests. */
-function BufferedVideo({ src, poster, className }: {
+/**
+ * MP4 (H.264) has frequent keyframes — native seeking works perfectly.
+ * Old WebM recordings have sparse keyframes (~15-30s) — seeking freezes
+ * unless the full file is buffered into a blob URL first.
+ */
+function RecordingVideo({ src, poster, className }: {
+  src: string;
+  poster?: string;
+  className?: string;
+}) {
+  const isMp4 = src.endsWith('.mp4');
+
+  if (isMp4) {
+    return (
+      // eslint-disable-next-line jsx-a11y/media-has-caption
+      <video
+        src={src}
+        controls
+        muted
+        playsInline
+        preload="auto"
+        poster={poster}
+        className={className}
+      />
+    );
+  }
+
+  return (
+    <BufferedWebmVideo src={src} poster={poster} className={className} />
+  );
+}
+
+function BufferedWebmVideo({ src, poster, className }: {
   src: string;
   poster?: string;
   className?: string;
@@ -28,7 +58,7 @@ function BufferedVideo({ src, poster, className }: {
 
       const chunks: ArrayBuffer[] = [];
       let loaded = 0;
-      while (true) {
+      for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
         chunks.push(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
@@ -53,7 +83,7 @@ function BufferedVideo({ src, poster, className }: {
 
   if (!blobUrl) {
     return (
-      <div className={cn('flex items-center justify-center bg-black', className)} style={{ minHeight: 160 }}>
+      <div className={cn('relative flex items-center justify-center bg-black', className)} style={{ minHeight: 160 }}>
         {poster && (
           // eslint-disable-next-line @next/next/no-img-element
           <img src={poster} alt="" className="absolute inset-0 w-full h-full object-cover opacity-30" />
@@ -282,7 +312,7 @@ export function AuditClaimCard({
                                 Agent Recording
                               </span>
                             </div>
-                            <BufferedVideo
+                            <RecordingVideo
                               src={claim.videoUrl}
                               poster={claim.screenshotDataUrl}
                               className="w-full max-h-64 bg-black"

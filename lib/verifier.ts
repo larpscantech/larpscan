@@ -1,8 +1,12 @@
 import path    from 'path';
 import fs      from 'fs/promises';
 import { randomUUID } from 'crypto';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { fixWebmDuration } from 'webm-duration-fix-buffer';
 import { connectBrowser, isServerlessRuntime, isBrowserlessMode } from './browser';
+
+const execFileAsync = promisify(execFile);
 import { supabase } from './supabase';
 import {
   analyzePageState,
@@ -29,6 +33,69 @@ import { runSafetyMonitor, formatSafetyReport } from './wallet/monitor';
 import { exposeSigningBridge, drainTransactionHashes, drainTransactionAttempt } from './wallet/signer';
 import { waitForTxReceiptOutcome } from './wallet/tx-confirm';
 import type { WalletRequestContext } from './wallet/request-classifier';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WebM → MP4 conversion
+//
+// Browserless CDP recording produces VP9 WebM with sparse keyframes (~15-30s).
+// Seeking freezes because the browser must decode from the last keyframe.
+// Re-encoding to H.264 MP4 with keyframes every 2s gives instant seeking.
+// Uses ffmpeg-static which runs natively on Vercel (Fluid compute).
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function convertWebmToMp4(webmBuffer: Buffer, tag: string): Promise<Buffer | null> {
+  let ffmpegPath: string;
+  try {
+    ffmpegPath = require('ffmpeg-static') as string;
+  } catch {
+    console.warn(`[${tag}] ffmpeg-static not available, skipping MP4 conversion`);
+    return null;
+  }
+
+  const tmpIn  = path.join('/tmp', `${randomUUID()}.webm`);
+  const tmpOut = path.join('/tmp', `${randomUUID()}.mp4`);
+
+  try {
+    await fs.writeFile(tmpIn, webmBuffer);
+
+    await execFileAsync(ffmpegPath, [
+      '-y',
+      '-i', tmpIn,
+      '-pix_fmt', 'yuv420p',
+      '-vf', 'scale=960:-2,fps=24',  // deduplicate frames + scale down
+      '-c:v', 'libx264',
+      '-preset', 'veryfast',
+      '-crf', '34',
+      '-g', '48',
+      '-keyint_min', '24',
+      '-an',
+      '-movflags', '+faststart',
+      tmpOut,
+    ], { timeout: 120_000, maxBuffer: 10 * 1024 * 1024 });
+
+    const mp4Buffer = await fs.readFile(tmpOut);
+    const inKB  = (webmBuffer.length / 1024).toFixed(0);
+    const outKB = (mp4Buffer.length / 1024).toFixed(0);
+    console.log(`[${tag}] MP4 conversion: ${inKB}KB → ${outKB}KB`);
+
+    // Supabase free tier has a 50MB upload limit; reject oversized files
+    if (mp4Buffer.length > 45 * 1024 * 1024) {
+      console.warn(`[${tag}] MP4 too large (${outKB}KB), falling back to WebM`);
+      return null;
+    }
+
+    return mp4Buffer;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const stderr = (err as { stderr?: string })?.stderr;
+    console.warn(`[${tag}] MP4 conversion failed: ${msg.slice(0, 300)}`);
+    if (stderr) console.warn(`[${tag}] ffmpeg stderr (last 300): ${stderr.slice(-300)}`);
+    return null;
+  } finally {
+    await fs.unlink(tmpIn).catch(() => {});
+    await fs.unlink(tmpOut).catch(() => {});
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -637,28 +704,34 @@ async function recordInteraction(
           console.log(`[verifier:record] Raw recording: ${(rawBuffer.length / 1024).toFixed(0)}KB`);
 
           if (rawBuffer.length > 0) {
-            // Inject Duration + Cues (seek index) into the WebM so browsers
-            // can display the total length and seek without buffering the
-            // entire file first.
-            let uploadBuffer = rawBuffer;
-            try {
-              const rawBlob = new Blob([rawBuffer], { type: 'video/webm' });
-              const fixedBlob = await fixWebmDuration(rawBlob);
-              uploadBuffer = Buffer.from(await fixedBlob.arrayBuffer());
-              console.log(
-                `[verifier:record] WebM patched: +${uploadBuffer.length - rawBuffer.length}B ` +
-                `(duration + cues injected, ${(durationMs / 1000).toFixed(1)}s)`,
-              );
-            } catch (fixErr) {
-              console.warn('[verifier:record] WebM patch failed (uploading raw):', fixErr);
+            let uploadBuffer: Buffer = rawBuffer;
+            let fileName = `${claimId}.webm`;
+            let contentType = 'video/webm';
+
+            // Convert to MP4 (H.264) with frequent keyframes for instant seeking.
+            const mp4 = await convertWebmToMp4(rawBuffer, 'verifier:record');
+            if (mp4) {
+              uploadBuffer = mp4;
+              fileName = `${claimId}.mp4`;
+              contentType = 'video/mp4';
+            } else {
+              // Fallback: patch WebM with duration + cues for basic metadata
+              try {
+                const rawBlob = new Blob([rawBuffer], { type: 'video/webm' });
+                const fixedBlob = await fixWebmDuration(rawBlob);
+                uploadBuffer = Buffer.from(await fixedBlob.arrayBuffer());
+                console.log('[verifier:record] WebM patched with duration + cues (fallback)');
+              } catch (fixErr) {
+                console.warn('[verifier:record] WebM patch failed (uploading raw):', fixErr);
+              }
             }
 
             await supabase.storage.createBucket('recordings', { public: true }).catch(() => {});
 
             const { error: uploadErr } = await supabase.storage
               .from('recordings')
-              .upload(`${claimId}.webm`, uploadBuffer, {
-                contentType: 'video/webm',
+              .upload(fileName, uploadBuffer, {
+                contentType,
                 upsert: true,
               });
 
@@ -667,7 +740,7 @@ async function recordInteraction(
             } else {
               const { data } = supabase.storage
                 .from('recordings')
-                .getPublicUrl(`${claimId}.webm`);
+                .getPublicUrl(fileName);
               videoUrl = data.publicUrl;
               console.log(`[verifier:record] Video uploaded → ${videoUrl}`);
             }

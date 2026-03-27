@@ -77,10 +77,21 @@ const BLOCKER_PATTERNS: Array<{ type: BlockerType; patterns: RegExp[] }> = [
   {
     type: 'auth_required',
     patterns: [
-      // English
-      /sign in/i, /log in/i, /\blogin\b/i, /create account/i, /login to continue/i,
+      // English — specific phrases first to avoid false positives from partial matches
+      /sign in to continue/i, /log in to continue/i, /please sign in/i, /please log in/i,
+      /login to continue/i, /create account/i, /sign up to continue/i,
+      /create an account to continue/i, /verify your email/i, /email verification required/i,
+      /log in or sign up/i,
+      // Privy / social auth
+      /login with twitter/i, /login with github/i, /login with tiktok/i,
+      /login with twitch/i, /login with discord/i, /continue with a wallet/i,
+      // General auth
+      /sign in/i, /log in/i, /\blogin\b/i,
+      // KYC / identity verification
+      /complete kyc/i, /kyc required/i, /identity verification/i, /verify your identity/i,
       // Traditional Chinese
-      /登入/,  /登錄/, /請登入/, /需要登入/, /註冊帳號/,
+      /登入/, /登錄/, /請登入/, /需要登入/, /註冊帳號/,
+      /身份驗證/, /完成身份認證/, /實名認證/,
     ],
   },
   {
@@ -88,8 +99,10 @@ const BLOCKER_PATTERNS: Array<{ type: BlockerType; patterns: RegExp[] }> = [
     patterns: [
       // English
       /connect wallet/i, /connect your wallet/i, /wallet required/i, /wallet not connected/i,
+      /please connect/i, /no wallet detected/i, /install a wallet/i,
       // Traditional Chinese
       /連接錢包/, /連結錢包/, /請連接錢包/, /未連接錢包/, /錢包未連接/, /連接您的錢包/,
+      /未檢測到錢包/, /安裝錢包/,
     ],
   },
   {
@@ -97,8 +110,11 @@ const BLOCKER_PATTERNS: Array<{ type: BlockerType; patterns: RegExp[] }> = [
     patterns: [
       // English
       /coming soon/i, /under construction/i, /not available yet/i, /launching soon/i,
+      /under maintenance/i, /scheduled maintenance/i, /temporarily unavailable/i,
+      /we.?re working on it/i, /check back later/i,
       // Traditional Chinese
       /即將推出/, /敬請期待/, /建設中/, /即將上線/, /功能開發中/,
+      /維護中/, /系統維護/, /暫時不可用/,
     ],
   },
   {
@@ -106,6 +122,7 @@ const BLOCKER_PATTERNS: Array<{ type: BlockerType; patterns: RegExp[] }> = [
     patterns: [
       // English
       /\b404\b/, /page not found/i, /this page could not be found/i, /no page found/i,
+      /this page doesn.?t exist/i, /nothing to see here/i, /oops.*not found/i,
       // Traditional Chinese
       /頁面不存在/, /找不到頁面/, /頁面未找到/, /此頁面不存在/,
     ],
@@ -113,17 +130,21 @@ const BLOCKER_PATTERNS: Array<{ type: BlockerType; patterns: RegExp[] }> = [
   {
     type: 'bot_protection',
     patterns: [
-      // English
+      // English — Cloudflare, hCaptcha, reCAPTCHA, generic
       /just a moment/i, /checking your browser/i, /cf-browser-verification/i, /enable javascript/i,
+      /verify you are human/i, /are you a robot/i, /complete the captcha/i,
+      /solve the challenge/i, /hcaptcha/i, /recaptcha/i,
+      /access denied/i, /blocked by.*protection/i,
       // Traditional Chinese
-      /正在驗證您的瀏覽器/, /請稍候/, /啟用 JavaScript/,
+      /正在驗證您的瀏覽器/, /請稍候/, /啟用 JavaScript/, /驗證碼/,
     ],
   },
   {
     type: 'rate_limited',
     patterns: [
       // English
-      /too many requests/i, /rate limit/i, /\b429\b/,
+      /too many requests/i, /rate limit/i, /\b429\b/, /slow down/i, /try again later/i,
+      /request limit exceeded/i,
       // Traditional Chinese
       /請求過多/, /請求頻率過高/, /操作太頻繁/,
     ],
@@ -133,6 +154,8 @@ const BLOCKER_PATTERNS: Array<{ type: BlockerType; patterns: RegExp[] }> = [
     patterns: [
       // English
       /not available in your region/i, /geographic restriction/i, /country not supported/i,
+      /unavailable in your location/i, /restricted territory/i, /vpn detected/i,
+      /this service is not available/i,
       // Traditional Chinese
       /您所在地區不支援/, /地區限制/, /不支援您的地區/, /此國家不可用/,
     ],
@@ -142,6 +165,7 @@ const BLOCKER_PATTERNS: Array<{ type: BlockerType; patterns: RegExp[] }> = [
     patterns: [
       // English
       /no data/i, /no results/i, /nothing here/i, /no entries/i,
+      /no items found/i, /empty/i,
       // Traditional Chinese
       /暫無數據/, /沒有結果/, /沒有數據/, /無記錄/, /暫無記錄/,
     ],
