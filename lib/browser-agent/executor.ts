@@ -210,12 +210,16 @@ function buildStepNarrative(obs: AgentObservation): string {
 }
 
 function detectBlockerFromText(text: string): BlockerType | undefined {
-  // wallet_required — English + Traditional Chinese
-  if (/connect wallet|wallet required/i.test(text))           return 'wallet_required';
-  if (/連接錢包|連結錢包|請連接錢包|未連接錢包|錢包未連接/.test(text)) return 'wallet_required';
+  // auth_required — Privy social login modal (check BEFORE wallet_required)
+  if (/login with twitter|login with github|login with tiktok|login with twitch/i.test(text)) return 'auth_required';
+  if (/log in or sign up/i.test(text))                        return 'auth_required';
+  if (/continue with a wallet/i.test(text))                   return 'auth_required';
   // auth_required — English + Traditional Chinese
   if (/sign in|log in|\blogin\b/i.test(text))                 return 'auth_required';
   if (/登入|登錄|請登入|需要登入/.test(text))                   return 'auth_required';
+  // wallet_required — English + Traditional Chinese (after auth checks)
+  if (/connect wallet|wallet required/i.test(text))           return 'wallet_required';
+  if (/連接錢包|連結錢包|請連接錢包|未連接錢包|錢包未連接/.test(text)) return 'wallet_required';
   // bot_protection — English + Traditional Chinese
   if (/just a moment|checking your browser/i.test(text))      return 'bot_protection';
   if (/正在驗證您的瀏覽器|請稍候.*驗證/.test(text))              return 'bot_protection';
@@ -2292,19 +2296,27 @@ export async function handleWalletPopups(
         { short: shortAddr, end: shortAddrEnd },
       ).catch(() => false);
 
-      if (connectedInDom) {
+      const authModalStillVisible = await page.evaluate(() => {
+        const text = document.body?.innerText?.toLowerCase() ?? '';
+        return (
+          /log in or sign up/i.test(text) ||
+          /login with twitter|login with github|login with tiktok/i.test(text) ||
+          /continue with a wallet/i.test(text)
+        );
+      }).catch(() => false);
+
+      if (connectedInDom && !authModalStillVisible) {
         walletConnected = true;
         log.push('[wallet] Wallet connected confirmed — address/state visible in DOM');
-      } else if (pickerClicked) {
-        // Optimistic: we clicked through the full flow — mark connected
-        walletConnected = true;
-        log.push('[wallet] Wallet connection flow completed (personal_sign handled by signing bridge)');
+      } else if (authModalStillVisible) {
+        walletConnected = false;
+        log.push('[wallet] Auth/login modal still visible — Privy session not established, wallet NOT connected');
       } else {
-        walletConnected = primaryClicked;
+        walletConnected = false;
         log.push(
-          primaryClicked
-            ? '[wallet] Wallet address injected — connection state uncertain'
-            : '[wallet] Wallet injection active but no UI interaction succeeded',
+          pickerClicked
+            ? '[wallet] Wallet picker clicked but connection not confirmed in DOM — NOT marking connected'
+            : '[wallet] Wallet injection active but connection not confirmed in DOM — NOT marking connected',
         );
       }
     } else {

@@ -261,6 +261,8 @@ async function recordInteraction(
   const browser = await launchChromium({ headless: true });
 
   let context: Awaited<ReturnType<typeof browser.newContext>> | null = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Playwright Video type not directly importable
+  let video: { path(): Promise<string>; saveAs(path: string): Promise<void> } | null = null;
   let allObservations: AgentObservation[] = [];
   let finalPageState: PageState = emptyPageState;
   const runApiCalls: string[] = [];
@@ -301,7 +303,18 @@ async function recordInteraction(
     // It is off by default because ffmpeg is often absent in serverless bundles.
     const videoEnvEnabled = process.env.ENABLE_PLAYWRIGHT_VIDEO === 'true';
     await ensureFFmpegForPlaywright();
-    const enableRecording = videoEnvEnabled && (isFFmpegReady() || !isServerlessRuntime());
+    const ffmpegOk = isFFmpegReady();
+    const serverless = isServerlessRuntime();
+    const enableRecording = videoEnvEnabled && (ffmpegOk || !serverless);
+
+    if (!enableRecording) {
+      const reasons: string[] = [];
+      if (!videoEnvEnabled)        reasons.push('ENABLE_PLAYWRIGHT_VIDEO not set to "true"');
+      if (serverless && !ffmpegOk) reasons.push('serverless runtime but ffmpeg not available');
+      console.log(`[verifier:record] Video recording DISABLED — ${reasons.join('; ') || 'unknown'}`);
+    } else {
+      console.log('[verifier:record] Video recording ENABLED');
+    }
 
     context = await browser.newContext({
       userAgent:
@@ -601,59 +614,76 @@ async function recordInteraction(
       }
     }
 
-    // ── Close page → finalizes video ────────────────────────────────────────
+    // ── Video finalization: strongest Playwright-safe sequence ─────────────
+    // 1. Capture video ref BEFORE page.close() (can become null after close)
+    // 2. page.close() flushes video frames to disk
+    // 3. context.close() fully releases the video file handle
+    // 4. THEN read path and persist/upload
+    // Each stage is logged so if Vercel kills the Lambda, logs show where it stopped.
+    video = page.video();
+    console.log(`[verifier:record] Stage 1/4: video object present: ${!!video}`);
+
     await page.close();
-
-    try {
-      const rawPath = await page.video()?.path();
-      if (rawPath) {
-        const finalPath = path.join(recordingsDir, `${claimId}.webm`);
-        await fs.rename(rawPath, finalPath).catch(async () => {
-          await fs.copyFile(rawPath, finalPath);
-          await fs.unlink(rawPath).catch(() => {});
-        });
-
-        if (!recordingsDir.startsWith('/tmp')) {
-          // Local dev — serve directly from /public/recordings
-          videoUrl = `/recordings/${claimId}.webm`;
-          console.log(`[verifier:record] Video saved → ${videoUrl}`);
-        } else {
-          // Serverless — upload to Supabase Storage for a public URL
-          try {
-            const fileBuffer = await fs.readFile(finalPath);
-
-            // Create bucket if it doesn't exist yet (idempotent).
-            await supabase.storage.createBucket('recordings', { public: true }).catch(() => {});
-
-            const { error: uploadErr } = await supabase.storage
-              .from('recordings')
-              .upload(`${claimId}.webm`, fileBuffer, {
-                contentType: 'video/webm',
-                upsert: true,
-              });
-
-            if (uploadErr) {
-              console.warn(`[verifier:record] Supabase upload error: ${uploadErr.message}`);
-            } else {
-              const { data } = supabase.storage
-                .from('recordings')
-                .getPublicUrl(`${claimId}.webm`);
-              videoUrl = data.publicUrl;
-              console.log(`[verifier:record] Video uploaded → ${videoUrl}`);
-            }
-          } catch (uploadEx) {
-            console.warn('[verifier:record] Supabase upload failed (non-fatal):', uploadEx);
-          }
-          // Clean up from /tmp regardless
-          await fs.unlink(finalPath).catch(() => {});
-        }
-      }
-    } catch (e) {
-      console.warn('[verifier:record] Video save failed (non-fatal):', e);
-    }
+    console.log('[verifier:record] Stage 2/4: page closed');
   } finally {
-    if (context) await context.close().catch(() => {});
+    // context.close() MUST happen before video persistence — Playwright holds
+    // the file handle open until the context is fully torn down.
+    if (context) {
+      await context.close().catch(() => {});
+      console.log('[verifier:record] Stage 3/4: context closed');
+    }
+
+    // ── Stage 4: persist video ──────────────────────────────────────────
+    if (video) {
+      try {
+        const rawPath = await video.path();
+        console.log(`[verifier:record] Stage 4/4: raw video path: ${rawPath ?? '(null)'}`);
+        if (rawPath) {
+          const finalPath = path.join(recordingsDir, `${claimId}.webm`);
+          await fs.rename(rawPath, finalPath).catch(async () => {
+            await fs.copyFile(rawPath, finalPath);
+            await fs.unlink(rawPath).catch(() => {});
+          });
+          console.log(`[verifier:record] Video finalized → ${finalPath}`);
+
+          if (!recordingsDir.startsWith('/tmp')) {
+            videoUrl = `/recordings/${claimId}.webm`;
+            console.log(`[verifier:record] Video served locally → ${videoUrl}`);
+          } else {
+            try {
+              const fileBuffer = await fs.readFile(finalPath);
+
+              await supabase.storage.createBucket('recordings', { public: true }).catch(() => {});
+
+              const { error: uploadErr } = await supabase.storage
+                .from('recordings')
+                .upload(`${claimId}.webm`, fileBuffer, {
+                  contentType: 'video/webm',
+                  upsert: true,
+                });
+
+              if (uploadErr) {
+                console.warn(`[verifier:record] Supabase upload error: ${uploadErr.message}`);
+              } else {
+                const { data } = supabase.storage
+                  .from('recordings')
+                  .getPublicUrl(`${claimId}.webm`);
+                videoUrl = data.publicUrl;
+                console.log(`[verifier:record] Video uploaded → ${videoUrl}`);
+              }
+            } catch (uploadEx) {
+              console.warn('[verifier:record] Supabase upload failed (non-fatal):', uploadEx);
+            }
+            await fs.unlink(finalPath).catch(() => {});
+          }
+        }
+      } catch (e) {
+        console.warn('[verifier:record] Video save failed (non-fatal):', e);
+      }
+    }
+
     await browser.close().catch(() => {});
+    console.log('[verifier:record] Browser closed');
   }
 
   return { probes, videoUrl, observations: allObservations, finalPageState, runApiCalls, walletEvidence, finalScreenshotDataUrl, walletOnlyGateDetected, pageJsErrors };

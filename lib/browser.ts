@@ -82,8 +82,28 @@ export async function ensureFFmpegForPlaywright(): Promise<void> {
   }
 }
 
+/** Parses PROXY_URL env var into Playwright's proxy config format. */
+export function getProxyConfig(): { server: string; username?: string; password?: string } | undefined {
+  const raw = process.env.PROXY_URL;
+  if (!raw) return undefined;
+  try {
+    const url = new URL(raw);
+    const config: { server: string; username?: string; password?: string } = {
+      server: `${url.protocol}//${url.hostname}:${url.port}`,
+    };
+    if (url.username) config.username = decodeURIComponent(url.username);
+    if (url.password) config.password = decodeURIComponent(url.password);
+    console.log(`[browser] Proxy configured → ${url.hostname}:${url.port}`);
+    return config;
+  } catch {
+    console.warn(`[browser] Invalid PROXY_URL — ignoring`);
+    return undefined;
+  }
+}
+
 export async function launchChromium(options: LaunchOptions = {}): Promise<Browser> {
   const mergedArgs = mergeArgs(options.args);
+  const proxy = getProxyConfig();
 
   if (isServerlessRuntime()) {
     try {
@@ -95,6 +115,7 @@ export async function launchChromium(options: LaunchOptions = {}): Promise<Brows
         executablePath,
         args: mergeArgs([...(chromium.args ?? []), ...mergedArgs]),
         headless: options.headless ?? true,
+        ...(proxy ? { proxy } : {}),
       });
     } catch (error) {
       console.warn('[browser] Falling back to Playwright bundled Chromium:', error);
@@ -105,5 +126,6 @@ export async function launchChromium(options: LaunchOptions = {}): Promise<Brows
     ...options,
     args: mergedArgs,
     headless: options.headless ?? true,
+    ...(proxy ? { proxy } : {}),
   });
 }
