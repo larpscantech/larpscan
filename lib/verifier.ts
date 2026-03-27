@@ -1,6 +1,7 @@
 import path    from 'path';
 import fs      from 'fs/promises';
 import { randomUUID } from 'crypto';
+import fixWebmDuration from 'fix-webm-duration';
 import { connectBrowser, isServerlessRuntime, isBrowserlessMode } from './browser';
 import { supabase } from './supabase';
 import {
@@ -268,6 +269,7 @@ async function recordInteraction(
   let context: Awaited<ReturnType<typeof browser.newContext>> | null = null;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- CDP session for Browserless recording
   let cdpSession: any = null;
+  let recordingStartMs = 0;
   let allObservations: AgentObservation[] = [];
   let finalPageState: PageState = emptyPageState;
   const runApiCalls: string[] = [];
@@ -331,18 +333,6 @@ async function recordInteraction(
     const page = await context.newPage();
     page.setDefaultTimeout(15_000);
 
-    // Start Browserless CDP screen recording
-    if (enableRecording) {
-      try {
-        cdpSession = await context.newCDPSession(page);
-        await cdpSession.send('Browserless.startRecording');
-        console.log('[verifier:record] CDP recording started');
-      } catch (recErr) {
-        console.warn('[verifier:record] CDP recording start failed (non-fatal):', recErr);
-        cdpSession = null;
-      }
-    }
-
     // ── Run-level network listener ──────────────────────────────────────────
     page.on('response', (response) => {
       const url    = response.url();
@@ -357,13 +347,7 @@ async function recordInteraction(
     });
 
     // ── Unhandled JS error listener ─────────────────────────────────────────
-    // Playwright fires 'pageerror' for any unhandled exception thrown in the
-    // page context. We capture these to detect when a feature page crashes
-    // (e.g. a React component throws TypeError during render/hydration) so
-    // the verdict system can distinguish "page crashed = FAILED" from
-    // "feature absent = LARP".
     page.on('pageerror', (error) => {
-      // Only record errors that look like actual crashes (not background analytics noise)
       const msg = error.message ?? '';
       if (
         /Cannot read propert|is not a function|is not defined|Cannot set propert|undefined is not|null is not/i.test(msg)
@@ -385,6 +369,20 @@ async function recordInteraction(
     // appears in the DOM. Use a longer wait so analyzePageState sees the correct
     // connected state and doesn't emit a false wallet_required blocker.
     await page.waitForTimeout(walletEnabled ? 5_000 : 2_500);
+
+    // Start CDP recording AFTER the page has loaded and rendered so the video
+    // begins with the actual site content instead of a blank white page.
+    if (enableRecording) {
+      try {
+        cdpSession = await context.newCDPSession(page);
+        await cdpSession.send('Browserless.startRecording');
+        recordingStartMs = Date.now();
+        console.log('[verifier:record] CDP recording started (post-navigation)');
+      } catch (recErr) {
+        console.warn('[verifier:record] CDP recording start failed (non-fatal):', recErr);
+        cdpSession = null;
+      }
+    }
 
     // ── Dismiss cookie / GDPR consent banners ────────────────────────────────
     // Many sites show a consent overlay that blocks all interaction until
@@ -628,23 +626,34 @@ async function recordInteraction(
     // is tied to the page and dies when the page closes.
     if (cdpSession) {
       try {
-        console.log('[verifier:record] Stopping CDP recording...');
+        const durationMs = Date.now() - recordingStartMs;
+        console.log(`[verifier:record] Stopping CDP recording (${(durationMs / 1000).toFixed(1)}s)...`);
         const response = await cdpSession.send('Browserless.stopRecording');
 
         if (response.error) {
           console.warn(`[verifier:record] Recording error from Browserless: ${response.error}`);
         } else if (response.value) {
-          // response.value is a plain object (not a string) — Buffer.from()
-          // handles it correctly without an encoding argument.
-          const videoBuffer = Buffer.from(response.value);
-          console.log(`[verifier:record] Recording captured: ${(videoBuffer.length / 1024).toFixed(0)}KB`);
+          const rawBuffer = Buffer.from(response.value);
+          console.log(`[verifier:record] Raw recording: ${(rawBuffer.length / 1024).toFixed(0)}KB`);
 
-          if (videoBuffer.length > 0) {
+          if (rawBuffer.length > 0) {
+            // Patch the WebM with correct duration so browsers can seek
+            // without downloading the entire file first.
+            let uploadBuffer = rawBuffer;
+            try {
+              const rawBlob = new Blob([rawBuffer], { type: 'video/webm' });
+              const fixedBlob = await fixWebmDuration(rawBlob, durationMs, { logger: false });
+              uploadBuffer = Buffer.from(await fixedBlob.arrayBuffer());
+              console.log(`[verifier:record] Duration patched: ${(durationMs / 1000).toFixed(1)}s`);
+            } catch (fixErr) {
+              console.warn('[verifier:record] Duration fix failed (uploading raw):', fixErr);
+            }
+
             await supabase.storage.createBucket('recordings', { public: true }).catch(() => {});
 
             const { error: uploadErr } = await supabase.storage
               .from('recordings')
-              .upload(`${claimId}.webm`, videoBuffer, {
+              .upload(`${claimId}.webm`, uploadBuffer, {
                 contentType: 'video/webm',
                 upsert: true,
               });

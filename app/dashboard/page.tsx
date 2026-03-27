@@ -740,63 +740,70 @@ export default function DashboardPage() {
         setCheckingClaimIndex(rotateIdx);
       }, rotatePeriodMs);
 
-      let verifyResults: { claimId: string; verdict: string; confidence: string }[] = [];
-
+      // Dispatch claims — /api/verify/run now returns immediately after
+      // fanning out each claim to its own serverless function.
       try {
-        console.log(`${TAG} Calling /api/verify/run`, STYLE);
-        const verifyRes = await apiPost<{
-          runId: string;
-          results: { claimId: string; verdict: string; confidence: string }[];
-        }>(
+        console.log(`${TAG} Dispatching claims via /api/verify/run`, STYLE);
+        await apiPost<{ runId: string; results: unknown[] }>(
           '/api/verify/run',
           '/api/verify/run',
           { runId },
         );
-
-        verifyResults = verifyRes.results;
-        console.log(`${TAG} Verify/run returned ${verifyResults.length} result(s):`, STYLE, verifyResults);
       } catch (e) {
         const msg = e instanceof Error ? e.message : 'Verification engine failed';
-        console.error(`${TAG} verify/run failed:`, STYLE, msg);
+        console.error(`${TAG} verify/run dispatch failed:`, STYLE, msg);
         addLog(`✗ Browser verification failed: ${msg}`);
-        // Non-fatal: continue to reporting with unverified claims
-      } finally {
-        clearInterval(rotateTimer);
       }
 
-      if (!alive()) { console.groupEnd(); return; }
+      if (!alive()) { clearInterval(rotateTimer); console.groupEnd(); return; }
 
-      // Fetch updated claims (with evidence joined) and reveal verdicts one by one
-      try {
-        const statusRes = await apiGet<{
-          run:    DbVerificationRun;
-          claims: DbClaimWithEvidence[];
-          logs:   { message: string }[];
-        }>('/api/verify/status', `/api/verify/status?runId=${runId}`);
+      // Poll /api/verify/status until the run is complete or all claims resolved.
+      // Each claim runs in its own Lambda so results appear incrementally.
+      let revealedCount = 0;
+      const maxPollMs = 10 * 60 * 1000; // 10 minute safety cap
+      const pollStart = Date.now();
 
-        console.group(`${TAG} ── Status after verification ──`, STYLE);
-        console.log('  run status :', statusRes.run.status);
-        console.log('  claims     :', statusRes.claims.map((c) => `${c.claim} → ${c.status}`));
-        console.log('  log entries:', statusRes.logs.length);
-        console.groupEnd();
+      while (alive() && Date.now() - pollStart < maxPollMs) {
+        await sleep(5_000);
+        if (!alive()) break;
 
-        // Replace realClaims with verdict-enriched data
-        setRealClaims(statusRes.claims);
+        try {
+          const statusRes = await apiGet<{
+            run:    DbVerificationRun;
+            claims: DbClaimWithEvidence[];
+            logs:   { message: string }[];
+          }>('/api/verify/status', `/api/verify/status?runId=${runId}`);
 
-        // Reveal verdicts one by one
-        setCheckingClaimIndex(-1);
-        for (let i = 0; i < statusRes.claims.length; i++) {
-          if (!alive()) { console.groupEnd(); return; }
-          await sleep(450);
-          setResolvedResultsCount(i + 1);
-          const c = statusRes.claims[i];
-          addLog(`Claim ${String(i + 1).padStart(2, '0')} → ${c.status.toUpperCase()}`);
-          console.log(`${TAG} Revealed claim ${i + 1}: ${c.status}`, STYLE);
+          // Update claims in real-time as verdicts arrive
+          setRealClaims(statusRes.claims);
+
+          // Reveal newly resolved claims
+          const resolvedClaims = statusRes.claims.filter(
+            (c) => c.status !== 'pending' && c.status !== 'checking',
+          );
+          for (let i = revealedCount; i < resolvedClaims.length; i++) {
+            const c = resolvedClaims[i];
+            setResolvedResultsCount(i + 1);
+            addLog(`Claim ${String(i + 1).padStart(2, '0')} → ${c.status.toUpperCase()}`);
+            console.log(`${TAG} Revealed claim ${i + 1}: ${c.status}`, STYLE);
+          }
+          revealedCount = resolvedClaims.length;
+
+          // Done when run is complete or all claims have a final status
+          if (
+            statusRes.run.status === 'complete' ||
+            resolvedClaims.length === statusRes.claims.length
+          ) {
+            console.log(`${TAG} All claims resolved`, STYLE);
+            break;
+          }
+        } catch (e) {
+          console.warn(`${TAG} Status poll failed (retrying):`, STYLE, e);
         }
-      } catch (e) {
-        console.warn(`${TAG} Status fetch failed (non-fatal):`, STYLE, e);
-        setCheckingClaimIndex(-1);
       }
+
+      clearInterval(rotateTimer);
+      setCheckingClaimIndex(-1);
     }
 
     if (!alive()) { console.groupEnd(); return; }
