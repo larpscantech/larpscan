@@ -11,7 +11,7 @@
 import type { FeatureType, VerificationStrategy } from './db-types';
 import type { VerifyClaimResult } from './verifier';
 import { verifyClaim } from './verifier';
-import { rpcClient } from './rpc';
+import { rpcClient, analyzeContractOnChain, formatOnChainEvidence } from './rpc';
 
 // ── Structured claim shape passed through the graph ──────────────────────────
 
@@ -58,19 +58,16 @@ async function runBrowserPlusRpc(
     claim.surface ?? '/', claim.feature_type ?? undefined, claim.verification_strategy ?? undefined,
   );
 
-  // If we have a contract address, probe it on-chain as additional evidence
+  // Deep on-chain analysis — bytecode, ERC-20 metadata, liquidity, proxy, owner
   if (contractAddress) {
     try {
-      const code = await rpcClient.getBytecode({
-        address: contractAddress as `0x${string}`,
-      });
-      const rpcLine = code && code.length > 2
-        ? `RPC: contract ${contractAddress} is live on-chain (${code.length} bytes)`
-        : `RPC: contract ${contractAddress} has no bytecode`;
-      browserResult.evidenceSummary += `\n${rpcLine}`;
-      console.log(`[graph] ${rpcLine}`);
+      const report = await analyzeContractOnChain(contractAddress);
+      const evidence = formatOnChainEvidence(report);
+      browserResult.evidenceSummary += `\n\n${evidence}`;
+      console.log(`[graph] On-chain: ${report.signals.length} signals for ${contractAddress}`);
+      for (const sig of report.signals) console.log(`[graph]   ${sig}`);
     } catch (e) {
-      console.warn('[graph] RPC probe failed (non-fatal):', e);
+      console.warn('[graph] On-chain analysis failed (non-fatal):', e);
     }
   }
 
@@ -177,7 +174,7 @@ type GraphHandler = (
 const verificationGraph: Record<FeatureType, GraphHandler> = {
   UI_FEATURE:      runBrowserVerification,
   DEX_SWAP:        runBrowserPlusRpc,
-  TOKEN_CREATION:  runBrowserVerification,
+  TOKEN_CREATION:  runBrowserPlusRpc,
   API_FEATURE:     runApiCheck,
   BOT:             runBotCheck,
   CLI_TOOL:        runCliCheck,

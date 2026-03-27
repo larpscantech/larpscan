@@ -1273,15 +1273,92 @@ export async function executeSteps(
 
     // Suppress wallet_required when the investigation wallet address is already
     // visible in the page text — that means the site shows it as connected.
-    // Without this, the observation accumulates wallet_required even on pages
-    // where the wallet is connected (e.g. a nav "Connect Wallet" button that
-    // stays visible alongside the connected address).
     if (blockerDetected === 'wallet_required' && options?.investigationWalletAddress) {
       const addrLower = options.investigationWalletAddress.toLowerCase();
       const short     = addrLower.slice(0, 6);
       const end       = addrLower.slice(-4);
       if (textAfter.toLowerCase().includes(short) || textAfter.toLowerCase().includes(end)) {
         blockerDetected = undefined;
+      }
+    }
+
+    // ── Auto-reconnect wallet on wallet_required after navigation ──────────
+    // SPA navigation or full page.goto can reset the dApp's internal wallet
+    // state even though window.ethereum is still injected. When we detect
+    // wallet_required mid-execution and we have a wallet, re-trigger the
+    // connection flow instead of recording it as a hard blocker.
+    if (blockerDetected === 'wallet_required' && options?.investigationWalletAddress) {
+      console.log('[executor] wallet_required detected mid-execution — auto-reconnecting');
+
+      // Re-fire eth_requestAccounts + EIP-6963 + force-connect helper
+      await page.evaluate(() => {
+        const w = window as unknown as Record<string, unknown>;
+        const eth = w['ethereum'] as { request?: (a: { method: string; params: unknown[] }) => Promise<unknown> } | undefined;
+        if (eth && typeof eth.request === 'function') {
+          eth.request({ method: 'eth_requestAccounts', params: [] }).catch(() => {});
+        }
+        if (typeof w['__chainverifyTriggerConnect'] === 'function') {
+          (w['__chainverifyTriggerConnect'] as () => void)();
+        }
+        window.dispatchEvent(new CustomEvent('eip6963:requestProvider'));
+      }).catch(() => {});
+      await page.waitForTimeout(2_000);
+
+      // Try clicking any "Connect Wallet" / "Connect Wallet to Continue" button
+      const connectBtnSelectors = [
+        page.locator('button, [role="button"], a').filter({ hasText: /connect wallet to continue/i }).first(),
+        page.locator('button, [role="button"], a').filter({ hasText: /^connect wallet$/i }).first(),
+        page.locator('button, [role="button"], a').filter({ hasText: /^connect$/i }).first(),
+        page.locator('button, [role="button"], a').filter({ hasText: /connect wallet/i }).first(),
+      ];
+      for (const btn of connectBtnSelectors) {
+        const vis = await btn.isVisible({ timeout: 1_500 }).catch(() => false);
+        if (vis) {
+          const txt = (await btn.textContent().catch(() => '') ?? '').trim().slice(0, 60);
+          await btn.click().catch(() => {});
+          console.log(`[executor] Auto-reconnect: clicked "${txt}"`);
+          await page.waitForTimeout(2_000);
+
+          // After clicking, fire connect again (the click may open a modal)
+          await page.evaluate(() => {
+            const w = window as unknown as Record<string, unknown>;
+            if (typeof w['__chainverifyTriggerConnect'] === 'function') {
+              (w['__chainverifyTriggerConnect'] as () => void)();
+            }
+          }).catch(() => {});
+          await page.waitForTimeout(2_000);
+
+          // Try clicking MetaMask in any modal that appeared
+          const mmBtn = page.locator('button, [role="button"], li').filter({ hasText: /metamask/i }).first();
+          const mmVis = await mmBtn.isVisible({ timeout: 1_500 }).catch(() => false);
+          if (mmVis) {
+            await mmBtn.click().catch(() => {});
+            console.log('[executor] Auto-reconnect: clicked MetaMask in modal');
+            await page.evaluate(() => {
+              const w = window as unknown as Record<string, unknown>;
+              if (typeof w['__chainverifyTriggerConnect'] === 'function') {
+                (w['__chainverifyTriggerConnect'] as () => void)();
+              }
+            }).catch(() => {});
+            await page.waitForTimeout(3_000);
+          }
+          break;
+        }
+      }
+
+      // Check if reconnection succeeded — if so, suppress the blocker
+      const reconnectText = await capturePageText(page);
+      const addrLower2 = options.investigationWalletAddress.toLowerCase();
+      const short2 = addrLower2.slice(0, 6);
+      const end2   = addrLower2.slice(-4);
+      const reconnected = reconnectText.toLowerCase().includes(short2) ||
+        reconnectText.toLowerCase().includes(end2) ||
+        !/connect wallet|wallet required|please connect/i.test(reconnectText);
+      if (reconnected) {
+        console.log('[executor] Auto-reconnect succeeded — suppressing wallet_required blocker');
+        blockerDetected = undefined;
+      } else {
+        console.log('[executor] Auto-reconnect did not resolve wallet_required');
       }
     }
 
@@ -1562,11 +1639,23 @@ async function performStep(page: Page, step: AgentStep, baseDomain: string): Pro
         page.goto(`${base}${path}`, { waitUntil: 'load', timeout: 10_000 }),
       );
       await page.waitForTimeout(1_500);
+      // Re-fire wallet connection after full navigation — dApp state often
+      // resets on page.goto even though window.ethereum persists.
+      await page.evaluate(() => {
+        const w = window as unknown as Record<string, unknown>;
+        const eth = w['ethereum'] as { request?: (a: { method: string; params: unknown[] }) => Promise<unknown> } | undefined;
+        if (eth && typeof eth.request === 'function') {
+          eth.request({ method: 'eth_requestAccounts', params: [] }).catch(() => {});
+        }
+        if (typeof w['__chainverifyTriggerConnect'] === 'function') {
+          (w['__chainverifyTriggerConnect'] as () => void)();
+        }
+      }).catch(() => {});
+      await page.waitForTimeout(1_000);
       break;
     }
 
     case 'open_link_text': {
-      // Follows an a[href] by its visible text — avoids triggering click handlers
       const href = await page.evaluate((text: string) => {
         const anchors = Array.from(document.querySelectorAll('a[href]'));
         const match   = anchors.find((el) => (el.textContent ?? '').trim().includes(text));
@@ -1578,6 +1667,18 @@ async function performStep(page: Page, step: AgentStep, baseDomain: string): Pro
         const url  = href.startsWith('http') ? href : `${base}${href.startsWith('/') ? '' : '/'}${href}`;
         await page.goto(url, { waitUntil: 'load', timeout: 12_000 }).catch(() => null);
         await page.waitForTimeout(1_500);
+        // Re-fire wallet connection after navigation
+        await page.evaluate(() => {
+          const w = window as unknown as Record<string, unknown>;
+          const eth = w['ethereum'] as { request?: (a: { method: string; params: unknown[] }) => Promise<unknown> } | undefined;
+          if (eth && typeof eth.request === 'function') {
+            eth.request({ method: 'eth_requestAccounts', params: [] }).catch(() => {});
+          }
+          if (typeof w['__chainverifyTriggerConnect'] === 'function') {
+            (w['__chainverifyTriggerConnect'] as () => void)();
+          }
+        }).catch(() => {});
+        await page.waitForTimeout(1_000);
       } else {
         throw new Error(`Link with text "${step.text}" not found`);
       }
