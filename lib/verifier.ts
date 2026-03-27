@@ -1,7 +1,7 @@
 import path    from 'path';
 import fs      from 'fs/promises';
 import { randomUUID } from 'crypto';
-import fixWebmDuration from 'fix-webm-duration';
+import { fixWebmDuration } from 'webm-duration-fix-buffer';
 import { connectBrowser, isServerlessRuntime, isBrowserlessMode } from './browser';
 import { supabase } from './supabase';
 import {
@@ -637,16 +637,20 @@ async function recordInteraction(
           console.log(`[verifier:record] Raw recording: ${(rawBuffer.length / 1024).toFixed(0)}KB`);
 
           if (rawBuffer.length > 0) {
-            // Patch the WebM with correct duration so browsers can seek
-            // without downloading the entire file first.
+            // Inject Duration + Cues (seek index) into the WebM so browsers
+            // can display the total length and seek without buffering the
+            // entire file first.
             let uploadBuffer = rawBuffer;
             try {
               const rawBlob = new Blob([rawBuffer], { type: 'video/webm' });
-              const fixedBlob = await fixWebmDuration(rawBlob, durationMs, { logger: false });
+              const fixedBlob = await fixWebmDuration(rawBlob);
               uploadBuffer = Buffer.from(await fixedBlob.arrayBuffer());
-              console.log(`[verifier:record] Duration patched: ${(durationMs / 1000).toFixed(1)}s`);
+              console.log(
+                `[verifier:record] WebM patched: +${uploadBuffer.length - rawBuffer.length}B ` +
+                `(duration + cues injected, ${(durationMs / 1000).toFixed(1)}s)`,
+              );
             } catch (fixErr) {
-              console.warn('[verifier:record] Duration fix failed (uploading raw):', fixErr);
+              console.warn('[verifier:record] WebM patch failed (uploading raw):', fixErr);
             }
 
             await supabase.storage.createBucket('recordings', { public: true }).catch(() => {});
