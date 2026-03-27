@@ -212,6 +212,8 @@ export function AuditClaimCard({
                               controls
                               muted
                               playsInline
+                              preload="metadata"
+                              poster={claim.screenshotDataUrl}
                               className="w-full max-h-64 bg-black"
                             />
                           </div>
