@@ -132,7 +132,7 @@ export const POST = withErrorHandler(async (req: Request) => {
 async function maybeCompleteRun(runId: string) {
   const { data: remaining } = await supabase
     .from('claims')
-    .select('id')
+    .select('id, status, created_at')
     .eq('verification_run_id', runId)
     .in('status', ['pending', 'checking']);
 
@@ -143,6 +143,36 @@ async function maybeCompleteRun(runId: string) {
       .eq('id', runId);
     await log(runId, 'Verification complete');
     console.log('[verify/claim] All claims done — run marked complete');
+    return;
+  }
+
+  // Safety: if claims have been stuck in 'pending' for > 5 minutes, they
+  // likely had their Lambda dropped by Vercel. Mark them as failed so the
+  // run can eventually complete instead of hanging forever.
+  const now = Date.now();
+  for (const claim of remaining) {
+    const age = now - new Date(claim.created_at).getTime();
+    if (claim.status === 'pending' && age > 5 * 60 * 1000) {
+      console.warn(`[verify/claim] Claim ${claim.id} stuck in pending for ${Math.round(age / 1000)}s — marking as failed`);
+      await supabase.from('claims').update({ status: 'failed' }).eq('id', claim.id);
+      await log(runId, `Claim timed out (Lambda may have been dropped)`);
+    }
+  }
+
+  // Re-check after marking stuck claims
+  const { data: stillRemaining } = await supabase
+    .from('claims')
+    .select('id')
+    .eq('verification_run_id', runId)
+    .in('status', ['pending', 'checking']);
+
+  if (!stillRemaining?.length) {
+    await supabase
+      .from('verification_runs')
+      .update({ status: 'complete' })
+      .eq('id', runId);
+    await log(runId, 'Verification complete (some claims timed out)');
+    console.log('[verify/claim] All claims resolved (with timeouts) — run marked complete');
   }
 }
 

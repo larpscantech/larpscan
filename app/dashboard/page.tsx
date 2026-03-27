@@ -774,15 +774,21 @@ export default function DashboardPage() {
             logs:   { message: string }[];
           }>('/api/verify/status', `/api/verify/status?runId=${runId}`);
 
-          const allDone =
-            statusRes.run.status === 'complete' ||
+          // Only trust individual claim statuses — run.status can be set to
+          // 'complete' by maybeCompleteRun before all Lambdas have reported back
+          // (race condition with fire-and-forget dispatch).
+          const allClaimsResolved = statusRes.claims.length > 0 &&
             statusRes.claims.every((c) => c.status !== 'pending' && c.status !== 'checking');
 
-          if (allDone) {
+          if (allClaimsResolved) {
             finalStatus = statusRes;
-            console.log(`${TAG} All claims resolved`, STYLE);
+            console.log(`${TAG} All ${statusRes.claims.length} claims resolved`, STYLE);
             break;
           }
+
+          // Log progress for debugging
+          const resolved = statusRes.claims.filter((c) => c.status !== 'pending' && c.status !== 'checking').length;
+          console.log(`${TAG} Poll: ${resolved}/${statusRes.claims.length} claims done`, STYLE);
         } catch (e) {
           console.warn(`${TAG} Status poll failed (retrying):`, STYLE, e);
         }
@@ -791,7 +797,22 @@ export default function DashboardPage() {
       clearInterval(rotateTimer);
       setCheckingClaimIndex(-1);
 
-      // Reveal all results at once
+      // If poll timed out without all claims resolving, fetch the latest state
+      // and show whatever we have (partial results > no results).
+      if (!finalStatus && alive()) {
+        console.warn(`${TAG} Poll timed out — fetching latest partial results`, STYLE);
+        addLog('Some claims are still processing — showing available results');
+        try {
+          const partialRes = await apiGet<{
+            run:    DbVerificationRun;
+            claims: DbClaimWithEvidence[];
+            logs:   { message: string }[];
+          }>('/api/verify/status', `/api/verify/status?runId=${runId}`);
+          finalStatus = partialRes;
+        } catch { /* use whatever we have */ }
+      }
+
+      // Reveal results — all at once with staggered animation
       if (finalStatus) {
         setRealClaims(finalStatus.claims);
         for (let i = 0; i < finalStatus.claims.length; i++) {
@@ -799,7 +820,10 @@ export default function DashboardPage() {
           await sleep(450);
           setResolvedResultsCount(i + 1);
           const c = finalStatus.claims[i];
-          addLog(`Claim ${String(i + 1).padStart(2, '0')} → ${c.status.toUpperCase()}`);
+          const label = (c.status === 'pending' || c.status === 'checking')
+            ? 'PROCESSING'
+            : c.status.toUpperCase();
+          addLog(`Claim ${String(i + 1).padStart(2, '0')} → ${label}`);
           console.log(`${TAG} Revealed claim ${i + 1}: ${c.status}`, STYLE);
         }
       }
