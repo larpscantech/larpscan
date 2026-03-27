@@ -59,21 +59,39 @@ export async function ensureFFmpegForPlaywright(): Promise<void> {
       return;
     }
 
-    // Tell Playwright to look in /tmp for all browser binaries.
-    // Only set this after confirming ffmpeg source exists so we don't redirect
-    // Playwright's browser path when recording is unavailable.
-    const tmpBrowsersPath = '/tmp/playwright-browsers';
-    process.env.PLAYWRIGHT_BROWSERS_PATH = tmpBrowsersPath;
+    // Playwright resolves its browser cache path at import time, so setting
+    // PLAYWRIGHT_BROWSERS_PATH after import has no effect. Instead, copy
+    // ffmpeg into BOTH the env-var path AND Playwright's default cache path
+    // so it's found regardless of which path Playwright actually uses.
+    const candidates = [
+      process.env.PLAYWRIGHT_BROWSERS_PATH,
+      path.join(process.env.HOME ?? '/tmp', '.cache', 'ms-playwright'),
+      '/tmp/playwright-browsers',
+    ].filter(Boolean) as string[];
 
-    const ffmpegDir    = path.join(tmpBrowsersPath, `ffmpeg-${revision}`);
-    const ffmpegTarget = path.join(ffmpegDir, 'ffmpeg-linux');
+    // Also set the env var for any future Playwright process
+    if (!process.env.PLAYWRIGHT_BROWSERS_PATH) {
+      process.env.PLAYWRIGHT_BROWSERS_PATH = '/tmp/playwright-browsers';
+      candidates.push('/tmp/playwright-browsers');
+    }
 
-    if (!fsSync.existsSync(ffmpegTarget)) {
-      await fs.mkdir(ffmpegDir, { recursive: true });
-      await fs.copyFile(ffmpegSource, ffmpegTarget);
-      await fs.chmod(ffmpegTarget, 0o755);
+    // De-duplicate
+    const dirs = [...new Set(candidates)];
 
-      console.log(`[browser] ffmpeg installed → ${ffmpegTarget}`);
+    for (const base of dirs) {
+      const ffmpegDir    = path.join(base, `ffmpeg-${revision}`);
+      const ffmpegTarget = path.join(ffmpegDir, 'ffmpeg-linux');
+
+      if (!fsSync.existsSync(ffmpegTarget)) {
+        try {
+          await fs.mkdir(ffmpegDir, { recursive: true });
+          await fs.copyFile(ffmpegSource, ffmpegTarget);
+          await fs.chmod(ffmpegTarget, 0o755);
+          console.log(`[browser] ffmpeg installed → ${ffmpegTarget}`);
+        } catch (cpErr) {
+          console.warn(`[browser] ffmpeg copy to ${ffmpegTarget} failed:`, cpErr);
+        }
+      }
     }
 
     _ffmpegReady = true;
