@@ -1,7 +1,7 @@
 import path    from 'path';
 import fs      from 'fs/promises';
 import { randomUUID } from 'crypto';
-import { launchChromium, isServerlessRuntime, ensureFFmpegForPlaywright, isFFmpegReady } from './browser';
+import { connectBrowser, isServerlessRuntime, isBrowserlessMode } from './browser';
 import { supabase } from './supabase';
 import {
   analyzePageState,
@@ -136,15 +136,17 @@ async function analyzeWebsite(baseUrl: string): Promise<AnalysisResult> {
   let screenshotDataUrl: string | undefined;
   let surfaceStatus:    number | null = null;
 
-  const browser = await launchChromium({ headless: true });
+  const browser = await connectBrowser();
 
   try {
-    const context = await browser.newContext({
-      userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-        '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      viewport: { width: 1280, height: 720 },
-    });
+    const context = isBrowserlessMode()
+      ? browser.contexts()[0] ?? await browser.newContext()
+      : await browser.newContext({
+          userAgent:
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+            '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          viewport: { width: 1280, height: 720 },
+        });
 
     const page = await context.newPage();
     page.setDefaultTimeout(15_000);
@@ -258,11 +260,12 @@ async function recordInteraction(
     disabledControls: [], blockers: [], hasModal: false, apiSignals: [],
   };
 
-  const browser = await launchChromium({ headless: true });
+  const useBrowserless = isBrowserlessMode();
+  const browser = await connectBrowser({ record: useBrowserless });
 
   let context: Awaited<ReturnType<typeof browser.newContext>> | null = null;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Playwright Video type not directly importable
-  let video: { path(): Promise<string>; saveAs(path: string): Promise<void> } | null = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- CDP session for Browserless recording
+  let cdpSession: any = null;
   let allObservations: AgentObservation[] = [];
   let finalPageState: PageState = emptyPageState;
   const runApiCalls: string[] = [];
@@ -296,33 +299,22 @@ async function recordInteraction(
   }
 
   try {
-    // Ensure ffmpeg is available before requesting recordVideo.
-    // On serverless runtimes we copy the ffmpeg-static binary into /tmp so
-    // Playwright can find it.  On local dev the binary is already installed.
-    // Set ENABLE_PLAYWRIGHT_VIDEO=true to opt in to recording on Vercel.
-    // It is off by default because ffmpeg is often absent in serverless bundles.
-    const videoEnvEnabled = process.env.ENABLE_PLAYWRIGHT_VIDEO === 'true';
-    await ensureFFmpegForPlaywright();
-    const ffmpegOk = isFFmpegReady();
-    const serverless = isServerlessRuntime();
-    const enableRecording = videoEnvEnabled && (ffmpegOk || !serverless);
+    const enableRecording = useBrowserless;
 
-    if (!enableRecording) {
-      const reasons: string[] = [];
-      if (!videoEnvEnabled)        reasons.push('ENABLE_PLAYWRIGHT_VIDEO not set to "true"');
-      if (serverless && !ffmpegOk) reasons.push('serverless runtime but ffmpeg not available');
-      console.log(`[verifier:record] Video recording DISABLED — ${reasons.join('; ') || 'unknown'}`);
+    if (enableRecording) {
+      console.log('[verifier:record] Video recording ENABLED (Browserless CDP)');
     } else {
-      console.log('[verifier:record] Video recording ENABLED');
+      console.log('[verifier:record] Video recording DISABLED (local mode — set BROWSERLESS_TOKEN to enable)');
     }
 
-    context = await browser.newContext({
-      userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-        '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      viewport:    { width: 1280, height: 720 },
-      ...(enableRecording ? { recordVideo: { dir: recordingsDir, size: { width: 1280, height: 720 } } } : {}),
-    });
+    context = useBrowserless
+      ? browser.contexts()[0] ?? await browser.newContext()
+      : await browser.newContext({
+          userAgent:
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+            '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          viewport:    { width: 1280, height: 720 },
+        });
 
     // Install signing bridge FIRST so it's available when addInitScript runs.
     // Pass sessionId so this run's tx hashes are isolated from concurrent runs.
@@ -333,6 +325,18 @@ async function recordInteraction(
 
     const page = await context.newPage();
     page.setDefaultTimeout(15_000);
+
+    // Start Browserless CDP screen recording
+    if (enableRecording) {
+      try {
+        cdpSession = await context.newCDPSession(page);
+        await cdpSession.send('Browserless.startRecording');
+        console.log('[verifier:record] CDP recording started');
+      } catch (recErr) {
+        console.warn('[verifier:record] CDP recording start failed (non-fatal):', recErr);
+        cdpSession = null;
+      }
+    }
 
     // ── Run-level network listener ──────────────────────────────────────────
     page.on('response', (response) => {
@@ -614,74 +618,43 @@ async function recordInteraction(
       }
     }
 
-    // ── Video finalization: strongest Playwright-safe sequence ─────────────
-    // 1. Capture video ref BEFORE page.close() (can become null after close)
-    // 2. page.close() flushes video frames to disk
-    // 3. context.close() fully releases the video file handle
-    // 4. THEN read path and persist/upload
-    // Each stage is logged so if Vercel kills the Lambda, logs show where it stopped.
-    video = page.video();
-    console.log(`[verifier:record] Stage 1/4: video object present: ${!!video}`);
-
     await page.close();
-    console.log('[verifier:record] Stage 2/4: page closed');
+    console.log('[verifier:record] Page closed');
   } finally {
-    // context.close() MUST happen before video persistence — Playwright holds
-    // the file handle open until the context is fully torn down.
-    if (context) {
-      await context.close().catch(() => {});
-      console.log('[verifier:record] Stage 3/4: context closed');
-    }
-
-    // ── Stage 4: persist video ──────────────────────────────────────────
-    if (video) {
+    // ── Stop recording and upload video ────────────────────────────────
+    if (cdpSession) {
       try {
-        const rawPath = await video.path();
-        console.log(`[verifier:record] Stage 4/4: raw video path: ${rawPath ?? '(null)'}`);
-        if (rawPath) {
-          const finalPath = path.join(recordingsDir, `${claimId}.webm`);
-          await fs.rename(rawPath, finalPath).catch(async () => {
-            await fs.copyFile(rawPath, finalPath);
-            await fs.unlink(rawPath).catch(() => {});
+        console.log('[verifier:record] Stopping CDP recording...');
+        const response = await cdpSession.send('Browserless.stopRecording');
+        const videoBuffer = Buffer.from(response.value, 'binary');
+        console.log(`[verifier:record] Recording captured: ${(videoBuffer.length / 1024).toFixed(0)}KB`);
+
+        await supabase.storage.createBucket('recordings', { public: true }).catch(() => {});
+
+        const { error: uploadErr } = await supabase.storage
+          .from('recordings')
+          .upload(`${claimId}.webm`, videoBuffer, {
+            contentType: 'video/webm',
+            upsert: true,
           });
-          console.log(`[verifier:record] Video finalized → ${finalPath}`);
 
-          if (!recordingsDir.startsWith('/tmp')) {
-            videoUrl = `/recordings/${claimId}.webm`;
-            console.log(`[verifier:record] Video served locally → ${videoUrl}`);
-          } else {
-            try {
-              const fileBuffer = await fs.readFile(finalPath);
-
-              await supabase.storage.createBucket('recordings', { public: true }).catch(() => {});
-
-              const { error: uploadErr } = await supabase.storage
-                .from('recordings')
-                .upload(`${claimId}.webm`, fileBuffer, {
-                  contentType: 'video/webm',
-                  upsert: true,
-                });
-
-              if (uploadErr) {
-                console.warn(`[verifier:record] Supabase upload error: ${uploadErr.message}`);
-              } else {
-                const { data } = supabase.storage
-                  .from('recordings')
-                  .getPublicUrl(`${claimId}.webm`);
-                videoUrl = data.publicUrl;
-                console.log(`[verifier:record] Video uploaded → ${videoUrl}`);
-              }
-            } catch (uploadEx) {
-              console.warn('[verifier:record] Supabase upload failed (non-fatal):', uploadEx);
-            }
-            await fs.unlink(finalPath).catch(() => {});
-          }
+        if (uploadErr) {
+          console.warn(`[verifier:record] Supabase upload error: ${uploadErr.message}`);
+        } else {
+          const { data } = supabase.storage
+            .from('recordings')
+            .getPublicUrl(`${claimId}.webm`);
+          videoUrl = data.publicUrl;
+          console.log(`[verifier:record] Video uploaded → ${videoUrl}`);
         }
       } catch (e) {
         console.warn('[verifier:record] Video save failed (non-fatal):', e);
       }
     }
 
+    if (context && !useBrowserless) {
+      await context.close().catch(() => {});
+    }
     await browser.close().catch(() => {});
     console.log('[verifier:record] Browser closed');
   }
