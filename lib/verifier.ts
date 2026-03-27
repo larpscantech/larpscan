@@ -221,7 +221,9 @@ async function analyzeWebsite(baseUrl: string): Promise<AnalysisResult> {
       console.log(`[verifier:analyze] Screenshot: ${Math.round(buf.length / 1024)}KB`);
     } catch { /* non-fatal */ }
 
-    await context.close().catch(() => {});
+    if (!isBrowserlessMode()) {
+      await context.close().catch(() => {});
+    }
   } finally {
     await browser.close().catch(() => {});
   }
@@ -307,6 +309,9 @@ async function recordInteraction(
       console.log('[verifier:record] Video recording DISABLED (local mode — set BROWSERLESS_TOKEN to enable)');
     }
 
+    // connectOverCDP gives us one default context that inherits the proxy and
+    // stealth settings from the connection URL.  Creating a new context would
+    // lose those settings, so we always reuse the default context in Browserless.
     context = useBrowserless
       ? browser.contexts()[0] ?? await browser.newContext()
       : await browser.newContext({
@@ -618,40 +623,54 @@ async function recordInteraction(
       }
     }
 
-    await page.close();
-    console.log('[verifier:record] Page closed');
   } finally {
-    // ── Stop recording and upload video ────────────────────────────────
+    // Stop CDP recording BEFORE closing page/browser — the CDP session
+    // is tied to the page and dies when the page closes.
     if (cdpSession) {
       try {
         console.log('[verifier:record] Stopping CDP recording...');
         const response = await cdpSession.send('Browserless.stopRecording');
-        const videoBuffer = Buffer.from(response.value, 'binary');
-        console.log(`[verifier:record] Recording captured: ${(videoBuffer.length / 1024).toFixed(0)}KB`);
 
-        await supabase.storage.createBucket('recordings', { public: true }).catch(() => {});
+        if (response.error) {
+          console.warn(`[verifier:record] Recording error from Browserless: ${response.error}`);
+        } else if (response.value) {
+          // response.value is a plain object (not a string) — Buffer.from()
+          // handles it correctly without an encoding argument.
+          const videoBuffer = Buffer.from(response.value);
+          console.log(`[verifier:record] Recording captured: ${(videoBuffer.length / 1024).toFixed(0)}KB`);
 
-        const { error: uploadErr } = await supabase.storage
-          .from('recordings')
-          .upload(`${claimId}.webm`, videoBuffer, {
-            contentType: 'video/webm',
-            upsert: true,
-          });
+          if (videoBuffer.length > 0) {
+            await supabase.storage.createBucket('recordings', { public: true }).catch(() => {});
 
-        if (uploadErr) {
-          console.warn(`[verifier:record] Supabase upload error: ${uploadErr.message}`);
+            const { error: uploadErr } = await supabase.storage
+              .from('recordings')
+              .upload(`${claimId}.webm`, videoBuffer, {
+                contentType: 'video/webm',
+                upsert: true,
+              });
+
+            if (uploadErr) {
+              console.warn(`[verifier:record] Supabase upload error: ${uploadErr.message}`);
+            } else {
+              const { data } = supabase.storage
+                .from('recordings')
+                .getPublicUrl(`${claimId}.webm`);
+              videoUrl = data.publicUrl;
+              console.log(`[verifier:record] Video uploaded → ${videoUrl}`);
+            }
+          } else {
+            console.warn('[verifier:record] Recording buffer is empty (0 bytes)');
+          }
         } else {
-          const { data } = supabase.storage
-            .from('recordings')
-            .getPublicUrl(`${claimId}.webm`);
-          videoUrl = data.publicUrl;
-          console.log(`[verifier:record] Video uploaded → ${videoUrl}`);
+          console.warn('[verifier:record] No recording data in response');
         }
       } catch (e) {
         console.warn('[verifier:record] Video save failed (non-fatal):', e);
       }
     }
 
+    // connectOverCDP default context — do NOT close it explicitly or the
+    // entire browser connection tears down prematurely.
     if (context && !useBrowserless) {
       await context.close().catch(() => {});
     }

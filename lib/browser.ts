@@ -21,20 +21,22 @@ export function isServerlessRuntime(): boolean {
 // ─────────────────────────────────────────────────────────────────────────────
 // Browserless connection
 //
-// When BROWSERLESS_TOKEN is set, connect to Browserless.io's hosted browser
-// instead of launching a local Chromium.  This eliminates the need for
-// @sparticuz/chromium, ffmpeg-static, and all the Lambda binary juggling.
+// Uses `connectOverCDP` with the `/stealth` path.  CDP mode is required for
+// the `Browserless.startRecording` / `Browserless.stopRecording` CDP commands
+// that produce WebM screen recordings (requires Prototyping plan or higher).
 //
-// Falls back to local Playwright launch when the token is absent (local dev).
+// Built-in residential proxy is configured via query params so Privy and
+// other datacenter-IP-blocking services work out of the box.
+//
+// Falls back to local Playwright launch when BROWSERLESS_TOKEN is absent.
 // ─────────────────────────────────────────────────────────────────────────────
 
-function getBrowserlessEndpoint(opts?: { record?: boolean; stealth?: boolean }): string | undefined {
+function getBrowserlessEndpoint(opts?: { record?: boolean }): string | undefined {
   const token = process.env.BROWSERLESS_TOKEN;
   if (!token) return undefined;
 
   const params = new URLSearchParams({ token });
 
-  // Residential proxy — bypasses Privy datacenter IP blocking
   params.set('proxy', 'residential');
   params.set('proxyCountry', 'us');
   params.set('proxySticky', 'true');
@@ -44,16 +46,15 @@ function getBrowserlessEndpoint(opts?: { record?: boolean; stealth?: boolean }):
     params.set('headless', 'false');
   }
 
-  const basePath = opts?.stealth ? '/chromium/stealth' : '/chromium';
   const region = process.env.BROWSERLESS_REGION ?? 'production-sfo';
-  return `wss://${region}.browserless.io${basePath}?${params.toString()}`;
+  return `wss://${region}.browserless.io/stealth?${params.toString()}`;
 }
 
 export async function connectBrowser(opts?: { record?: boolean }): Promise<Browser> {
-  const wsEndpoint = getBrowserlessEndpoint({ record: opts?.record, stealth: opts?.record });
+  const wsEndpoint = getBrowserlessEndpoint(opts);
 
   if (wsEndpoint) {
-    console.log(`[browser] Connecting to Browserless (record=${opts?.record ?? false})`);
+    console.log(`[browser] Connecting to Browserless (CDP, record=${opts?.record ?? false})`);
     const browser = await playwrightChromium.connectOverCDP(wsEndpoint);
     return browser;
   }
@@ -104,7 +105,5 @@ export function isBrowserlessMode(): boolean {
   return Boolean(process.env.BROWSERLESS_TOKEN);
 }
 
-// ffmpeg helpers are no longer needed with Browserless but kept as no-ops
-// so existing callers don't break during migration.
 export function isFFmpegReady(): boolean { return isBrowserlessMode(); }
 export async function ensureFFmpegForPlaywright(): Promise<void> { /* no-op */ }
