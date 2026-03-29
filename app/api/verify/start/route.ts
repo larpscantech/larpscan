@@ -6,7 +6,7 @@ import type { DbClaimWithEvidence, DbVerificationRun } from '@/lib/db-types';
 
 const INFRA_FAILURE_PATTERN = /missing executable|critical failure in launching the browser|preventing any interaction with the site|site-level issue/i;
 
-const STALE_RUN_MS = 10 * 60 * 1000; // 10 minutes
+const STALE_RUN_MS = 8 * 60 * 1000; // 8 minutes
 
 function hasInfrastructureFailure(claims: DbClaimWithEvidence[]): boolean {
   return claims.some((claim) => {

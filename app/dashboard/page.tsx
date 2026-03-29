@@ -533,6 +533,13 @@ export default function DashboardPage() {
           setDisplayedLogs(statusRes.logs.map((l) => l.message));
         }
 
+        // If the run is already terminal (complete/failed), we're done
+        if (statusRes.run.status === 'complete' || statusRes.run.status === 'failed') {
+          finalStatus = statusRes;
+          console.log(`${TAG} Run is ${statusRes.run.status} — done polling`, STYLE);
+          break;
+        }
+
         const allClaimsResolved = statusRes.claims.length > 0 &&
           statusRes.claims.every((c) => c.status !== 'pending' && c.status !== 'checking');
 

@@ -10,7 +10,7 @@ import type { DbProject, DbVerificationRun, DbClaimWithEvidence } from '@/lib/db
 export const runtime = 'nodejs';
 export const maxDuration = 120;
 
-const STALE_RUN_MS = 10 * 60 * 1000;
+const STALE_RUN_MS = 8 * 60 * 1000;
 
 const INFRA_FAILURE_PATTERN = /missing executable|critical failure in launching the browser|preventing any interaction with the site|site-level issue/i;
 
@@ -47,15 +47,15 @@ export const POST = withErrorHandler(async (req: Request) => {
 
   if (!contractAddress) return err('contractAddress is required');
 
-  // ── 1. Discover project (inline — no self-fetch) ─────────────────────────
-  // On Vercel, a Lambda calling its own origin can deadlock or timeout.
-  // Import and call the discover logic directly instead.
+  // ── 1. Discover project ────────────────────────────────────────────────────
+  // Never self-fetch on Vercel (Lambda calling itself deadlocks).
+  // Use the discover route's logic directly via internal imports.
   const { validateContract, getTokenMetadata } = await import('@/lib/rpc');
 
   await validateContract(contractAddress);
   const { name: tokenName, symbol: tokenSymbol } = await getTokenMetadata(contractAddress);
 
-  // Check if project already exists in DB
+  // Check if project already exists in DB with enriched data
   const { data: existingProject } = await supabase
     .from('projects')
     .select('*')
@@ -64,29 +64,48 @@ export const POST = withErrorHandler(async (req: Request) => {
 
   let project: DbProject;
 
-  if (existingProject && !forceReverify) {
+  if (existingProject && existingProject.website && !forceReverify) {
+    // Already enriched — use cached data
     project = existingProject;
-    console.log(`[orchestrate] Using cached project: ${project.name}`);
+    console.log(`[orchestrate] Using cached project: ${project.name} (${project.website})`);
   } else {
-    // Full discovery with enrichment — call the discover route via internal fetch
-    // only on localhost where self-fetch works, or inline the enrichment
+    // Need enrichment — call discover route. This works because discover is a
+    // separate Lambda on Vercel (different function, not self-calling).
     const origin = new URL((req as NextRequest).url).origin;
-    const isLocalhost = origin.includes('localhost') || origin.includes('127.0.0.1');
-
-    if (isLocalhost) {
+    try {
       const discoverRes = await fetch(`${origin}/api/project/discover`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ contractAddress }),
       });
-      if (!discoverRes.ok) {
-        const errBody = await discoverRes.json().catch(() => ({ error: 'Discovery failed' }));
-        return err(errBody.error ?? 'Contract discovery failed', discoverRes.status);
+      if (discoverRes.ok) {
+        const discoverData = await discoverRes.json() as { project: DbProject };
+        project = discoverData.project;
+      } else {
+        // Enrichment failed — fall back to basic upsert
+        const { data: upserted, error: upsertErr } = await supabase
+          .from('projects')
+          .upsert(
+            {
+              contract_address: contractAddress.toLowerCase(),
+              name: tokenName,
+              symbol: tokenSymbol,
+              website: existingProject?.website ?? null,
+              twitter: existingProject?.twitter ?? null,
+              logo_url: existingProject?.logo_url ?? null,
+              description: existingProject?.description ?? null,
+              chain: 'bsc',
+            },
+            { onConflict: 'contract_address' },
+          )
+          .select()
+          .single<DbProject>();
+
+        if (upsertErr || !upserted) return err('Failed to save project', 500);
+        project = upserted;
       }
-      const discoverData = await discoverRes.json() as { project: DbProject };
-      project = discoverData.project;
-    } else {
-      // On Vercel: upsert with basic metadata, skip full enrichment to avoid self-fetch
+    } catch (e) {
+      console.warn('[orchestrate] Discover fetch failed, using basic upsert:', e);
       const { data: upserted, error: upsertErr } = await supabase
         .from('projects')
         .upsert(
@@ -105,28 +124,8 @@ export const POST = withErrorHandler(async (req: Request) => {
         .select()
         .single<DbProject>();
 
-      if (upsertErr || !upserted) {
-        return err('Failed to save project', 500);
-      }
+      if (upsertErr || !upserted) return err('Failed to save project', 500);
       project = upserted;
-
-      // If this is a brand new project with no website, try enrichment in background
-      if (!project.website) {
-        console.log('[orchestrate] New project with no cached website — running inline enrichment');
-        try {
-          const discoverRes = await fetch(`${origin}/api/project/discover`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ contractAddress }),
-          });
-          if (discoverRes.ok) {
-            const discoverData = await discoverRes.json() as { project: DbProject };
-            project = discoverData.project;
-          }
-        } catch (e) {
-          console.warn('[orchestrate] Enrichment fetch failed (non-fatal):', e);
-        }
-      }
     }
   }
 
