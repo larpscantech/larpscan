@@ -376,7 +376,7 @@ export default function HomeLandingPage() {
   if (!mounted || !introChecked) return null;
 
   return (
-    <div className="min-h-screen bg-[#050507] text-white overflow-x-hidden">
+    <div className="min-h-screen text-white overflow-x-hidden">
       <AnimatePresence>
         {!introComplete && <IntroAnimation onComplete={handleIntroComplete} key="intro" />}
       </AnimatePresence>
