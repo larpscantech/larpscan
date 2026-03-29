@@ -21,10 +21,12 @@ import { generateFakeTokenPng } from '../utils/fake-png';
 
 const BLOCKED_PATTERNS = [
   // English — dangerous wallet/transaction actions
-  /connect wallet/i, /\bsign\b/i, /\bapprove\b/i, /confirm transaction/i,
+  // NOTE: "connect wallet" is intentionally ALLOWED — the agent needs to click
+  // it to trigger our injected wallet mock for verification.
+  /\bsign\b/i, /\bapprove\b/i, /confirm transaction/i,
   /\bbuy\b/i, /\bsell\b/i, /execute swap/i, /seed phrase/i, /private key/i, /\bpay\b/i,
   // Traditional Chinese — equivalent dangerous actions
-  /連接錢包/, /連結錢包/, /簽名/, /簽署/, /批准/, /授權交易/,
+  /簽名/, /簽署/, /批准/, /授權交易/,
   /確認交易/, /執行兌換/, /購買代幣/, /出售代幣/, /助記詞/, /私鑰/, /支付/,
 ];
 
@@ -621,7 +623,7 @@ ANTI-PATTERNS (never do these):
 - Click "Create Token" / "Launch" / "Deploy" when any required field is still empty
 - Repeat an action already listed in the narrative
 - Scroll when the target input is already visible on screen
-- Click a wallet / sign / approve button
+- Click "Sign", "Approve", MetaMask, or WalletConnect buttons (but "Connect Wallet" IS allowed)
 
 SPECIFIC ERROR RECOVERY:
 - If you see "transaction value exceeds safety limit" or "exceeds safety limit" →

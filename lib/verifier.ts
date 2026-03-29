@@ -222,12 +222,12 @@ async function analyzeWebsite(baseUrl: string): Promise<AnalysisResult> {
     console.log(`[verifier:analyze] Navigating to ${baseUrl}`);
 
     let rootResp = await page
-      .goto(baseUrl, { waitUntil: 'networkidle', timeout: 20_000 })
+      .goto(baseUrl, { waitUntil: 'load', timeout: 15_000 })
       .catch(() => null);
 
     if (!rootResp) {
       rootResp = await page
-        .goto(baseUrl, { waitUntil: 'load', timeout: 12_000 })
+        .goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 10_000 })
         .catch(() => null);
     }
 
@@ -236,7 +236,7 @@ async function analyzeWebsite(baseUrl: string): Promise<AnalysisResult> {
       return { probes, siteLoaded, blocked, pageText, title, surfaceStatus: null };
     }
 
-    await page.waitForTimeout(2_000);
+    await page.waitForTimeout(1_000);
 
     const status = rootResp.status();
     surfaceStatus = status;

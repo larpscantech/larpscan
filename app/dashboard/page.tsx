@@ -348,9 +348,6 @@ function ClaimsSection({
     return (
       <div className="space-y-1">
         {claims.map((claim, i) => {
-          if (i < resolvedResultsCount) {
-            return <AuditClaimCard key={claim.id} claim={claim} index={i} defaultExpanded={true} />;
-          }
           if (i === checkingClaimIndex) {
             return (
               <AuditClaimCard
