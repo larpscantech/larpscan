@@ -2,7 +2,6 @@ import { NextRequest } from 'next/server';
 import { supabase } from '@/lib/supabase';
 import { log, logBatch } from '@/lib/logger';
 import { ok, err, withErrorHandler } from '@/lib/api-helpers';
-import { validateContract, getTokenMetadata } from '@/lib/rpc';
 import { fetchWebsiteText } from '@/lib/scraper';
 import { extractClaimsFromText } from '@/lib/llm';
 import { fetchXProfileText } from '@/lib/x-scraper';
@@ -28,6 +27,19 @@ function hasInfrastructureFailure(claims: DbClaimWithEvidence[]): boolean {
   });
 }
 
+/**
+ * Server-side orchestrator: discover → dedup → scrape → extract → create claims.
+ *
+ * IMPORTANT: This route does NOT dispatch claim workers (fire-and-forget fetch).
+ * On Vercel, fire-and-forget fetches are killed when the Lambda returns its response.
+ * Instead, the dashboard calls /api/verify/run after this route returns to dispatch
+ * claims in a separate Lambda that properly fires off claim workers.
+ *
+ * Returns:
+ *   status: 'complete'  → cached completed run, load instantly
+ *   status: 'joined'    → existing in-progress run, poll for results
+ *   status: 'started'   → new run created with claims, dashboard must call /api/verify/run
+ */
 export const POST = withErrorHandler(async (req: Request) => {
   const body = await (req as NextRequest).json().catch(() => ({}));
   const contractAddress = (body?.contractAddress ?? '').trim();
@@ -35,23 +47,88 @@ export const POST = withErrorHandler(async (req: Request) => {
 
   if (!contractAddress) return err('contractAddress is required');
 
-  const origin = new URL((req as NextRequest).url).origin;
+  // ── 1. Discover project (inline — no self-fetch) ─────────────────────────
+  // On Vercel, a Lambda calling its own origin can deadlock or timeout.
+  // Import and call the discover logic directly instead.
+  const { validateContract, getTokenMetadata } = await import('@/lib/rpc');
 
-  // ── 1. Discover project ───────────────────────────────────────────────────
-  // Call the existing discover route server-side to reuse all enrichment logic
-  const discoverRes = await fetch(`${origin}/api/project/discover`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ contractAddress }),
-  });
+  await validateContract(contractAddress);
+  const { name: tokenName, symbol: tokenSymbol } = await getTokenMetadata(contractAddress);
 
-  if (!discoverRes.ok) {
-    const body = await discoverRes.json().catch(() => ({ error: 'Discovery failed' }));
-    return err(body.error ?? 'Contract discovery failed', discoverRes.status);
+  // Check if project already exists in DB
+  const { data: existingProject } = await supabase
+    .from('projects')
+    .select('*')
+    .eq('contract_address', contractAddress.toLowerCase())
+    .maybeSingle<DbProject>();
+
+  let project: DbProject;
+
+  if (existingProject && !forceReverify) {
+    project = existingProject;
+    console.log(`[orchestrate] Using cached project: ${project.name}`);
+  } else {
+    // Full discovery with enrichment — call the discover route via internal fetch
+    // only on localhost where self-fetch works, or inline the enrichment
+    const origin = new URL((req as NextRequest).url).origin;
+    const isLocalhost = origin.includes('localhost') || origin.includes('127.0.0.1');
+
+    if (isLocalhost) {
+      const discoverRes = await fetch(`${origin}/api/project/discover`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contractAddress }),
+      });
+      if (!discoverRes.ok) {
+        const errBody = await discoverRes.json().catch(() => ({ error: 'Discovery failed' }));
+        return err(errBody.error ?? 'Contract discovery failed', discoverRes.status);
+      }
+      const discoverData = await discoverRes.json() as { project: DbProject };
+      project = discoverData.project;
+    } else {
+      // On Vercel: upsert with basic metadata, skip full enrichment to avoid self-fetch
+      const { data: upserted, error: upsertErr } = await supabase
+        .from('projects')
+        .upsert(
+          {
+            contract_address: contractAddress.toLowerCase(),
+            name: tokenName,
+            symbol: tokenSymbol,
+            website: existingProject?.website ?? null,
+            twitter: existingProject?.twitter ?? null,
+            logo_url: existingProject?.logo_url ?? null,
+            description: existingProject?.description ?? null,
+            chain: 'bsc',
+          },
+          { onConflict: 'contract_address' },
+        )
+        .select()
+        .single<DbProject>();
+
+      if (upsertErr || !upserted) {
+        return err('Failed to save project', 500);
+      }
+      project = upserted;
+
+      // If this is a brand new project with no website, try enrichment in background
+      if (!project.website) {
+        console.log('[orchestrate] New project with no cached website — running inline enrichment');
+        try {
+          const discoverRes = await fetch(`${origin}/api/project/discover`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ contractAddress }),
+          });
+          if (discoverRes.ok) {
+            const discoverData = await discoverRes.json() as { project: DbProject };
+            project = discoverData.project;
+          }
+        } catch (e) {
+          console.warn('[orchestrate] Enrichment fetch failed (non-fatal):', e);
+        }
+      }
+    }
   }
-
-  const discoverData = await discoverRes.json() as { project: DbProject };
-  const project = discoverData.project;
 
   // ── 2. Check for existing in-progress run ─────────────────────────────────
   if (!forceReverify) {
@@ -68,11 +145,7 @@ export const POST = withErrorHandler(async (req: Request) => {
       const age = Date.now() - new Date(activeRun.created_at).getTime();
       if (age < STALE_RUN_MS) {
         console.log(`[orchestrate] Joining existing run ${activeRun.id} (age: ${Math.round(age / 1000)}s)`);
-        return ok({
-          runId: activeRun.id,
-          project,
-          status: 'joined' as const,
-        });
+        return ok({ runId: activeRun.id, project, status: 'joined' as const });
       }
       await supabase.from('verification_runs').update({ status: 'failed' }).eq('id', activeRun.id);
     }
@@ -101,11 +174,7 @@ export const POST = withErrorHandler(async (req: Request) => {
 
       if (claims.length > 0 && hasMeaningful && !hasInfrastructureFailure(claims)) {
         console.log(`[orchestrate] Reusing completed run ${completedRun.id}`);
-        return ok({
-          runId: completedRun.id,
-          project,
-          status: 'complete' as const,
-        });
+        return ok({ runId: completedRun.id, project, status: 'complete' as const });
       }
     }
   }
@@ -205,32 +274,11 @@ export const POST = withErrorHandler(async (req: Request) => {
     .update({ claims_extracted: extracted.length })
     .eq('id', runId);
 
-  await log(runId, `${extracted.length} claim(s) extracted`);
+  await log(runId, `${extracted.length} claim(s) extracted — awaiting verification`);
 
-  // ── 7. Dispatch claim workers (fire-and-forget) ───────────────────────────
-  await supabase.from('verification_runs').update({ status: 'verifying' }).eq('id', runId);
-  await log(runId, `Launching browser verification — ${extracted.length} claim(s)`);
-  await log(runId, `Target: ${project.website}`);
-
-  // Read back the inserted claims to get their IDs
-  const { data: savedClaims } = await supabase
-    .from('claims')
-    .select('id, claim')
-    .eq('verification_run_id', runId)
-    .eq('status', 'pending')
-    .order('created_at', { ascending: true });
-
-  for (const claim of savedClaims ?? []) {
-    fetch(`${origin}/api/verify/claim`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ runId, claimId: claim.id }),
-    }).catch((e) => {
-      console.error(`[orchestrate] Failed to dispatch claim ${claim.id}:`, e);
-    });
-  }
-
-  console.log(`[orchestrate] Dispatched ${savedClaims?.length ?? 0} claim(s) for run ${runId}`);
+  // NOTE: We do NOT dispatch claim workers here. On Vercel, fire-and-forget
+  // fetches are killed when the Lambda returns. The dashboard calls
+  // /api/verify/run in a separate request to dispatch claims properly.
 
   return ok({ runId, project, status: 'started' as const });
 });

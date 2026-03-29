@@ -509,6 +509,7 @@ export default function DashboardPage() {
     const maxPollMs = 10 * 60 * 1000;
     const pollStart = Date.now();
     let finalStatus: { claims: DbClaimWithEvidence[]; logs: { message: string }[] } | null = null;
+    let dispatchRetried = false;
 
     while (alive() && Date.now() - pollStart < maxPollMs) {
       await sleep(5_000);
@@ -539,6 +540,22 @@ export default function DashboardPage() {
           finalStatus = statusRes;
           console.log(`${TAG} All ${statusRes.claims.length} claims resolved`, STYLE);
           break;
+        }
+
+        // Safety: if all claims are still 'pending' after 30s, dispatch may have
+        // failed (e.g. user closed tab before /api/verify/run was called).
+        // Re-trigger dispatch to unstick the run.
+        const allPending = statusRes.claims.length > 0 &&
+          statusRes.claims.every((c) => c.status === 'pending');
+        const pollAge = Date.now() - pollStart;
+        if (allPending && pollAge > 30_000 && !dispatchRetried) {
+          dispatchRetried = true;
+          console.warn(`${TAG} All claims still pending after 30s — re-dispatching`, STYLE);
+          fetch('/api/verify/run', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ runId }),
+          }).catch(() => {});
         }
 
         const resolved = statusRes.claims.filter((c) => c.status !== 'pending' && c.status !== 'checking').length;
@@ -680,13 +697,28 @@ export default function DashboardPage() {
       addLog('Joining existing verification in progress...');
     } else {
       addLog('Server is processing — discovering, scraping, extracting claims...');
+
+      // Orchestrate created the run + claims but did NOT dispatch claim workers
+      // (fire-and-forget fetches die on Vercel when the Lambda returns).
+      // Call /api/verify/run in a separate request to dispatch claims properly.
+      try {
+        await apiPost<{ runId: string; results: unknown[] }>(
+          '/api/verify/run',
+          '/api/verify/run',
+          { runId },
+        );
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : 'Dispatch failed';
+        console.warn(`${TAG} verify/run dispatch failed (claims may still be pending):`, STYLE, msg);
+        addLog(`Warning: claim dispatch issue — ${msg}`);
+      }
     }
 
     // ── PHASE 2 — Poll until all claims are done ──────────────────────────────
     setPhase('analyzing');
     addLog('Waiting for claim extraction and verification...');
 
-    // Give the server a moment to create claims before we start polling
+    // Give the server a moment to dispatch and start processing claims
     await sleep(3_000);
     if (!alive()) { console.groupEnd(); return; }
 
