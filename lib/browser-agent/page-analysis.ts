@@ -175,8 +175,23 @@ const BLOCKER_PATTERNS: Array<{ type: BlockerType; patterns: RegExp[] }> = [
 function detectBlockers(text: string, bodyLength: number): BlockerType[] {
   const found: BlockerType[] = [];
   if (bodyLength < 20) found.push('page_broken');
+
+  // Weak patterns like "sign in" / "log in" / "connect wallet" appear in
+  // nav bars and footers on full product pages. Only flag them as blockers
+  // when the visible text is short (< 600 chars), indicating a gate/modal.
+  const WEAK_AUTH_PATTERNS = [/\bsign in\b/i, /\blog in\b/i, /\blogin\b/i];
+  const WEAK_WALLET_PATTERNS = [/connect wallet/i, /please connect/i];
+  const isShort = text.length < 600;
+
   for (const { type, patterns } of BLOCKER_PATTERNS) {
-    if (patterns.some((re) => re.test(text))) found.push(type);
+    const effective = patterns.filter((re) => {
+      if (!isShort) {
+        if (type === 'auth_required' && WEAK_AUTH_PATTERNS.some((w) => w.source === re.source)) return false;
+        if (type === 'wallet_required' && WEAK_WALLET_PATTERNS.some((w) => w.source === re.source)) return false;
+      }
+      return true;
+    });
+    if (effective.some((re) => re.test(text))) found.push(type);
   }
   return [...new Set(found)];
 }

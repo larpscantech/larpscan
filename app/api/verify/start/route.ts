@@ -6,6 +6,8 @@ import type { DbClaimWithEvidence, DbVerificationRun } from '@/lib/db-types';
 
 const INFRA_FAILURE_PATTERN = /missing executable|critical failure in launching the browser|preventing any interaction with the site|site-level issue/i;
 
+const STALE_RUN_MS = 10 * 60 * 1000; // 10 minutes
+
 function hasInfrastructureFailure(claims: DbClaimWithEvidence[]): boolean {
   return claims.some((claim) => {
     if (claim.status !== 'failed') return false;
@@ -30,7 +32,6 @@ export const POST = withErrorHandler(async (req: Request) => {
     return err('projectId is required');
   }
 
-  // Confirm the project exists
   const { data: project, error: projectError } = await supabase
     .from('projects')
     .select('id, name, website')
@@ -41,7 +42,32 @@ export const POST = withErrorHandler(async (req: Request) => {
     return err('Project not found', 404);
   }
 
-  // Reuse most recent completed run unless forceReverify is enabled
+  // ── Check for an already in-progress run for this project ─────────────────
+  // This prevents duplicate runs when multiple users verify the same token
+  // or when a user refreshes the page mid-verification.
+  if (!forceReverify) {
+    const { data: activeRun } = await supabase
+      .from('verification_runs')
+      .select('*')
+      .eq('project_id', projectId)
+      .in('status', ['pending', 'verifying', 'extracting', 'analyzing'])
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle<DbVerificationRun>();
+
+    if (activeRun) {
+      const age = Date.now() - new Date(activeRun.created_at).getTime();
+      if (age < STALE_RUN_MS) {
+        console.log(`[verify/start] Joining existing in-progress run ${activeRun.id} (age: ${Math.round(age / 1000)}s)`);
+        return ok({ runId: activeRun.id, run: activeRun, reused: false, inProgress: true });
+      }
+      // Stale run — mark it failed so it doesn't block future runs
+      console.warn(`[verify/start] Marking stale run ${activeRun.id} as failed (age: ${Math.round(age / 1000)}s)`);
+      await supabase.from('verification_runs').update({ status: 'failed' }).eq('id', activeRun.id);
+    }
+  }
+
+  // ── Reuse most recent completed run ───────────────────────────────────────
   if (!forceReverify) {
     const { data: existingRun } = await supabase
       .from('verification_runs')
@@ -68,7 +94,7 @@ export const POST = withErrorHandler(async (req: Request) => {
     }
   }
 
-  // Create the verification run
+  // ── Create a new run ──────────────────────────────────────────────────────
   const { data: run, error: runError } = await supabase
     .from('verification_runs')
     .insert({ project_id: projectId, status: 'pending' })
@@ -80,7 +106,6 @@ export const POST = withErrorHandler(async (req: Request) => {
     return err('Failed to create verification run', 500);
   }
 
-  // Emit initial pipeline logs
   await logBatch(run.id, [
     'Initializing verification run',
     `Project: ${project.name}`,

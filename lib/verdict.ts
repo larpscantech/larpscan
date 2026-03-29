@@ -326,7 +326,8 @@ export async function determineVerdict(
       response_format:  { type: 'json_object' },
       messages: [
         { role: 'system', content: SYSTEM },
-        { role: 'user',   content: userContent as string },  // cast: SDK accepts both shapes
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        { role: 'user',   content: userContent as any },
       ],
     });
 
@@ -410,6 +411,17 @@ function buildSignalContext(
     );
   }
   lines.push(`Likely form validation error visible: ${signals.likelyFormValidationError}`);
+
+  if (signals.walletEvidence) {
+    const we = signals.walletEvidence;
+    lines.push(`Wallet connected: ${we.walletConnected}`);
+    if (we.walletAddress) lines.push(`Wallet address: ${we.walletAddress}`);
+    if (we.detectedRequests?.length) lines.push(`Wallet requests detected: ${we.detectedRequests.length}`);
+    if (we.rejectedRequests?.length) lines.push(`Wallet requests rejected: ${we.rejectedRequests.length}`);
+  }
+  if (signals.transactionAttempted && !signals.transactionSubmitted) {
+    lines.push('Transaction was attempted but not broadcast — likely insufficient BNB for gas. This is evidence the feature IS functional (lean VERIFIED or UNTESTABLE, not LARP).');
+  }
 
   if (signals.pageJsCrash) {
     lines.push(

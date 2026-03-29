@@ -105,5 +105,3 @@ export function isBrowserlessMode(): boolean {
   return Boolean(process.env.BROWSERLESS_TOKEN);
 }
 
-export function isFFmpegReady(): boolean { return isBrowserlessMode(); }
-export async function ensureFFmpegForPlaywright(): Promise<void> { /* no-op */ }

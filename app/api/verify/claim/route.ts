@@ -146,16 +146,18 @@ async function maybeCompleteRun(runId: string) {
     return;
   }
 
-  // Safety: if claims have been stuck in 'pending' for > 5 minutes, they
-  // likely had their Lambda dropped by Vercel. Mark them as failed so the
-  // run can eventually complete instead of hanging forever.
+  // Safety: if claims have been stuck in 'pending' or 'checking' for too long,
+  // they likely had their Lambda dropped or crashed. Mark them as failed so
+  // the run can eventually complete instead of hanging forever.
   const now = Date.now();
   for (const claim of remaining) {
     const age = now - new Date(claim.created_at).getTime();
-    if (claim.status === 'pending' && age > 5 * 60 * 1000) {
-      console.warn(`[verify/claim] Claim ${claim.id} stuck in pending for ${Math.round(age / 1000)}s — marking as failed`);
+    const stuckPending  = claim.status === 'pending'  && age > 5 * 60 * 1000;
+    const stuckChecking = claim.status === 'checking' && age > 7 * 60 * 1000;
+    if (stuckPending || stuckChecking) {
+      console.warn(`[verify/claim] Claim ${claim.id} stuck in ${claim.status} for ${Math.round(age / 1000)}s — marking as failed`);
       await supabase.from('claims').update({ status: 'failed' }).eq('id', claim.id);
-      await log(runId, `Claim timed out (Lambda may have been dropped)`);
+      await log(runId, `Claim timed out in ${claim.status} state (Lambda may have been dropped or crashed)`);
     }
   }
 

@@ -3,7 +3,7 @@ import { ok, withErrorHandler } from '@/lib/api-helpers';
 import type { DbProject, DbVerificationRun, DbClaim } from '@/lib/db-types';
 import type { RecentVerification, JobStatus } from '@/lib/types';
 
-const LIMIT = 15;
+const LIMIT = 30;
 
 function runStatusToJobStatus(status: DbVerificationRun['status']): JobStatus {
   if (status === 'complete') return 'complete';
@@ -22,7 +22,6 @@ function elapsedLabel(createdAt: string): string {
 export const GET = withErrorHandler(async () => {
   console.log('[runs/recent] Fetching recent verification runs');
 
-  // ── 1. Fetch the most recent runs with their project rows ─────────────────
   const { data: runs, error: runsErr } = await supabase
     .from('verification_runs')
     .select('*, projects(*)')
@@ -38,8 +37,18 @@ export const GET = withErrorHandler(async () => {
     return ok({ runs: [] });
   }
 
-  // ── 2. Fetch claim statuses for all returned runs in one query ────────────
-  const runIds = runs.map((r) => r.id as string);
+  // Deduplicate: keep only the most recent run per project_id.
+  // Since runs are already sorted by created_at DESC, the first occurrence
+  // of each project_id is the most recent one.
+  const seenProjects = new Set<string>();
+  const dedupedRuns = runs.filter((r) => {
+    const pid = (r as DbVerificationRun).project_id;
+    if (seenProjects.has(pid)) return false;
+    seenProjects.add(pid);
+    return true;
+  });
+
+  const runIds = dedupedRuns.map((r) => r.id as string);
 
   const { data: claims } = await supabase
     .from('claims')
@@ -53,8 +62,7 @@ export const GET = withErrorHandler(async () => {
     (claimsByRun[c.verification_run_id] ??= []).push(c);
   }
 
-  // ── 3. Shape into RecentVerification ─────────────────────────────────────
-  const result: RecentVerification[] = runs.map((row) => {
+  const result: RecentVerification[] = dedupedRuns.map((row) => {
     const run     = row as DbVerificationRun;
     const project = (row as unknown as { projects: DbProject }).projects;
     const runClaims = claimsByRun[run.id] ?? [];
@@ -76,6 +84,6 @@ export const GET = withErrorHandler(async () => {
     };
   });
 
-  console.log(`[runs/recent] Returning ${result.length} runs`);
+  console.log(`[runs/recent] Returning ${result.length} runs (deduped from ${runs.length})`);
   return ok({ runs: result });
 });

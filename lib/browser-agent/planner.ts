@@ -39,10 +39,16 @@ AVAILABLE ACTIONS (JSON format):
 - { "action": "check_text",        "text": "text expected on CURRENT page AFTER interaction" }
 
 SAFETY RULES — NEVER do any of these:
-- click or interact with: "Connect Wallet", "Sign", "Approve", "Confirm transaction", "Swap" (execution), "Buy", "Sell", "Pay"
-- Traditional Chinese equivalents: "連接錢包", "簽名", "簽署", "批准", "確認交易", "執行兌換", "購買", "出售", "支付"
+- click or interact with: "Sign", "Approve", "Confirm transaction", "Swap" (execution), "Buy", "Sell", "Pay"
+- Traditional Chinese equivalents: "簽名", "簽署", "批准", "確認交易", "執行兌換", "購買", "出售", "支付"
 - enter seed phrases, private keys, 助記詞, or 私鑰
 - trigger real blockchain transactions
+
+WALLET CONNECTION — when the investigation wallet is configured:
+- You ARE allowed to click "Connect Wallet", "Connect Wallet to Continue", "連接錢包" buttons
+- The system will handle the wallet connection automatically after you click
+- After clicking a connect button, continue with the next step — the wallet mock handles authentication
+- If a page shows "Connect Wallet to Continue" as the only way forward, click it
 
 EXCEPTION — For TOKEN_CREATION claims, you ARE allowed to:
 - click the final "Create Token", "Launch Token", "Deploy", "Mint", "Create" submit button
@@ -247,7 +253,6 @@ export async function planWorkflow(
   const hardStop =
     (pageState.blockers.includes('auth_required') && pageState.forms.length === 0 && pageState.buttons.filter(b => !b.disabled).length === 0) ||
     pageState.blockers.includes('page_broken') ||
-    pageState.blockers.includes('wallet_only_gate') ||
     pageState.blockers.includes('bot_protection');
 
   if (hardStop) {
@@ -311,7 +316,7 @@ PLANNING RULES:
 7. If blockers include wallet_required but form/dashboard UI is visible — still plan steps to demonstrate it
 8. For DATA_DASHBOARD / dashboard+browser: use navigate → scroll → inspect table/chart content
 9. For TOKEN_CREATION / form+browser: navigate → fill ALL visible form fields using selectors from "Form fields" → scroll down → fill remaining fields → click the Create/Launch/Deploy/Mint submit button → check_text for the outcome. You ARE allowed to click the submit button for TOKEN_CREATION. NEVER invent input selectors — only use what is listed in "Form fields".
-10. For DEX_SWAP / WALLET_FLOW: navigate to feature surface → show form is interactive → stop before wallet signature
+10. For DEX_SWAP / WALLET_FLOW: navigate to feature surface → click "Connect Wallet" if it blocks access → show form is interactive → stop before wallet signature (Sign/Approve)
 11. Only return {"steps":[]} if the page is broken, auth-gated with no visible UI, or wallet_only_gate confirmed
 12. RESPONSE FORMAT: Return JSON {"steps":[...]} — no text outside the JSON object.${pageScreenshotDataUrl ? '\n13. A screenshot of the page is attached. Study it carefully before planning — look for visible forms, buttons, and loaded content.' : ''}`;
 
@@ -347,7 +352,8 @@ PLANNING RULES:
       response_format: { type: 'json_object' },
       messages: [
         { role: 'system', content: systemPrompt },
-        { role: 'user',   content: userContent as string },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        { role: 'user',   content: userContent as any },
       ],
     });
 
@@ -584,7 +590,7 @@ If a field explicitly expects a 0x wallet address as fee recipient (not @usernam
       return 'PRIORITY: Navigate to the swap/exchange surface → show the swap form is present and interactive → identify token selectors and amount inputs (stop before executing any swap).';
     case 'WALLET_FLOW':
     case 'wallet+rpc':
-      return 'PRIORITY: Navigate to the feature surface → demonstrate what pre-wallet UI is available → record form structure and available inputs (stop before wallet connection).';
+      return 'PRIORITY: Navigate to the feature surface → click "Connect Wallet" if it blocks progress → demonstrate the UI and form structure → record available inputs (stop before Sign/Approve).';
     case 'API_FEATURE':
     case 'api+fetch':
       return 'PRIORITY: Navigate to the feature surface → look for API endpoint documentation, interactive demos, or direct endpoint responses.';

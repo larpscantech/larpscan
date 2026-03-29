@@ -224,16 +224,18 @@ function ContractRow({
         </button>
       </div>
 
-      <label className="flex items-center gap-2.5 cursor-pointer w-fit group ml-1">
+      <label
+        onClick={() => onForceReverifyChange(!forceReverify)}
+        className="flex items-center gap-2.5 cursor-pointer w-fit group ml-1 select-none"
+      >
         <div
-          onClick={() => onForceReverifyChange(!forceReverify)}
           className={cn(
-            'w-3.5 h-3.5 rounded border flex items-center justify-center transition-all',
+            'w-4 h-4 rounded border flex items-center justify-center transition-all shrink-0',
             forceReverify ? 'bg-[#1c0808] border-[#b91c1c]/50' : 'border-cv-border group-hover:border-zinc-600',
           )}
         >
           {forceReverify && (
-            <svg className="w-2 h-2 text-[#dc2626]" viewBox="0 0 8 8" fill="none">
+            <svg className="w-2.5 h-2.5 text-[#dc2626]" viewBox="0 0 8 8" fill="none">
               <path d="M1 4L3 6L7 2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
           )}
@@ -487,7 +489,102 @@ export default function DashboardPage() {
     setDisplayedLogs((prev) => [...prev, message]);
   }, []);
 
+  // ── Shared polling loop — used by both startVerification and instant load ────
+  const pollRunToCompletion = useCallback(async (
+    runId: string,
+    alive: () => boolean,
+    sleep: (ms: number) => Promise<void>,
+  ) => {
+    setPhase('verifying');
+    setCheckingClaimIndex(0);
+
+    let rotateIdx = 0;
+    const rotatePeriodMs = 5_000;
+    const rotateTimer = setInterval(() => {
+      if (!alive()) { clearInterval(rotateTimer); return; }
+      rotateIdx = (rotateIdx + 1) % Math.max(1, visibleClaimsCount || 3);
+      setCheckingClaimIndex(rotateIdx);
+    }, rotatePeriodMs);
+
+    const maxPollMs = 10 * 60 * 1000;
+    const pollStart = Date.now();
+    let finalStatus: { claims: DbClaimWithEvidence[]; logs: { message: string }[] } | null = null;
+
+    while (alive() && Date.now() - pollStart < maxPollMs) {
+      await sleep(5_000);
+      if (!alive()) break;
+
+      try {
+        const statusRes = await apiGet<{
+          run:    DbVerificationRun;
+          claims: DbClaimWithEvidence[];
+          logs:   { message: string }[];
+        }>('/api/verify/status', `/api/verify/status?runId=${runId}`);
+
+        // Update claims as they arrive so the UI shows progress
+        if (statusRes.claims.length > 0) {
+          setRealClaims(statusRes.claims);
+          setVisibleClaimsCount(statusRes.claims.length);
+        }
+
+        // Sync server logs into the UI
+        if (statusRes.logs?.length) {
+          setDisplayedLogs(statusRes.logs.map((l) => l.message));
+        }
+
+        const allClaimsResolved = statusRes.claims.length > 0 &&
+          statusRes.claims.every((c) => c.status !== 'pending' && c.status !== 'checking');
+
+        if (allClaimsResolved) {
+          finalStatus = statusRes;
+          console.log(`${TAG} All ${statusRes.claims.length} claims resolved`, STYLE);
+          break;
+        }
+
+        const resolved = statusRes.claims.filter((c) => c.status !== 'pending' && c.status !== 'checking').length;
+        console.log(`${TAG} Poll: ${resolved}/${statusRes.claims.length} claims done`, STYLE);
+      } catch (e) {
+        console.warn(`${TAG} Status poll failed (retrying):`, STYLE, e);
+      }
+    }
+
+    clearInterval(rotateTimer);
+    setCheckingClaimIndex(-1);
+
+    if (!finalStatus && alive()) {
+      console.warn(`${TAG} Poll timed out — fetching latest partial results`, STYLE);
+      addLog('Some claims are still processing — showing available results');
+      try {
+        const partialRes = await apiGet<{
+          run:    DbVerificationRun;
+          claims: DbClaimWithEvidence[];
+          logs:   { message: string }[];
+        }>('/api/verify/status', `/api/verify/status?runId=${runId}`);
+        finalStatus = partialRes;
+      } catch { /* use whatever we have */ }
+    }
+
+    if (finalStatus) {
+      setRealClaims(finalStatus.claims);
+      setVisibleClaimsCount(finalStatus.claims.length);
+      for (let i = 0; i < finalStatus.claims.length; i++) {
+        if (!alive()) break;
+        await sleep(350);
+        setResolvedResultsCount(i + 1);
+        const c = finalStatus.claims[i];
+        const label = (c.status === 'pending' || c.status === 'checking')
+          ? 'PROCESSING'
+          : c.status.toUpperCase();
+        addLog(`Claim ${String(i + 1).padStart(2, '0')} → ${label}`);
+      }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [addLog, visibleClaimsCount]);
+
   // ── Core verification pipeline ────────────────────────────────────────────────
+  // Single API call to /api/verify/orchestrate handles everything server-side:
+  // discover → dedup → scrape → extract → dispatch claim workers.
+  // The client just calls orchestrate, then polls for results.
   const startVerification = useCallback(async (overrideAddress?: string) => {
     const myRunId = ++runIdRef.current;
     const alive   = () => runIdRef.current === myRunId;
@@ -508,28 +605,27 @@ export default function DashboardPage() {
 
     console.group(`${TAG} ══ Verification run started ══`, STYLE);
     console.log('  contract :', address);
-    console.log('  scan type:', scanType);
     console.log('  timestamp:', new Date().toISOString());
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // PHASE 1 — EXTRACTING: validate contract + discover project metadata
-    // ─────────────────────────────────────────────────────────────────────────
+    // ── PHASE 1 — Call orchestrate (server does discover + scrape + extract + dispatch)
     setPhase('extracting');
     addLog('Initializing verification job...');
     addLog(`Resolving contract: ${address.slice(0, 10)}...`);
 
-    let project: DbProject;
+    let orchResult: { runId: string; project: DbProject; status: 'started' | 'joined' | 'complete' };
     try {
-      console.log(`${TAG} Phase → extracting`, STYLE);
-      const res = await apiPost<{ project: DbProject }>(
-        '/api/project/discover',
-        '/api/project/discover',
-        { contractAddress: address },
+      orchResult = await apiPost<{
+        runId: string;
+        project: DbProject;
+        status: 'started' | 'joined' | 'complete';
+      }>(
+        '/api/verify/orchestrate',
+        '/api/verify/orchestrate',
+        { contractAddress: address, forceReverify },
       );
-      project = res.project;
     } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Contract discovery failed';
-      console.error(`${TAG} Discovery failed:`, STYLE, msg);
+      const msg = e instanceof Error ? e.message : 'Verification failed';
+      console.error(`${TAG} orchestrate failed:`, STYLE, msg);
       addLog(`✗ Error: ${msg}`);
       setApiError(msg);
       setPhase('idle');
@@ -539,53 +635,21 @@ export default function DashboardPage() {
 
     if (!alive()) { console.groupEnd(); return; }
 
-    console.log(`${TAG} Project discovered:`, STYLE, project);
-    addLog(`Token: ${project.name} (${project.symbol})`);
-    if (project.website) addLog(`Website: ${project.website}`);
-    if (project.twitter) addLog(`Social: ${project.twitter}`);
-    if (!project.website && !project.twitter) addLog('No web presence found for this contract');
+    const project = orchResult.project;
+    const runId = orchResult.runId;
 
     setRealProject(project);
     setProjectLoaded(true);
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // PHASE 2 — ANALYZING: start run + scrape website + extract claims via LLM
-    // ─────────────────────────────────────────────────────────────────────────
-    setPhase('analyzing');
-    addLog('Starting verification run...');
-
-    console.log(`${TAG} Phase → analyzing`, STYLE);
-
-    // Create the run record in Supabase
-    let runRecord: { runId: string; run: DbVerificationRun; reused?: boolean };
-    try {
-      runRecord = await apiPost<{ runId: string; run: DbVerificationRun; reused?: boolean }>(
-        '/api/verify/start',
-        '/api/verify/start',
-        { projectId: project.id, forceReverify },
-      );
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Failed to create verification run';
-      console.error(`${TAG} verify/start failed:`, STYLE, msg);
-      addLog(`✗ Error: ${msg}`);
-      setApiError(msg);
-      setPhase('idle');
-      console.groupEnd();
-      return;
-    }
-
-    if (!alive()) { console.groupEnd(); return; }
-
-    const runId = runRecord.runId;
     setCurrentRunId(runId);
-    console.log(`${TAG} Run created — ID:`, STYLE, runId);
+
+    addLog(`Token: ${project.name} (${project.symbol})`);
+    if (project.website) addLog(`Website: ${project.website}`);
     addLog(`Run ID: ${runId.slice(0, 8)}...`);
 
-    // Fast path: use cached completed run if available
-    if (runRecord.reused) {
+    // ── Handle orchestrate response status ────────────────────────────────────
+    if (orchResult.status === 'complete') {
+      // Cached completed run — load instantly
       addLog('Existing completed run found — loading cached result');
-      let cachedLoaded = false;
-
       try {
         const statusRes = await apiGet<{
           run: DbVerificationRun;
@@ -602,261 +666,49 @@ export default function DashboardPage() {
         setPhase('complete');
         addLog('Cached verification loaded ✓');
         void fetchRecentScans();
-        cachedLoaded = true;
       } catch (e) {
         const msg = e instanceof Error ? e.message : 'Failed to load cached run';
-        console.warn(`${TAG} Failed to load cached run, continuing fresh:`, STYLE, msg);
-        addLog('Cached run unavailable — continuing with fresh verification');
+        addLog(`✗ ${msg}`);
+        setApiError(msg);
+        setPhase('idle');
       }
-
-      if (cachedLoaded || !alive()) {
-        console.groupEnd();
-        return;
-      }
-    }
-
-    // Scrape the project website
-    let websiteText = '';
-    if (project.website) {
-      addLog(`Extracting website content from ${project.website}...`);
-      console.log(`${TAG} Scraping website:`, STYLE, project.website);
-
-      try {
-        const textRes = await apiPost<{ text: string; charCount: number }>(
-          '/api/project/extract-text',
-          '/api/project/extract-text',
-          { website: project.website },
-        );
-        websiteText = textRes.text;
-        addLog(`Website scraped — ${textRes.charCount} chars extracted`);
-        console.log(`${TAG} Website text preview (first 300 chars):`, STYLE);
-        console.log('  ', websiteText.slice(0, 300));
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : 'Scrape failed';
-        console.warn(`${TAG} Website extraction failed (non-fatal):`, STYLE, msg);
-        addLog(`Website scraping failed — ${msg}`);
-        addLog('Continuing without website content');
-      }
-    } else {
-      console.warn(`${TAG} No website on record for this project — skipping scrape`, STYLE);
-      addLog('No website found — skipping content extraction');
-    }
-
-    if (!alive()) { console.groupEnd(); return; }
-
-    // Extract claims via LLM
-    if (!websiteText) {
-      addLog('No website content available — 0 claims extracted');
-      console.warn(`${TAG} No website text → skipping LLM extraction`, STYLE);
-      setPhase('reporting');
-      await sleep(1200);
-      if (!alive()) { console.groupEnd(); return; }
-      setPhase('complete');
-      addLog('Run complete — no claims to verify');
-      console.log(`${TAG} Run complete (no claims)`, STYLE);
       console.groupEnd();
       return;
     }
 
-    if (project.twitter) addLog(`Scraping X profile ${project.twitter}...`);
-    addLog('Running AI claim extraction model...');
-    console.log(`${TAG} Calling /api/claims/extract with ${websiteText.length} chars`, STYLE);
-
-    let extractedClaims: DbClaim[] = [];
-    try {
-      const claimsRes = await apiPost<{
-        claims:   DbClaim[];
-        count:    number;
-        xScraped: boolean;
-        xChars:   number;
-        twitter:  string | null;
-      }>(
-        '/api/claims/extract',
-        '/api/claims/extract',
-        { projectId: project.id, runId, websiteText },
-      );
-      extractedClaims = claimsRes.claims;
-      if (claimsRes.xScraped) {
-        addLog(`X profile scraped — ${claimsRes.xChars} chars`);
-      } else if (claimsRes.twitter) {
-        addLog('X profile unavailable — using website only');
-      }
-      console.log(`${TAG} LLM returned ${claimsRes.count} claim(s):`, STYLE);
-      console.table(
-        claimsRes.claims.map((c) => ({ claim: c.claim, pass_condition: c.pass_condition })),
-      );
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Claim extraction failed';
-      console.error(`${TAG} claims/extract failed:`, STYLE, msg);
-      addLog(`✗ Claim extraction failed: ${msg}`);
-      setApiError(msg);
-      setPhase('idle');
-      console.groupEnd();
-      return;
-    }
-
-    if (!alive()) { console.groupEnd(); return; }
-
-    setRealClaims(extractedClaims);
-
-    if (extractedClaims.length === 0) {
-      addLog('No verifiable product claims found on this website');
-      console.warn(`${TAG} LLM found 0 verifiable claims`, STYLE);
+    if (orchResult.status === 'joined') {
+      addLog('Joining existing verification in progress...');
     } else {
-      // Stagger-reveal claims one by one as they appear from the LLM response
-      for (let i = 0; i < extractedClaims.length; i++) {
-        if (!alive()) { console.groupEnd(); return; }
-        await sleep(480);
-        setVisibleClaimsCount(i + 1);
-        const label = extractedClaims[i].claim.slice(0, 60);
-        addLog(`Claim ${String(i + 1).padStart(2, '0')} — ${label}`);
-        console.log(`${TAG} Claim ${i + 1} revealed:`, STYLE, extractedClaims[i]);
-      }
-
-      addLog(`${extractedClaims.length} claim${extractedClaims.length === 1 ? '' : 's'} extracted — awaiting verification automation`);
+      addLog('Server is processing — discovering, scraping, extracting claims...');
     }
 
+    // ── PHASE 2 — Poll until all claims are done ──────────────────────────────
+    setPhase('analyzing');
+    addLog('Waiting for claim extraction and verification...');
+
+    // Give the server a moment to create claims before we start polling
+    await sleep(3_000);
     if (!alive()) { console.groupEnd(); return; }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // PHASE 3 — VERIFYING: Playwright browser runs each claim against live product
-    // ─────────────────────────────────────────────────────────────────────────
-    console.log(`${TAG} Phase → verifying`, STYLE);
-    setPhase('verifying');
-    setCheckingClaimIndex(0);
-
-    if (extractedClaims.length > 0) {
-      addLog('Launching browser verification engine...');
-      addLog(`Target: ${project.website}`);
-
-      // Rotate the "checking" indicator across claims while the long request runs
-      let rotateIdx = 0;
-      const claimCount = extractedClaims.length;
-      const rotatePeriodMs = Math.max(3_000, Math.floor(20_000 / claimCount));
-
-      const rotateTimer = setInterval(() => {
-        if (!alive()) { clearInterval(rotateTimer); return; }
-        rotateIdx = (rotateIdx + 1) % claimCount;
-        setCheckingClaimIndex(rotateIdx);
-      }, rotatePeriodMs);
-
-      // Dispatch claims — /api/verify/run now returns immediately after
-      // fanning out each claim to its own serverless function.
-      try {
-        console.log(`${TAG} Dispatching claims via /api/verify/run`, STYLE);
-        await apiPost<{ runId: string; results: unknown[] }>(
-          '/api/verify/run',
-          '/api/verify/run',
-          { runId },
-        );
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : 'Verification engine failed';
-        console.error(`${TAG} verify/run dispatch failed:`, STYLE, msg);
-        addLog(`✗ Browser verification failed: ${msg}`);
-      }
-
-      if (!alive()) { clearInterval(rotateTimer); console.groupEnd(); return; }
-
-      // Poll /api/verify/status until ALL claims are done, then reveal
-      // everything at once so the UI doesn't glitch with partial results.
-      const maxPollMs = 10 * 60 * 1000;
-      const pollStart = Date.now();
-      let finalStatus: { claims: DbClaimWithEvidence[]; logs: { message: string }[] } | null = null;
-
-      while (alive() && Date.now() - pollStart < maxPollMs) {
-        await sleep(5_000);
-        if (!alive()) break;
-
-        try {
-          const statusRes = await apiGet<{
-            run:    DbVerificationRun;
-            claims: DbClaimWithEvidence[];
-            logs:   { message: string }[];
-          }>('/api/verify/status', `/api/verify/status?runId=${runId}`);
-
-          // Only trust individual claim statuses — run.status can be set to
-          // 'complete' by maybeCompleteRun before all Lambdas have reported back
-          // (race condition with fire-and-forget dispatch).
-          const allClaimsResolved = statusRes.claims.length > 0 &&
-            statusRes.claims.every((c) => c.status !== 'pending' && c.status !== 'checking');
-
-          if (allClaimsResolved) {
-            finalStatus = statusRes;
-            console.log(`${TAG} All ${statusRes.claims.length} claims resolved`, STYLE);
-            break;
-          }
-
-          // Log progress for debugging
-          const resolved = statusRes.claims.filter((c) => c.status !== 'pending' && c.status !== 'checking').length;
-          console.log(`${TAG} Poll: ${resolved}/${statusRes.claims.length} claims done`, STYLE);
-        } catch (e) {
-          console.warn(`${TAG} Status poll failed (retrying):`, STYLE, e);
-        }
-      }
-
-      clearInterval(rotateTimer);
-      setCheckingClaimIndex(-1);
-
-      // If poll timed out without all claims resolving, fetch the latest state
-      // and show whatever we have (partial results > no results).
-      if (!finalStatus && alive()) {
-        console.warn(`${TAG} Poll timed out — fetching latest partial results`, STYLE);
-        addLog('Some claims are still processing — showing available results');
-        try {
-          const partialRes = await apiGet<{
-            run:    DbVerificationRun;
-            claims: DbClaimWithEvidence[];
-            logs:   { message: string }[];
-          }>('/api/verify/status', `/api/verify/status?runId=${runId}`);
-          finalStatus = partialRes;
-        } catch { /* use whatever we have */ }
-      }
-
-      // Reveal results — all at once with staggered animation
-      if (finalStatus) {
-        setRealClaims(finalStatus.claims);
-        for (let i = 0; i < finalStatus.claims.length; i++) {
-          if (!alive()) break;
-          await sleep(450);
-          setResolvedResultsCount(i + 1);
-          const c = finalStatus.claims[i];
-          const label = (c.status === 'pending' || c.status === 'checking')
-            ? 'PROCESSING'
-            : c.status.toUpperCase();
-          addLog(`Claim ${String(i + 1).padStart(2, '0')} → ${label}`);
-          console.log(`${TAG} Revealed claim ${i + 1}: ${c.status}`, STYLE);
-        }
-      }
-    }
-
-    if (!alive()) { console.groupEnd(); return; }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // PHASE 4 — REPORTING: assemble final report
-    // ─────────────────────────────────────────────────────────────────────────
-    console.log(`${TAG} Phase → reporting`, STYLE);
-    setPhase('reporting');
-    await sleep(400);
-    addLog('Assembling verification report...');
-    await sleep(800);
+    await pollRunToCompletion(runId, alive, sleep);
 
     if (!alive()) { console.groupEnd(); return; }
 
     // ── COMPLETE ──────────────────────────────────────────────────────────────
+    setPhase('reporting');
+    await sleep(400);
+    addLog('Assembling verification report...');
+    await sleep(600);
+
+    if (!alive()) { console.groupEnd(); return; }
+
     setPhase('complete');
     addLog('Verification run complete ✓');
-
-    // Refresh the recent scans table now that this run is persisted
     void fetchRecentScans();
 
-    console.log(`${TAG} ══ Run complete ══`, STYLE, {
-      project: project.name,
-      runId,
-      claims: extractedClaims.length,
-      elapsed: `${elapsed}s`,
-    });
+    console.log(`${TAG} ══ Run complete ══`, STYLE);
     console.groupEnd();
-  }, [input, scanType, forceReverify, addLog, elapsed, fetchRecentScans]);
+  }, [input, forceReverify, addLog, fetchRecentScans, pollRunToCompletion]);
 
   // ── Reset ──────────────────────────────────────────────────────────────────
   const handleSubmit = useCallback(() => {
@@ -865,12 +717,77 @@ export default function DashboardPage() {
   }, [input, phase, startVerification]);
 
   // ── Load a previous scan from the recent-scans table ───────────────────────
-  const handleSelectRecentScan = useCallback((v: import('@/lib/types').RecentVerification) => {
+  // Completed scans: load instantly from DB (no re-discovery, no re-scraping).
+  // In-progress scans: join the polling loop.
+  const handleSelectRecentScan = useCallback(async (v: import('@/lib/types').RecentVerification) => {
     if (phase !== 'idle' && phase !== 'complete') return;
+
+    const myRunId = ++runIdRef.current;
+    const alive   = () => runIdRef.current === myRunId;
+    const sleep   = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
     setInput(v.project.contractAddress);
-    // Pass the address directly so startVerification doesn't race with setState
-    startVerification(v.project.contractAddress);
-  }, [phase, startVerification]);
+
+    // ── Hard reset ──────────────────────────────────────────────────────────
+    setDisplayedLogs([]);
+    setRealProject(null);
+    setRealClaims([]);
+    setCurrentRunId(v.id);
+    setApiError(null);
+    setProjectLoaded(false);
+    setVisibleClaimsCount(0);
+    setResolvedResultsCount(0);
+    setCheckingClaimIndex(-1);
+    setElapsed(0);
+
+    // Build a minimal project object from the recent scan data
+    const projectStub: DbProject = {
+      id: '', contract_address: v.project.contractAddress,
+      name: v.project.name, symbol: v.project.ticker,
+      website: v.project.website, twitter: v.project.xHandle,
+      logo_url: null, description: null, chain: 'bsc', created_at: '',
+    };
+    setRealProject(projectStub);
+    setProjectLoaded(true);
+
+    addLog(`Loading verification for ${v.project.name}...`);
+
+    if (v.status === 'complete') {
+      // ── Instant load: fetch cached results directly ──────────────────────
+      setPhase('extracting');
+      try {
+        const statusRes = await apiGet<{
+          run: DbVerificationRun;
+          claims: DbClaimWithEvidence[];
+          logs: { message: string }[];
+        }>('/api/verify/status', `/api/verify/status?runId=${v.id}`);
+
+        if (!alive()) return;
+
+        setRealClaims(statusRes.claims);
+        setVisibleClaimsCount(statusRes.claims.length);
+        setResolvedResultsCount(statusRes.claims.length);
+        setCheckingClaimIndex(-1);
+        setPhase('complete');
+        addLog('Verification loaded ✓');
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : 'Failed to load verification';
+        addLog(`✗ ${msg}`);
+        setApiError(msg);
+        setPhase('idle');
+      }
+    } else {
+      // ── In-progress: join the polling loop ────────────────────────────────
+      addLog('Verification in progress — joining...');
+      await pollRunToCompletion(v.id, alive, sleep);
+
+      if (!alive()) return;
+
+      setPhase('complete');
+      addLog('Verification run complete ✓');
+      void fetchRecentScans();
+    }
+  }, [phase, addLog, fetchRecentScans, pollRunToCompletion]);
 
   const handleReset = useCallback(() => {
     console.log(`${TAG} Reset triggered`, STYLE);

@@ -210,18 +210,28 @@ function buildStepNarrative(obs: AgentObservation): string {
 }
 
 function detectBlockerFromText(text: string): BlockerType | undefined {
+  // Only classify as a blocker when the text is SHORT (< 600 chars) — that
+  // means the page is mostly a gate/modal, not a full product page that
+  // happens to mention "sign in" in a nav bar or footer.
+  const isShort = text.length < 600;
+
   // auth_required — Privy social login modal (check BEFORE wallet_required)
   if (/login with twitter|login with github|login with tiktok|login with twitch|login with discord/i.test(text)) return 'auth_required';
   if (/log in or sign up|sign up to continue|create an account to continue/i.test(text)) return 'auth_required';
   if (/continue with a wallet/i.test(text))                   return 'auth_required';
   if (/verify your email|email verification required/i.test(text)) return 'auth_required';
-  // auth_required — English + Traditional Chinese
+  // auth_required — strong signals (always match)
   if (/sign in to continue|log in to continue|please sign in|please log in/i.test(text)) return 'auth_required';
-  if (/sign in|log in|\blogin\b/i.test(text))                 return 'auth_required';
   if (/登入|登錄|請登入|需要登入/.test(text))                   return 'auth_required';
+  // auth_required — weak signals (only match on short/gate pages)
+  if (isShort && /\bsign in\b|\blog in\b|\blogin\b/i.test(text)) return 'auth_required';
+
   // wallet_required — English + Traditional Chinese (after auth checks)
-  if (/connect wallet|wallet required|wallet not connected|please connect/i.test(text)) return 'wallet_required';
+  if (/connect wallet to continue|wallet required|wallet not connected|please connect your wallet/i.test(text)) return 'wallet_required';
+  // "connect wallet" alone is weak — only flag on short pages
+  if (isShort && /connect wallet|please connect/i.test(text))  return 'wallet_required';
   if (/連接錢包|連結錢包|請連接錢包|未連接錢包|錢包未連接/.test(text)) return 'wallet_required';
+
   // bot_protection — English + Traditional Chinese + common CAPTCHA variants
   if (/just a moment|checking your browser|verify you are human|are you a robot/i.test(text)) return 'bot_protection';
   if (/complete the captcha|solve the challenge|hcaptcha|recaptcha/i.test(text)) return 'bot_protection';
@@ -627,7 +637,8 @@ Return the single best next action as JSON:
 
 Rules:
 - NEVER repeat an action already in the narrative
-- NEVER click "Connect Wallet", "Sign in", MetaMask, or WalletConnect
+- NEVER click "Sign in", "Sign", "Approve", MetaMask, or WalletConnect
+- You ARE allowed to click "Connect Wallet" or "Connect Wallet to Continue" if it is the only way to proceed
 - Look at the screenshot for buttons not in the button list
 - Read instructions/labels on the page — they tell you what to fill in next
 - Return null if pass condition is clearly met`;
@@ -636,7 +647,7 @@ Rules:
     `Claim: ${claim}`,
     `Pass condition: ${passCondition}`,
     `URL: ${url}`,
-    walletAddress ? `Wallet: ${walletAddress.slice(0, 10)}… (already connected — skip any wallet steps)` : '',
+    walletAddress ? `Wallet: ${walletAddress.slice(0, 10)}… (connected — click "Connect Wallet" buttons if they block progress, the system handles the rest)` : '',
     '',
     `What has happened so far (most recent last):`,
     runningNarratives.slice(-5).map((n, i) => `  ${i + 1}. ${n}`).join('\n') || '  (nothing yet)',
@@ -1271,13 +1282,15 @@ export async function executeSteps(
     // ── Blocker detection ────────────────────────────────────────────────────
     let blockerDetected = detectBlockerFromText(textAfter);
 
-    // Suppress wallet_required when the investigation wallet address is already
-    // visible in the page text — that means the site shows it as connected.
+    // Suppress wallet_required when the investigation wallet address is visible
+    // in the page text. Require BOTH prefix and suffix to avoid false positives
+    // from short hex strings that coincidentally appear in other content.
     if (blockerDetected === 'wallet_required' && options?.investigationWalletAddress) {
       const addrLower = options.investigationWalletAddress.toLowerCase();
       const short     = addrLower.slice(0, 6);
       const end       = addrLower.slice(-4);
-      if (textAfter.toLowerCase().includes(short) || textAfter.toLowerCase().includes(end)) {
+      const pageLower = textAfter.toLowerCase();
+      if (pageLower.includes(short) && pageLower.includes(end)) {
         blockerDetected = undefined;
       }
     }
@@ -1346,16 +1359,22 @@ export async function executeSteps(
         }
       }
 
-      // Check if reconnection succeeded — if so, suppress the blocker
+      // Check if reconnection succeeded — require positive evidence, not just
+      // absence of "connect wallet" text (which could mean an empty/error page)
       const reconnectText = await capturePageText(page);
       const addrLower2 = options.investigationWalletAddress.toLowerCase();
       const short2 = addrLower2.slice(0, 6);
       const end2   = addrLower2.slice(-4);
-      const reconnected = reconnectText.toLowerCase().includes(short2) ||
-        reconnectText.toLowerCase().includes(end2) ||
-        !/connect wallet|wallet required|please connect/i.test(reconnectText);
+      const textLower = reconnectText.toLowerCase();
+
+      const addrVisible = textLower.includes(short2) && textLower.includes(end2);
+      const connectGone = !/connect wallet to continue|wallet required|please connect your wallet/i.test(reconnectText);
+      const hasContent  = reconnectText.trim().length > 100;
+
+      // Address visible = strong proof. Connect CTA gone + real content = weak proof.
+      const reconnected = addrVisible || (connectGone && hasContent);
       if (reconnected) {
-        console.log('[executor] Auto-reconnect succeeded — suppressing wallet_required blocker');
+        console.log(`[executor] Auto-reconnect succeeded (addr=${addrVisible}, cta_gone=${connectGone})`);
         blockerDetected = undefined;
       } else {
         console.log('[executor] Auto-reconnect did not resolve wallet_required');
@@ -1513,8 +1532,7 @@ export async function executeSteps(
 
     if (
       (blockerDetected === 'auth_required' && inputsAfter.length === 0 && !workflowStructureVisible) ||
-      blockerDetected === 'bot_protection' ||
-      blockerDetected === 'wallet_only_gate'
+      blockerDetected === 'bot_protection'
     ) {
       console.log(`[executor] Hard blocker encountered: ${blockerDetected} — stopping`);
       return { observations, stopReason: 'blocker', consecutiveNoops };
@@ -2036,7 +2054,7 @@ export function buildEvidenceSummary(
         .replace(/(?:TypeError|ReferenceError)[^\n]{0,200}\n?/g, '')
         .replace(/Cannot read propert(?:y|ies) of (?:undefined|null)[^\n]{0,150}\n?/gi, '')
         .trim();
-      if (cleanedText.length > 10) lines.push(`  After: ${cleanedText.slice(0, 300)}`);
+      if (cleanedText.length > 10) lines.push(`  After: ${cleanedText.slice(0, 500)}`);
     }
   }
 
@@ -2053,7 +2071,7 @@ export function buildEvidenceSummary(
     .trim();
   lines.push('\n--- Final Page State ---');
   if (cleanedFinalText.length > 20) {
-    lines.push(`Final page content:\n${cleanedFinalText.slice(0, 800)}`);
+    lines.push(`Final page content:\n${cleanedFinalText.slice(0, 1500)}`);
   }
 
   // Run-level API calls
