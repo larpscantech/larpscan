@@ -34,11 +34,12 @@ import type { VerdictSignals } from './verdict-signals';
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface DeterministicVerdictResult {
-  resolved:     boolean;
-  verdict?:     'verified' | 'larp' | 'untestable' | 'failed';
-  confidence?:  'high' | 'medium';
-  matchedRule?: string;
-  reasons:      string[];
+  resolved:       boolean;
+  verdict?:       'verified' | 'larp' | 'untestable' | 'failed';
+  confidence?:    'high' | 'medium';
+  matchedRule?:   string;
+  blockerReason?: string;
+  reasons:        string[];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -69,6 +70,7 @@ export function evaluateDeterministicVerdict(
       verdict:     'failed',
       confidence:  'high',
       matchedRule: 'Rule 0a: on_chain_transaction_reverted',
+      blockerReason: 'On-chain transaction was mined but reverted',
       reasons: [
         'Transaction was mined on BSC but execution reverted — contract logic rejected it (not a gas/funds issue; the node already accepted and mined the tx)',
         `Transaction hash: ${signals.transactionHash}`,
@@ -98,6 +100,7 @@ export function evaluateDeterministicVerdict(
       verdict:     'verified',
       confidence:  'medium',
       matchedRule: 'Rule 0b: transaction_attempted_insufficient_funds',
+      blockerReason: 'Feature works but wallet has insufficient BNB for gas',
       reasons: [
         'eth_sendTransaction was called — the feature builds and submits real transactions',
         'Transaction was not broadcast (likely insufficient BNB for gas fees)',
@@ -121,6 +124,7 @@ export function evaluateDeterministicVerdict(
       verdict:     'verified',
       confidence:  'high',
       matchedRule: 'Rule 0: on_chain_transaction_succeeded',
+      blockerReason: 'On-chain transaction confirmed on BSC',
       reasons: [
         `On-chain transaction succeeded on BSC mainnet (receipt status: success)`,
         `Transaction hash: ${signals.transactionHash}`,
@@ -139,6 +143,7 @@ export function evaluateDeterministicVerdict(
       verdict:     'failed',
       confidence:  'high',
       matchedRule: 'Rule 1: site_not_loaded',
+      blockerReason: 'Site failed to load (DNS error, timeout, or 5xx)',
       reasons:     ['Site failed to load (DNS error, timeout, or 5xx)'],
     };
   }
@@ -174,6 +179,7 @@ export function evaluateDeterministicVerdict(
       verdict:     'failed',
       confidence:  'medium',
       matchedRule: 'Rule 1b: feature_page_js_crash',
+      blockerReason: 'Feature page crashed with a JS runtime error',
       reasons: [
         'Feature page crashed with a JavaScript runtime error — this is a bug in the site\'s code, not evidence the feature is absent',
         `JS error: ${errMsg.slice(0, 150)}`,
@@ -202,6 +208,7 @@ export function evaluateDeterministicVerdict(
       verdict:     'untestable',
       confidence:  'high',
       matchedRule: `Rule 2: automation_blocker (${foundAutomationBlocker})`,
+      blockerReason: `Blocked by ${foundAutomationBlocker === 'bot_protection' ? 'CAPTCHA / bot protection' : foundAutomationBlocker === 'geo_blocked' ? 'geographic restriction' : 'rate limiting'}`,
       reasons:     [`Automation blocker detected during interaction: ${foundAutomationBlocker}`],
     };
   }
@@ -219,6 +226,7 @@ export function evaluateDeterministicVerdict(
       verdict:     'untestable',
       confidence:  'high',
       matchedRule: 'Rule 3: wallet_only_gate_confirmed',
+      blockerReason: 'Feature is entirely gated behind wallet connection',
       reasons:     [
         `Executor confirmed wallet_only_gate after replanning`,
         `Noop ratio: ${signals.noopCount}/${signals.totalSteps} (${(noopRatio * 100).toFixed(0)}%)`,
@@ -261,6 +269,7 @@ export function evaluateDeterministicVerdict(
       verdict:     'verified',
       confidence:  'high',
       matchedRule: 'Rule 4: dashboard_data_confirmed',
+      blockerReason: 'Dashboard data and API activity confirmed',
       reasons:     [
         headerDesc,
         `Own-domain API activity confirmed: ${signals.ownDomainApiCalls.length} call(s)`,
@@ -322,6 +331,7 @@ export function evaluateDeterministicVerdict(
       verdict:     'verified',
       confidence:  'high',
       matchedRule: 'Rule 4b: wallet_connected_form_accessible',
+      blockerReason: 'Wallet connected and feature form is accessible',
       reasons,
     };
   }
@@ -345,6 +355,7 @@ export function evaluateDeterministicVerdict(
       verdict:     'untestable',
       confidence:  'high',
       matchedRule: 'Rule 4a: wallet_required_form_visible',
+      blockerReason: 'Wallet connection required — feature form is visible but gated',
       reasons:     [
         'Wallet connection required to proceed',
         'Feature form/workflow is visible — feature appears real',
@@ -372,6 +383,7 @@ export function evaluateDeterministicVerdict(
       verdict:     'untestable',
       confidence:  'high',
       matchedRule: 'Rule 5: auth_wall_no_public_ui',
+      blockerReason: 'Login/authentication required — no public UI accessible',
       reasons:     [
         'Login wall encountered during interaction',
         'No form fields or enabled CTAs found on any visited page',
@@ -402,6 +414,7 @@ export function evaluateDeterministicVerdict(
       verdict:     'verified',
       confidence:  'medium',
       matchedRule: 'Rule 6: form_cta_api_on_surface',
+      blockerReason: 'Feature form, CTA, and API activity confirmed on surface',
       reasons:     [
         `Feature form with enabled CTA visible on ${signals.finalUrl}`,
         `Own-domain API activity confirmed: ${signals.ownDomainApiCalls.length} call(s)`,
@@ -435,6 +448,7 @@ export function evaluateDeterministicVerdict(
       verdict:     'larp',
       confidence:  'medium',
       matchedRule: 'Rule 7: route_missing_no_recovery',
+      blockerReason: 'Feature route does not exist — no page or API found',
       reasons:     [
         'Route missing blocker encountered — surface not found',
         'No relevant surface, modal, form, or API activity observed',

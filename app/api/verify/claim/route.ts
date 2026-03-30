@@ -110,6 +110,7 @@ export const POST = withErrorHandler(async (req: Request) => {
     verifyResult?.signals?.transactionReceiptStatus,
     verifyResult?.signals?.transactionAttempted,
     verifyResult?.signals?.walletEvidence?.walletAddress,
+    verdict.blockerReason,
   );
 
   await supabase.from('claims').update({ status: verdict.verdict }).eq('id', claimId);
@@ -191,6 +192,7 @@ async function saveEvidence(
   transactionReceiptStatus?: 'success' | 'reverted' | 'timeout',
   transactionAttempted?: boolean,
   walletAddress?:        string,
+  blockerReason?:        string,
 ) {
   const { error } = await supabase.from('evidence_items').insert({
     claim_id: claimId,
@@ -207,6 +209,7 @@ async function saveEvidence(
       ...(transactionReceiptStatus ? { transactionReceiptStatus } : {}),
       ...(transactionAttempted   ? { transactionAttempted }   : {}),
       ...(walletAddress          ? { walletAddress }          : {}),
+      ...(blockerReason          ? { blockerReason }          : {}),
     },
   });
   if (error) {

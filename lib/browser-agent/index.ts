@@ -6,7 +6,10 @@ export {
 export * from './types';
 export { analyzePageState, capturePageText, getInteractiveElements } from './page-analysis';
 export { planWorkflow, replanWorkflow } from './planner';
-export { executeSteps, buildEvidenceSummary, handleWalletPopups, injectWalletMockIntoContext, dismissConsentBanner } from './executor';
-export type { ExecuteResult, WalletInterceptResult } from './executor';
+export { executeSteps } from './executor';
+export type { ExecuteResult } from './executor';
+export { buildEvidenceSummary, dismissConsentBanner } from './evidence';
+export { handleWalletPopups, injectWalletMockIntoContext, detectWalletStack } from './wallet-connect-flow';
+export type { WalletInterceptResult, WalletStack } from './wallet-connect-flow';
 export * from './playbooks';
 export * from './workflow';

@@ -207,9 +207,10 @@ Respond with JSON only:
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface VerdictResult {
-  verdict:    ClaimStatus;
-  confidence: 'high' | 'medium' | 'low';
-  reasoning:  string;
+  verdict:        ClaimStatus;
+  confidence:     'high' | 'medium' | 'low';
+  reasoning:      string;
+  blockerReason?: string;
 }
 
 const VERDICT_MAP: Record<string, ClaimStatus> = {
@@ -276,9 +277,10 @@ export async function determineVerdict(
     ].join(' — ');
 
     return {
-      verdict:    VERDICT_MAP[deterministic.verdict.toUpperCase()] ?? 'failed',
-      confidence: deterministic.confidence,
+      verdict:       VERDICT_MAP[deterministic.verdict.toUpperCase()] ?? 'failed',
+      confidence:    deterministic.confidence,
       reasoning,
+      blockerReason: deterministic.blockerReason,
     };
   }
 

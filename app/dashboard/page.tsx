@@ -55,6 +55,7 @@ function toFrontendClaim(c: DbClaim | DbClaimWithEvidence): Claim {
       (evidenceData?.['transactionReceiptStatus'] as Claim['transactionReceiptStatus']) ?? undefined,
     transactionAttempted:   (evidenceData?.['transactionAttempted']   as boolean | undefined) ?? undefined,
     walletAddress:          (evidenceData?.['walletAddress']          as string  | undefined) ?? undefined,
+    blockerReason:          (evidenceData?.['blockerReason']          as string  | undefined) ?? undefined,
   };
 }
 

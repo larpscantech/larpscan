@@ -247,9 +247,14 @@ export function AuditClaimCard({
                   initial={{ opacity: 0, scale: 0.85 }}
                   animate={{ opacity: 1, scale: 1 }}
                   transition={{ duration: 0.28, ease: 'easeOut' }}
-                  className="flex-shrink-0 mt-0.5"
+                  className="flex-shrink-0 mt-0.5 flex flex-col items-end gap-1"
                 >
                   <StatusBadge variant={verdictToBadge(claim.verdict)} />
+                  {claim.blockerReason && (
+                    <span className="text-[10px] font-mono text-zinc-600 max-w-[220px] text-right leading-tight">
+                      {claim.blockerReason}
+                    </span>
+                  )}
                 </motion.div>
               )}
             </AnimatePresence>

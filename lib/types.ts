@@ -40,6 +40,8 @@ export interface Claim {
   transactionAttempted?: boolean;
   /** Investigation wallet address used during this verification */
   walletAddress?: string;
+  /** Human-readable one-liner from the deterministic verdict rule (e.g. "Wallet connection required") */
+  blockerReason?: string;
 }
 
 export interface VerificationJob {
