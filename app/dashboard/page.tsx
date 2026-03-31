@@ -226,7 +226,7 @@ function ContractRow({
       </div>
 
       <label
-        onClick={() => onForceReverifyChange(!forceReverify)}
+          onClick={() => onForceReverifyChange(!forceReverify)}
         className="flex items-center gap-2.5 cursor-pointer w-fit group ml-1 select-none"
       >
         <div
@@ -694,8 +694,8 @@ export default function DashboardPage() {
         setApiError(msg);
         setPhase('idle');
       }
-      console.groupEnd();
-      return;
+        console.groupEnd();
+        return;
     }
 
     if (orchResult.status === 'joined') {
@@ -725,7 +725,7 @@ export default function DashboardPage() {
 
     // Give the server a moment to dispatch and start processing claims
     await sleep(3_000);
-    if (!alive()) { console.groupEnd(); return; }
+      if (!alive()) { console.groupEnd(); return; }
 
     await pollRunToCompletion(runId, alive, sleep);
 
@@ -737,7 +737,7 @@ export default function DashboardPage() {
     addLog('Assembling verification report...');
     await sleep(600);
 
-    if (!alive()) { console.groupEnd(); return; }
+        if (!alive()) { console.groupEnd(); return; }
 
     setPhase('complete');
     addLog('Verification run complete ✓');
@@ -820,9 +820,9 @@ export default function DashboardPage() {
 
       if (!alive()) return;
 
-      setPhase('complete');
-      addLog('Verification run complete ✓');
-      void fetchRecentScans();
+    setPhase('complete');
+    addLog('Verification run complete ✓');
+    void fetchRecentScans();
     }
   }, [phase, addLog, fetchRecentScans, pollRunToCompletion]);
 

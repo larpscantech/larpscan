@@ -299,19 +299,14 @@ export async function handleWalletPopups(
 
       // ── Step 2: Privy "Continue with a wallet" ───────────────────────────
       // Privy shows a "Log in or sign up" modal with social logins first.
-      // Use stack detection to short-circuit: only look for this button on
-      // Privy sites (or unknown stacks as a fallback).
-      const shouldCheckPrivy = walletStack === 'privy' || walletStack === 'unknown';
-      const privyContinueBtn = shouldCheckPrivy
-        ? page.locator('button, [role="button"]')
-            .filter({ hasText: /continue with a wallet|continue with wallet/i })
-            .first()
-        : null;
+      // Always check for this button regardless of detected stack — many sites
+      // use wagmi-appkit or rainbowkit with Privy as the auth layer underneath.
+      const privyContinueBtn = page.locator('button, [role="button"]')
+          .filter({ hasText: /continue with a wallet|continue with wallet/i })
+          .first();
 
-      const privyVisible = privyContinueBtn
-        ? await privyContinueBtn.isVisible({ timeout: 2_000 }).catch(() => false)
-        : false;
-      if (privyVisible && privyContinueBtn) {
+      const privyVisible = await privyContinueBtn.isVisible({ timeout: 2_000 }).catch(() => false);
+      if (privyVisible) {
         await privyContinueBtn.click().catch(() => {});
         log.push('[wallet] Clicked "Continue with a wallet" (Privy social modal)');
         // Privy needs time to detect window.ethereum.isMetaMask and render the
@@ -396,11 +391,9 @@ export async function handleWalletPopups(
             '[data-privy-dialog] button, [data-rk] button, ' +
             '[class*="WalletModal"] button, [class*="walletModal"] button, ' +
             '[class*="wallet-list"] button, [class*="connectorList"] button, ' +
-            // Web3Modal / ConnectKit / Dynamic / Thirdweb selectors
             '[class*="w3m-"] button, [class*="ck-"] button, ' +
             '[data-testid*="wallet"] button, [class*="dynamic-"] button, ' +
             '[class*="tw-connect"] button, [class*="thirdweb"] button, ' +
-            // Generic modal containers
             '[class*="modal"] button, [class*="Modal"] button, ' +
             '[class*="overlay"] button, [class*="Overlay"] button',
           );
@@ -415,6 +408,21 @@ export async function handleWalletPopups(
               await btn.click().catch(() => {});
               log.push(`[wallet] Clicked fallback modal option: "${txt.slice(0, 50)}"`);
               await page.waitForTimeout(4_000);
+
+              // If the fallback clicked a Privy "Continue with a wallet" transition,
+              // a new wallet picker may have appeared — try MetaMask/Injected now.
+              if (/continue with/i.test(txt)) {
+                log.push('[wallet] Fallback was a Privy transition — looking for MetaMask in new picker');
+                await triggerWalletReconnect(page, { withEip6963: true, waitMs: 2_000 });
+                const mmClicked = await tryClickWalletOption('MetaMask (post-privy)',
+                  page.locator('button, [role="button"], li, div[role="option"]').filter({ hasText: /metamask/i }).first(),
+                );
+                if (!mmClicked) {
+                  await tryClickWalletOption('Injected (post-privy)',
+                    page.locator('button, [role="button"], li, div[role="option"]').filter({ hasText: /injected|browser wallet|detected/i }).first(),
+                  );
+                }
+              }
               return true;
             }
           }
@@ -572,19 +580,65 @@ export async function handleWalletPopups(
         log.push('[wallet] Wallet connected confirmed — multiple weak signals in DOM');
       } else if (hasWeakPositive && pickerClicked) {
         // If we clicked a picker option AND have at least one weak signal, retry once
-        log.push('[wallet] Weak signal detected, retrying confirmation in 3s...');
-        await page.waitForTimeout(3_000);
+        log.push('[wallet] Weak signal detected, retrying confirmation in 5s...');
+        await page.waitForTimeout(5_000);
         const retryCheck = await page.evaluate(
           ({ short, end }: { short: string; end: string }) => {
             const text = document.body?.innerText?.toLowerCase() ?? '';
-            return text.includes(short) || text.includes(end) ||
-              !!document.querySelector('[class*="avatar" i], [class*="identicon" i], [class*="jazzicon" i]');
+
+            // Check 1: wallet address visible
+            if (text.includes(short) || text.includes(end)) return 'address_visible';
+            const truncRe = new RegExp(short + '[.…]{2,}' + end);
+            if (truncRe.test(text)) return 'truncated_address';
+
+            // Check 2: avatar/identicon appeared
+            if (document.querySelector('[class*="avatar" i], [class*="identicon" i], [class*="jazzicon" i], [class*="blockie" i]')) {
+              return 'avatar_visible';
+            }
+
+            // Check 3: auth modal gone AND connect button gone (strong combined signal)
+            const authModalGone = !/log in or sign up|continue with a wallet|create an account/i.test(text);
+            const connectBtns = Array.from(document.querySelectorAll('button, [role="button"]'))
+              .filter((el) => {
+                const t = ((el as HTMLElement).innerText ?? '').toLowerCase().trim();
+                const s = window.getComputedStyle(el as Element);
+                return s.display !== 'none' && s.visibility !== 'hidden' &&
+                  /^connect wallet$|^connect$|^connect your wallet$/i.test(t);
+              });
+            if (authModalGone && connectBtns.length === 0 && text.length > 200) {
+              return 'modal_gone_no_connect_btn';
+            }
+
+            // Check 4: Privy session token appeared
+            try {
+              if (localStorage.getItem('privy:token') || localStorage.getItem('privy:session') ||
+                  sessionStorage.getItem('privy:token')) {
+                return 'privy_session';
+              }
+            } catch {}
+
+            // Check 5: wagmi store shows connected with an account
+            try {
+              const wagmi = localStorage.getItem('wagmi.store');
+              if (wagmi) {
+                const parsed = JSON.parse(wagmi);
+                const state = parsed?.state;
+                if (state?.current && state.current !== 'null') return 'wagmi_account';
+              }
+            } catch {}
+
+            // Check 6: disconnect/logout button appeared
+            const disconnectBtns = Array.from(document.querySelectorAll('button, [role="button"], [role="menuitem"]'))
+              .filter((el) => /disconnect|log ?out|sign ?out/i.test(((el as HTMLElement).innerText ?? '').toLowerCase().trim()));
+            if (disconnectBtns.length > 0) return 'disconnect_btn';
+
+            return null;
           },
           { short: confirmShort, end: confirmEnd },
-        ).catch(() => false);
+        ).catch(() => null);
         if (retryCheck) {
           walletConnected = true;
-          log.push('[wallet] Wallet connected confirmed on retry');
+          log.push(`[wallet] Wallet connected confirmed on retry — signal: ${retryCheck}`);
         } else {
           walletConnected = false;
           log.push('[wallet] Wallet connection not confirmed after retry');

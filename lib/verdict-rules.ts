@@ -394,17 +394,38 @@ export function evaluateDeterministicVerdict(
   // ── Rule 6: Feature form with enabled CTA and own-domain API (conservative) ─
   // Restricted to feature types where a visible, non-gated form with live
   // own-domain API activity is sufficient evidence.
-  // Wallet-gated forms are explicitly excluded (already caught by Rule 4a).
-  const noWalletGate =
+  // Wallet-gated and auth-gated forms are explicitly excluded.
+  const noAccessGate =
     !blockersEncountered.includes('wallet_required') &&
-    !blockersEncountered.includes('wallet_only_gate');
+    !blockersEncountered.includes('wallet_only_gate') &&
+    !blockersEncountered.includes('auth_required');
+
+  // Guard: if the agent ended up on a completely different domain (e.g. Twitter
+  // OAuth redirect), the "form + CTA" on that page is NOT evidence for the
+  // original claim. Extract the base domain from the surface URL and compare.
+  let finalUrlOnDomain = true;
+  if (signals.finalUrl) {
+    try {
+      const finalHost  = new URL(signals.finalUrl).hostname.replace(/^www\./, '');
+      const ownDomains = signals.ownDomainApiCalls
+        .map((u) => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return ''; } })
+        .filter(Boolean);
+      const knownOAuthDomains = ['x.com', 'twitter.com', 'github.com', 'accounts.google.com', 'discord.com', 'auth.privy.io'];
+      if (knownOAuthDomains.some((d) => finalHost.includes(d))) {
+        finalUrlOnDomain = false;
+      } else if (ownDomains.length > 0 && !ownDomains.some((d) => finalHost.includes(d) || d.includes(finalHost))) {
+        finalUrlOnDomain = false;
+      }
+    } catch { /* malformed URL — skip guard */ }
+  }
 
   if (
     signals.formAppeared &&
     signals.enabledCtaPresent &&
     signals.ownDomainApiCalls.length > 0 &&
     signals.reachedRelevantSurface &&
-    noWalletGate &&
+    noAccessGate &&
+    finalUrlOnDomain &&
     featureType && RULE6_FEATURE_TYPES.has(featureType) &&
     signals.totalSteps > 0 &&
     !(featureType === 'TOKEN_CREATION' && signals.likelyFormValidationError)
@@ -422,12 +443,12 @@ export function evaluateDeterministicVerdict(
       ],
     };
   } else if (signals.totalSteps > 0 && featureType && RULE6_FEATURE_TYPES.has(featureType)) {
-    // Log the specific condition that blocked Rule 6 for applicable feature types
     if (!signals.formAppeared)             console.log('[verdict:l1] Rule 6 skipped: no form appeared');
     else if (!signals.enabledCtaPresent)   console.log('[verdict:l1] Rule 6 skipped: no enabled CTA');
     else if (signals.ownDomainApiCalls.length === 0) console.log('[verdict:l1] Rule 6 skipped: no own-domain API calls');
     else if (!signals.reachedRelevantSurface)        console.log('[verdict:l1] Rule 6 skipped: relevant surface not reached');
-    else if (!noWalletGate)                console.log('[verdict:l1] Rule 6 skipped: wallet gate present (handled by Rule 3/4a)');
+    else if (!noAccessGate)                console.log(`[verdict:l1] Rule 6 skipped: access gate present (blockers: ${blockersEncountered.join(',')})`);
+    else if (!finalUrlOnDomain)            console.log(`[verdict:l1] Rule 6 skipped: final URL off-domain (${signals.finalUrl})`);
     else if (featureType === 'TOKEN_CREATION' && signals.likelyFormValidationError) {
       console.log('[verdict:l1] Rule 6 skipped: TOKEN_CREATION with likely form validation error on page');
     }
