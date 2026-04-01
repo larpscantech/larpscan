@@ -512,16 +512,23 @@ async function waitForPageStable(page: Page, maxMs = 30_000): Promise<boolean> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OpenAI client for adaptive step decisions (gpt-4o-mini — cheap + fast)
+// AgentStepExecutor
+//
+// Encapsulates the OpenAI client singleton and the adaptive step decision
+// method. The module-level executeSteps function calls the static methods
+// directly — no instance needed.
 // ─────────────────────────────────────────────────────────────────────────────
 
-let _adaptiveClient: OpenAI | null = null;
-function getAdaptiveClient(): OpenAI {
-  if (_adaptiveClient) return _adaptiveClient;
-  const key = process.env.OPENAI_API_KEY;
-  if (!key) throw new Error('OPENAI_API_KEY not set');
-  _adaptiveClient = new OpenAI({ apiKey: key });
-  return _adaptiveClient;
+class AgentStepExecutor {
+  private static client: OpenAI | null = null;
+
+  static getAdaptiveClient(): OpenAI {
+    if (AgentStepExecutor.client) return AgentStepExecutor.client;
+    const key = process.env.OPENAI_API_KEY;
+    if (!key) throw new Error('OPENAI_API_KEY not set');
+    AgentStepExecutor.client = new OpenAI({ apiKey: key });
+    return AgentStepExecutor.client;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -680,7 +687,7 @@ Rules:
     : textContext;
 
   try {
-    const resp = await getAdaptiveClient().chat.completions.create({
+    const resp = await AgentStepExecutor.getAdaptiveClient().chat.completions.create({
       model:       'gpt-4o-mini',
       temperature: 0,
       max_tokens:  300,

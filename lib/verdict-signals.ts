@@ -152,6 +152,13 @@ export interface VerdictSignals {
    * can see what broke without reading the full agent logs.
    */
   pageJsCrashMessage?: string;
+  /**
+   * True when a rate-limit response (429 / "Maximum N per hour") was detected
+   * after the agent submitted a form. Proves the feature is functional.
+   */
+  rateLimitHit: boolean;
+  /** The rate-limit message text shown by the page, if captured. */
+  rateLimitMessage?: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -276,5 +283,18 @@ export function buildSignals(
     transactionAttempted:    txAttempted || txHashes.length > 0,
     pageJsCrash:             pageJsErrors.length > 0,
     pageJsCrashMessage:      pageJsErrors[0],
+    rateLimitHit: observations.some((o) =>
+      /maximum \d+ (agent|request|action)|rate.?limit|too many request|429/i.test(o.pageText ?? '') ||
+      (o.messages ?? []).some((m) => /maximum \d+|rate.?limit|too many/i.test(m.text)),
+    ),
+    rateLimitMessage: (() => {
+      for (const o of observations) {
+        const msg = (o.messages ?? []).find((m) => /maximum \d+|rate.?limit|too many/i.test(m.text));
+        if (msg) return msg.text.slice(0, 120);
+        const match = (o.pageText ?? '').match(/maximum \d+[^.]*\.|rate.?limit[^.]*\.|too many request[^.]*/i);
+        if (match) return match[0].slice(0, 120);
+      }
+      return undefined;
+    })(),
   };
 }

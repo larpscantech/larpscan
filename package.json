@@ -9,8 +9,6 @@
     "lint": "next lint"
   },
   "dependencies": {
-    "@react-three/drei": "^10.7.7",
-    "@react-three/fiber": "^9.5.0",
     "@sparticuz/chromium": "^143.0.4",
     "@supabase/supabase-js": "^2.99.1",
     "clsx": "^2.1.1",
@@ -25,7 +23,6 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "tailwind-merge": "^2.6.0",
-    "three": "^0.182.0",
     "viem": "^2.47.4",
     "webm-duration-fix-buffer": "^1.0.0"
   },

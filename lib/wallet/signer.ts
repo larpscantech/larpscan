@@ -18,32 +18,54 @@
 import type { BrowserContext } from 'playwright';
 import { investigationPublicClient, investigationWalletClient, investigationWalletAddress, investigationAccount } from './client';
 
-// ─── Transaction hash log ─────────────────────────────────────────────────────
-// Keyed by sessionId so concurrent verification runs never steal each other's
-// hashes.  The old flat-array design caused inconsistent Rule-0 verdicts when
-// two runs overlapped: Run B could drain Run A's hash before Run A had a chance
-// to call drainTransactionHashes(), leaving Run A with nothing → LLM fallback.
-const _txHashLog: Map<string, string[]> = new Map();
+// ─── Session Store ────────────────────────────────────────────────────────────
+// Encapsulates per-session tx hash and attempt state so concurrent runs never
+// bleed into each other (the old flat-Map design caused Rule-0 verdict races).
+
+class SigningSessionStore {
+  private readonly hashes   = new Map<string, string[]>();
+  private readonly attempts = new Map<string, boolean>();
+
+  init(sessionId: string): void {
+    this.hashes.set(sessionId, []);
+    this.attempts.set(sessionId, false);
+  }
+
+  pushHash(sessionId: string, hash: string): void {
+    const list = this.hashes.get(sessionId) ?? [];
+    list.push(hash);
+    this.hashes.set(sessionId, list);
+  }
+
+  markAttempted(sessionId: string): void {
+    this.attempts.set(sessionId, true);
+  }
+
+  /** Returns and clears all tx hashes for a session. */
+  drainHashes(sessionId: string): string[] {
+    const list = this.hashes.get(sessionId) ?? [];
+    this.hashes.delete(sessionId);
+    return list;
+  }
+
+  /** Returns and clears the attempt flag for a session. */
+  drainAttempt(sessionId: string): boolean {
+    const attempted = this.attempts.get(sessionId) ?? false;
+    this.attempts.delete(sessionId);
+    return attempted;
+  }
+}
+
+const sessionStore = new SigningSessionStore();
 
 /** Returns and clears all transaction hashes submitted for a given session. */
 export function drainTransactionHashes(sessionId: string): string[] {
-  const hashes = _txHashLog.get(sessionId) ?? [];
-  _txHashLog.delete(sessionId);
-  return hashes;
+  return sessionStore.drainHashes(sessionId);
 }
 
-// ── Transaction attempt tracking ──────────────────────────────────────────────
-// Tracks whether eth_sendTransaction was called at all, regardless of outcome.
-// A tx that is rejected by the RPC (e.g. insufficient funds for gas) never
-// produces a hash — but the fact that the frontend ATTEMPTED a tx means the
-// feature IS functional. The verdict system uses this to return VERIFIED rather
-// than UNTESTABLE when we simply lacked BNB to pay for the operation.
-const _txAttemptLog = new Map<string, boolean>();
-
+/** Returns and clears whether eth_sendTransaction was attempted for a session. */
 export function drainTransactionAttempt(sessionId: string): boolean {
-  const attempted = _txAttemptLog.get(sessionId) ?? false;
-  _txAttemptLog.delete(sessionId);
-  return attempted;
+  return sessionStore.drainAttempt(sessionId);
 }
 
 /** Returns a BscScan URL for a given tx hash (BSC mainnet). */
@@ -116,8 +138,7 @@ export async function exposeSigningBridge(context: BrowserContext, sessionId: st
     return;
   }
   // Initialize empty buckets for this session
-  _txHashLog.set(sessionId, []);
-  _txAttemptLog.set(sessionId, false);
+  sessionStore.init(sessionId);
 
   // Narrow types after null check
   const walletClient  = investigationWalletClient;
@@ -127,7 +148,6 @@ export async function exposeSigningBridge(context: BrowserContext, sessionId: st
   await context.exposeFunction(
     'chainverifySign',
     async (method: string, paramsJson: string): Promise<string> => {
-      const sessionLog = _txHashLog.get(sessionId) ?? [];
       let params: unknown[];
       try {
         params = JSON.parse(paramsJson) as unknown[];
@@ -149,7 +169,7 @@ export async function exposeSigningBridge(context: BrowserContext, sessionId: st
         if (!isSafeToSign(msgHex)) {
           console.warn('[wallet/signer] REFUSED: message contains unsafe financial keywords');
           throw Object.assign(
-            new Error('ChainVerify: message signing refused — unsafe content detected'),
+            new Error('LarpScan: message signing refused — unsafe content detected'),
             { code: 4001 },
           );
         }
@@ -164,7 +184,7 @@ export async function exposeSigningBridge(context: BrowserContext, sessionId: st
           });
         } catch (signErr) {
           console.error('[wallet/signer] signMessage failed:', signErr);
-          throw Object.assign(new Error('ChainVerify: signing failed'), { code: 4001 });
+          throw Object.assign(new Error('LarpScan: signing failed'), { code: 4001 });
         }
 
         console.log(`[wallet/signer] ✓ personal_sign complete → ${signature.slice(0, 20)}...`);
@@ -186,7 +206,7 @@ export async function exposeSigningBridge(context: BrowserContext, sessionId: st
         if (!isSafeToSign(JSON.stringify(typedData.message))) {
           console.warn('[wallet/signer] REFUSED: typed data contains unsafe content');
           throw Object.assign(
-            new Error('ChainVerify: typed-data signing refused — unsafe content detected'),
+            new Error('LarpScan: typed-data signing refused — unsafe content detected'),
             { code: 4001 },
           );
         }
@@ -280,10 +300,8 @@ export async function exposeSigningBridge(context: BrowserContext, sessionId: st
         }
         // ── end patch ──────────────────────────────────────────────────────
 
-        // Mark that a transaction was attempted for this session — even if the
-        // actual send fails (e.g. insufficient funds), the frontend DID try to
-        // submit a tx, which proves the feature is real.
-        _txAttemptLog.set(sessionId, true);
+        // Mark that a transaction was attempted for this session
+        sessionStore.markAttempted(sessionId);
 
         console.log(`[wallet/signer] eth_sendTransaction to=${txParams.to} value=${txParams.value ?? '0x0'}`);
 
@@ -295,7 +313,7 @@ export async function exposeSigningBridge(context: BrowserContext, sessionId: st
         const maxAllowed = BigInt('100000000000000000'); // 0.1 BNB
         if (valueWei > maxAllowed) {
           console.warn(`[wallet/signer] Transaction value ${valueWei} exceeds safety limit — rejecting`);
-          throw Object.assign(new Error('ChainVerify: transaction value exceeds safety limit'), { code: 4001 });
+          throw Object.assign(new Error('LarpScan: transaction value exceeds safety limit'), { code: 4001 });
         }
 
         try {
@@ -311,8 +329,7 @@ export async function exposeSigningBridge(context: BrowserContext, sessionId: st
             data:    txParams.data as `0x${string}` | undefined,
             gas:     gasLimit,
           });
-          sessionLog.push(hash as string);
-          _txHashLog.set(sessionId, sessionLog);
+          sessionStore.pushHash(sessionId, hash as string);
           console.log(`[wallet/signer] ✓ Transaction submitted [session ${sessionId.slice(0,8)}]: ${hash}`);
           return hash;
         } catch (txErr) {
@@ -325,7 +342,7 @@ export async function exposeSigningBridge(context: BrowserContext, sessionId: st
       }
 
       throw Object.assign(
-        new Error(`ChainVerify: signing method '${method}' not supported by investigation bridge`),
+        new Error(`LarpScan: signing method '${method}' not supported by investigation bridge`),
         { code: 4200 },
       );
     },
