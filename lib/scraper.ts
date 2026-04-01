@@ -203,7 +203,7 @@ async function fetchViaHttp(url: string): Promise<string> {
       signal: controller.signal,
       headers: {
         'User-Agent':
-          'Mozilla/5.0 (compatible; ChainVerify/1.0; +https://chainverify.io)',
+          'Mozilla/5.0 (compatible; LarpScan/1.0; +https://larpscan.sh)',
         'Accept': 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.5',
       },

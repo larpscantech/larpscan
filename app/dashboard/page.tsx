@@ -461,16 +461,13 @@ export default function DashboardPage() {
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const w = window as typeof window & {
-      __chainverifySetAddress?: (addr: string) => void;
       __larpscanSetAddress?: (addr: string) => void;
     };
     const setAddress = (addr: string) => {
       setInput(addr);
     };
-    w.__chainverifySetAddress = setAddress;
     w.__larpscanSetAddress = setAddress;
     return () => {
-      delete w.__chainverifySetAddress;
       delete w.__larpscanSetAddress;
     };
   }, []);

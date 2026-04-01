@@ -353,8 +353,8 @@ export async function handleWalletPopups(
         await page.waitForTimeout(500);
         await page.evaluate(() => {
           const w = window as unknown as Record<string, unknown>;
-          if (typeof w['__chainverifyTriggerConnect'] === 'function') {
-            (w['__chainverifyTriggerConnect'] as () => void)();
+          if (typeof w['__larpscanTriggerConnect'] === 'function') {
+            (w['__larpscanTriggerConnect'] as () => void)();
           }
         }).catch(() => {});
         await page.waitForTimeout(4_000);
@@ -713,8 +713,8 @@ function buildWalletMockScript(addr: string): string {
 
   return `
 (function() {
-  if (window.__chainverifyMockInstalled) return;
-  window.__chainverifyMockInstalled = true;
+  if (window.__larpscanMockInstalled) return;
+  window.__larpscanMockInstalled = true;
 
   var addr = "0x${safeAddr.replace(/^0x/i, '')}";
   var listeners = {};
@@ -799,14 +799,14 @@ function buildWalletMockScript(addr: string): string {
       }
 
       if (m === 'personal_sign' || m === 'eth_sign') {
-        console.log('[mock] personal_sign requested — calling chainverifySign');
-        if (typeof window.chainverifySign !== 'function') {
-          var e1 = new Error('ChainVerify: no signing bridge');
+        console.log('[mock] personal_sign requested — calling larpscanSign');
+        if (typeof window.larpscanSign !== 'function') {
+          var e1 = new Error('LarpScan: no signing bridge');
           e1.code = 4001;
           throw e1;
         }
         try {
-          var sig = await window.chainverifySign(m, JSON.stringify(p));
+          var sig = await window.larpscanSign(m, JSON.stringify(p));
           console.log('[mock] personal_sign SUCCESS:', sig.slice(0, 20) + '...');
           return sig;
         } catch(err) {
@@ -818,13 +818,13 @@ function buildWalletMockScript(addr: string): string {
       }
 
       if (m === 'eth_signTypedData' || m === 'eth_signTypedData_v3' || m === 'eth_signTypedData_v4') {
-        if (typeof window.chainverifySign !== 'function') {
-          var e3 = new Error('ChainVerify: no signing bridge');
+        if (typeof window.larpscanSign !== 'function') {
+          var e3 = new Error('LarpScan: no signing bridge');
           e3.code = 4001;
           throw e3;
         }
         try {
-          var sig2 = await window.chainverifySign('eth_signTypedData_v4', JSON.stringify(p));
+          var sig2 = await window.larpscanSign('eth_signTypedData_v4', JSON.stringify(p));
           return sig2;
         } catch(err2) {
           var e4 = new Error(err2.message || 'Typed-data signing rejected');
@@ -851,13 +851,13 @@ function buildWalletMockScript(addr: string): string {
 
       if (m === 'eth_sendTransaction') {
         console.log('[mock] eth_sendTransaction — forwarding to signing bridge');
-        if (typeof window.chainverifySign !== 'function') {
-          var e5 = new Error('ChainVerify: no signing bridge for transaction');
+        if (typeof window.larpscanSign !== 'function') {
+          var e5 = new Error('LarpScan: no signing bridge for transaction');
           e5.code = 4001;
           throw e5;
         }
         try {
-          var txHash = await window.chainverifySign('eth_sendTransaction', JSON.stringify(p));
+          var txHash = await window.larpscanSign('eth_sendTransaction', JSON.stringify(p));
           console.log('[mock] eth_sendTransaction SUCCESS: hash=' + txHash);
           return txHash;
         } catch(errTx) {
@@ -954,7 +954,7 @@ function buildWalletMockScript(addr: string): string {
 
   // EIP-6963 — announce as MetaMask with custom rdns to bypass MetaMask SDK
   var EIP6963_INFO = {
-    uuid:  'chainverify-investigation-metamask',
+    uuid:  'larpscan-investigation-metamask',
     name:  'MetaMask',
     icon:  'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"/>',
     rdns:  'io.metamask.injected'
@@ -1019,8 +1019,8 @@ function buildWalletMockScript(addr: string): string {
   }
 
   // ── Force-connect helper ─────────────────────────────────────────────────
-  window.__chainverifyTriggerConnect = function() {
-    console.log('[mock] __chainverifyTriggerConnect called — firing accountsChanged + connect + chainChanged');
+  window.__larpscanTriggerConnect = function() {
+    console.log('[mock] __larpscanTriggerConnect called — firing accountsChanged + connect + chainChanged');
     (listeners['accountsChanged'] || []).forEach(function(cb) { try { cb([addr]); } catch(e) {} });
     (listeners['connect'] || []).forEach(function(cb) { try { cb({ chainId: '0x38' }); } catch(e) {} });
     (listeners['chainChanged'] || []).forEach(function(cb) { try { cb('0x38'); } catch(e) {} });

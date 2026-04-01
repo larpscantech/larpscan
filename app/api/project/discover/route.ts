@@ -229,7 +229,7 @@ async function getMoralisData(address: string): Promise<Enrichment> {
     const meta = Array.isArray(data) ? data[0] : undefined;
     if (!meta) return EMPTY;
 
-    // Log if token is flagged as spam — useful signal for ChainVerify
+    // Log if token is flagged as spam — useful signal for LarpScan
     if (meta.possible_spam) {
       console.log('[discover] Moralis flagged as possible spam:', address);
     }

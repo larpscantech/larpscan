@@ -3,7 +3,7 @@
  *
  * Server-side signing bridge for the investigation wallet.
  *
- * exposeSigningBridge()  — registers window.chainverifySign on a Playwright
+ * exposeSigningBridge()  — registers window.larpscanSign on a Playwright
  *                          BrowserContext so the browser-side mock can call it
  *                          to produce real ECDSA signatures via viem.
  *
@@ -126,7 +126,7 @@ function isSafeToSign(rawMessage: string): boolean {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Exposes `window.chainverifySign(method, paramsJson)` in every page of the
+ * Exposes `window.larpscanSign(method, paramsJson)` in every page of the
  * given Playwright context.  The browser-side window.ethereum mock calls this
  * function for personal_sign requests so Privy / SIWE can authenticate.
  *
@@ -146,7 +146,7 @@ export async function exposeSigningBridge(context: BrowserContext, sessionId: st
   const walletAccount = investigationAccount;  // full Account object with private key
 
   await context.exposeFunction(
-    'chainverifySign',
+    'larpscanSign',
     async (method: string, paramsJson: string): Promise<string> => {
       let params: unknown[];
       try {

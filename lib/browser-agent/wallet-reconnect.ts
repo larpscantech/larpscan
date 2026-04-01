@@ -7,7 +7,7 @@ import { capturePageText } from './page-analysis';
  *
  * This is the SINGLE source of truth for "poke the wallet mock".
  * Previously this logic was copy-pasted in 4 places with subtle differences
- * (some forgot EIP-6963, some forgot __chainverifyTriggerConnect).
+ * (some forgot EIP-6963, some forgot __larpscanTriggerConnect).
  */
 export async function triggerWalletReconnect(
   page: Page,
@@ -25,8 +25,8 @@ export async function triggerWalletReconnect(
       eth.request({ method: 'eth_requestAccounts', params: [] }).catch(() => {});
     }
 
-    if (typeof w['__chainverifyTriggerConnect'] === 'function') {
-      (w['__chainverifyTriggerConnect'] as () => void)();
+    if (typeof w['__larpscanTriggerConnect'] === 'function') {
+      (w['__larpscanTriggerConnect'] as () => void)();
     }
 
     if (fireEip6963) {
