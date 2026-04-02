@@ -5,6 +5,8 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { fixWebmDuration } from 'webm-duration-fix-buffer';
 import { connectBrowser, isServerlessRuntime, isBrowserlessMode } from './browser';
+import { generateNarration } from './tts';
+import type { NarrationSegment } from './tts';
 
 const execFileAsync = promisify(execFile);
 import { supabase } from './supabase';
@@ -98,8 +100,62 @@ async function convertWebmToMp4(webmBuffer: Buffer, tag: string): Promise<Buffer
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Types
+// Merge AI narration audio into an existing MP4 buffer.
+//
+// Takes the silent MP4 + an MP3 narration track and mixes them using ffmpeg.
+// The video stream is copied (no re-encode). Audio is encoded as AAC.
+// The output is capped to the video duration (-shortest) so a long narration
+// track never pads the video with extra silent frames.
 // ─────────────────────────────────────────────────────────────────────────────
+
+async function mergeNarrationAudio(
+  mp4Buffer: Buffer,
+  audioBuf:  Buffer,
+  tag:       string,
+): Promise<Buffer> {
+  let ffmpegPath: string;
+  try {
+    ffmpegPath = require('ffmpeg-static') as string;
+  } catch {
+    console.warn(`[${tag}] ffmpeg-static unavailable — skipping narration merge`);
+    return mp4Buffer;
+  }
+
+  const tmpVideo = path.join('/tmp', `${randomUUID()}-video.mp4`);
+  const tmpAudio = path.join('/tmp', `${randomUUID()}-narration.mp3`);
+  const tmpOut   = path.join('/tmp', `${randomUUID()}-merged.mp4`);
+
+  try {
+    await fs.writeFile(tmpVideo, mp4Buffer);
+    await fs.writeFile(tmpAudio, audioBuf);
+
+    await execFileAsync(ffmpegPath, [
+      '-y',
+      '-i',    tmpVideo,
+      '-i',    tmpAudio,
+      '-c:v',  'copy',          // copy video stream — no re-encode
+      '-c:a',  'aac',
+      '-b:a',  '96k',
+      '-map',  '0:v:0',
+      '-map',  '1:a:0',
+      '-shortest',              // trim to video length
+      '-movflags', '+faststart',
+      tmpOut,
+    ], { timeout: 60_000, maxBuffer: 10 * 1024 * 1024 });
+
+    const merged = await fs.readFile(tmpOut);
+    console.log(`[${tag}] Narration merged: ${(mp4Buffer.length / 1024).toFixed(0)}KB → ${(merged.length / 1024).toFixed(0)}KB`);
+    return merged;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[${tag}] Narration merge failed: ${msg.slice(0, 300)}`);
+    return mp4Buffer;
+  } finally {
+    await fs.unlink(tmpVideo).catch(() => {});
+    await fs.unlink(tmpAudio).catch(() => {});
+    await fs.unlink(tmpOut).catch(() => {});
+  }
+}
 
 export interface WalletEvidence {
   walletEnabled:       boolean;
@@ -338,6 +394,7 @@ async function recordInteraction(
   let cdpSession: any = null;
   let recordingStartMs = 0;
   let allObservations: AgentObservation[] = [];
+  let allNarrationSegments: NarrationSegment[] = [];
   let finalPageState: PageState = emptyPageState;
   const runApiCalls: string[] = [];
   let walletOnlyGateDetected = false;
@@ -534,8 +591,10 @@ async function recordInteraction(
         claim,
         passCondition,
         featureType,
+        recordingStartMs,
       });
       allObservations = planAResult.observations;
+      allNarrationSegments.push(...planAResult.narrationSegments);
       attemptMemory = updateAttemptMemory(attemptMemory, planAResult.observations);
     } else {
       probes.push(`Planning returned empty plan — blockers: [${pageState.blockers.join(', ')}]`);
@@ -587,8 +646,10 @@ async function recordInteraction(
           claim,
           passCondition,
           featureType,
+          recordingStartMs,
         });
         allObservations   = [...allObservations, ...planBResult.observations];
+        allNarrationSegments.push(...planBResult.narrationSegments);
         attemptMemory = updateAttemptMemory(attemptMemory, planBResult.observations);
 
         // Wallet popup check after Plan B (only if not already connected)
@@ -711,7 +772,11 @@ async function recordInteraction(
             // Convert to MP4 (H.264) with frequent keyframes for instant seeking.
             const mp4 = await convertWebmToMp4(rawBuffer, 'verifier:record');
             if (mp4) {
-              uploadBuffer = mp4;
+              // Merge AI voice narration if segments were collected and feature is enabled.
+              const narrationBuf = await generateNarration(allNarrationSegments, durationMs);
+              uploadBuffer = narrationBuf
+                ? await mergeNarrationAudio(mp4, narrationBuf, 'verifier:record')
+                : mp4;
               fileName = `${claimId}.mp4`;
               contentType = 'video/mp4';
             } else {

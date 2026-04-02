@@ -19,7 +19,7 @@
  *   Rule 1b  pageJsCrash + reached surface + no positive  → failed      (medium)
  *   Rule 2   bot_protection / geo_blocked / rate_limited  → untestable  (high)
  *   Rule 3   wallet_only_gate + noop ratio ≥ 0.8          → untestable  (high)
- *   Rule 4   DATA_DASHBOARD + tableHeaders + ownApi       → verified    (high)
+ *   Rule 4   DATA_DASHBOARD + (tableHeaders OR ownApi≥5 OR leaderboard API) → verified (high)
  *   Rule 4b  wallet connected + form accessible (UI_FEATURE / DEX+API only) → verified (high)
  *   Rule 4a  wallet_required + formAppeared               → untestable  (high)
  *   Rule 5   auth_required + no form + no CTA             → untestable  (high)
@@ -74,7 +74,14 @@ function hasDashboardViaApi(signals: VerdictSignals): boolean {
   const hasLeaderboardApi = signals.ownDomainApiCalls.some(
     (url) => /\/api\/(leaderboard|ranking|rankings|tokens|token-list|stats|scores)/i.test(url),
   );
-  return hasLeaderboardApi && signals.visibleSignals.length >= 5 && signals.ownDomainApiCalls.length > 0;
+  // Primary path: named leaderboard/ranking API + any visible content
+  if (hasLeaderboardApi && signals.visibleSignals.length >= 2) return true;
+  // Relaxed: named API on homepage-style claims (page loaded before recording → 0 new signals)
+  if (hasLeaderboardApi && signals.ownDomainApiCalls.length >= 2) return true;
+  // Fallback: many own-domain API calls = backend is clearly live and serving data
+  // (catches dApps whose leaderboard API paths don't include standard keywords)
+  if (signals.ownDomainApiCalls.length >= 5) return true;
+  return false;
 }
 
 function isFinalUrlOnDomain(signals: VerdictSignals): boolean {
@@ -291,15 +298,19 @@ const rule4: Rule = {
   evaluate(signals, featureType) {
     if (!signals) return null;
     const dashboardViaApi = hasDashboardViaApi(signals);
+    // Direct path: table headers captured on final page + any own-domain API calls
+    const directTableEvidence =
+      signals.tableHeaders.length > 0 &&
+      signals.ownDomainApiCalls.length > 0;
     if (
       featureType !== 'DATA_DASHBOARD' ||
-      (signals.tableHeaders.length === 0 && !dashboardViaApi) ||
+      (!directTableEvidence && !dashboardViaApi) ||
       signals.ownDomainApiCalls.length === 0 ||
       signals.totalSteps <= 0
     ) {
       if (featureType !== 'DATA_DASHBOARD') {
         console.log(`[verdict:l1] Rule 4 skipped: featureType=${featureType ?? 'UI_FEATURE'} (not DATA_DASHBOARD)`);
-      } else if (signals.tableHeaders.length === 0 && !dashboardViaApi) {
+      } else if (!directTableEvidence && !dashboardViaApi) {
         console.log(`[verdict:l1] Rule 4 skipped: no table headers and no leaderboard API match (ownApi=${signals.ownDomainApiCalls.join(',')}, signals=${signals.visibleSignals.length})`);
       } else {
         console.log('[verdict:l1] Rule 4 skipped: no own-domain API calls');

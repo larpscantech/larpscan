@@ -26,7 +26,6 @@ function RecordingVideo({ src, poster, className }: {
       <video
         src={src}
         controls
-        muted
         playsInline
         preload="auto"
         poster={poster}
@@ -106,7 +105,6 @@ function BufferedWebmVideo({ src, poster, className }: {
     <video
       src={blobUrl}
       controls
-      muted
       playsInline
       poster={poster}
       className={className}

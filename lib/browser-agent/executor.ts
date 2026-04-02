@@ -1,6 +1,7 @@
 import type { Page, BrowserContext } from 'playwright';
 import OpenAI from 'openai';
 import type { AgentObservation, AgentStep, BlockerType, PageMessage, PageState, WorkflowStage } from './types';
+import type { NarrationSegment } from '../tts';
 import { analyzePageState, capturePageText } from './page-analysis';
 import {
   FEE_SHARE_SOCIAL_HANDLE_FILL_TOKEN,
@@ -906,6 +907,7 @@ export interface ExecuteResult {
   observations:      AgentObservation[];
   stopReason:        'completed' | 'blocker' | 'noop_threshold' | 'budget';
   consecutiveNoops:  number;
+  narrationSegments: NarrationSegment[];
 }
 
 const STEP_BUDGET = 15;  // raised from 10 — complex flows need more headroom
@@ -927,9 +929,12 @@ export async function executeSteps(
      *  TOKEN_CREATION: passConditionMet alone is never enough; also requires
      *  a fill_input OR a transaction attempt before the agent can stop early. */
     featureType?: string;
+    /** Unix ms when CDP recording started — used to timestamp narration segments. */
+    recordingStartMs?: number;
   },
 ): Promise<ExecuteResult> {
   const observations: AgentObservation[] = [];
+  const narrationSegments: NarrationSegment[] = [];
   let consecutiveNoops  = 0;
   let adaptiveCallCount = 0;
   const NOOP_THRESHOLD  = 3;
@@ -1362,6 +1367,13 @@ export async function executeSteps(
     builtObs.narrative = buildStepNarrative(builtObs);
     runningNarratives.push(builtObs.narrative);
 
+    if (builtObs.narrative && options?.recordingStartMs) {
+      narrationSegments.push({
+        text:        builtObs.narrative,
+        timestampMs: Math.max(0, Date.now() - options.recordingStartMs),
+      });
+    }
+
     observations.push(builtObs);
 
     const msgLog = stepMessages.length
@@ -1416,7 +1428,7 @@ export async function executeSteps(
       (passConditionMet(options.passCondition, textAfter) || successMessageFound)
     ) {
       console.log('[executor] Pass condition appears met — stopping early');
-      return { observations, stopReason: 'completed', consecutiveNoops };
+      return { observations, stopReason: 'completed', consecutiveNoops, narrationSegments };
     }
 
     if (
@@ -1424,7 +1436,7 @@ export async function executeSteps(
       blockerDetected === 'bot_protection'
     ) {
       console.log(`[executor] Hard blocker encountered: ${blockerDetected} — stopping`);
-      return { observations, stopReason: 'blocker', consecutiveNoops };
+      return { observations, stopReason: 'blocker', consecutiveNoops, narrationSegments };
     }
 
     // Noop threshold: before giving up, try one adaptive LLM decision.
@@ -1446,16 +1458,16 @@ export async function executeSteps(
         }
       }
       console.log('[executor] No-op threshold reached — stopping for replanning');
-      return { observations, stopReason: 'noop_threshold', consecutiveNoops };
+      return { observations, stopReason: 'noop_threshold', consecutiveNoops, narrationSegments };
     }
 
     if (observations.length >= STEP_BUDGET) {
       console.log(`[executor] Step budget exhausted (${STEP_BUDGET} steps)`);
-      return { observations, stopReason: 'budget', consecutiveNoops };
+      return { observations, stopReason: 'budget', consecutiveNoops, narrationSegments };
     }
   }
 
-  return { observations, stopReason: 'completed', consecutiveNoops };
+  return { observations, stopReason: 'completed', consecutiveNoops, narrationSegments };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

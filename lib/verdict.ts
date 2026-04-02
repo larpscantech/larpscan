@@ -181,12 +181,15 @@ CRITICAL RULES
   retried from homepage. Reduce your confidence slightly but do not fail the claim.
 - No-op actions alone never justify LARP — explain what the no-ops most likely mean.
 - JavaScript errors in page text (TypeError, ReferenceError, etc.) — follow this logic:
-  (a) If a JS error is present AND the claimed feature's content is ABSENT (no table, no leaderboard,
-      no data rendered) → return FAILED. The JS error explains WHY the feature content is missing.
-      This is a broken implementation, NOT evidence the feature doesn't exist (NOT LARP).
-  (b) If a JS error is present BUT positive signals also exist (API calls, partial UI, table headers)
+  (a) If a JS error is present AND Feature type is DATA_DASHBOARD AND own-domain API calls > 0
+      → return VERIFIED. The backend responded with data; the JS error is from a non-critical
+      component (wallet hook, analytics, third-party widget) and did NOT prevent data from rendering.
+  (b) If a JS error is present AND the claimed feature's content is ABSENT (no table, no leaderboard,
+      no data rendered) AND no own-domain API calls → return FAILED. The JS error explains WHY
+      the feature content is missing. This is a broken implementation, NOT LARP.
+  (c) If a JS error is present BUT positive signals also exist (API calls, partial UI, table headers)
       → treat the JS error as background noise and focus on the positive signals.
-  (c) NEVER return LARP based solely on a JS error with no other evidence — if a JS error
+  (d) NEVER return LARP based solely on a JS error with no other evidence — if a JS error
       prevented the feature from rendering, that is FAILED (broken), not LARP (doesn't exist).
 - Server-side / infrastructure errors (ENOENT, mkdir, EPERM, spawn, /var/task/, 500 Internal Server Error):
   These are errors thrown by the TARGET SITE's own backend, not by our testing tool.
@@ -429,11 +432,20 @@ function buildSignalContext(
     lines.push(
       `⚠ JavaScript crash detected: ${signals.pageJsCrashMessage?.slice(0, 150) ?? 'unhandled runtime error'}`,
     );
-    lines.push(
-      'NOTE: This is a bug in the site code, NOT evidence the feature is absent. ' +
-      'If positive signals exist despite the crash, lean toward VERIFIED/UNTESTABLE. ' +
-      'If no positive signals, return FAILED (broken implementation).',
-    );
+    if (featureType === 'DATA_DASHBOARD' && signals.ownDomainApiCalls.length > 0) {
+      lines.push(
+        'DIRECTIVE: This is a DATA_DASHBOARD claim with active own-domain API calls. ' +
+        'The JS error is from a non-critical component (e.g. wallet hook, analytics widget) ' +
+        'and did NOT prevent the dashboard data from loading — own-domain API calls prove the backend responded. ' +
+        'Return VERIFIED. Do NOT return FAILED based on this JS error.',
+      );
+    } else {
+      lines.push(
+        'NOTE: This is a bug in the site code, NOT evidence the feature is absent. ' +
+        'If positive signals exist despite the crash, lean toward VERIFIED/UNTESTABLE. ' +
+        'If no positive signals, return FAILED (broken implementation).',
+      );
+    }
   }
 
   return lines.join('\n');
