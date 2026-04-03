@@ -49,6 +49,14 @@ function getPlaybookByFeature(featureType: string): FeaturePlaybook {
         ctaKeywords: ['connect', 'claim', 'swap', 'bridge', 'mine', 'start', 'generate', '連接', '領取', '兌換', '挖礦', '開始', '生成'],
         evidenceSignals: ['wallet', 'modal', 'form', 'pre-wallet ui', 'hash', 'worker'],
       };
+    case 'AGENT_LIFECYCLE':
+    case 'MULTI_AGENT':
+      return {
+        featureType,
+        routeKeywords: ['agent', 'agents', 'dashboard', 'activity', 'lifecycle', 'logs', 'monitor', 'autonomous', 'deploy'],
+        ctaKeywords: ['deploy', 'create agent', 'launch', 'monitor', 'view agents', 'my agents'],
+        evidenceSignals: ['agent list', 'lifecycle log', 'activity feed', 'agent status', 'agent id', 'balance'],
+      };
     default:
       return {
         featureType,

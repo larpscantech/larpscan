@@ -18,6 +18,7 @@
  *   Rule 1   !siteLoaded                                  → failed      (high)
  *   Rule 1b  pageJsCrash + reached surface + no positive  → failed      (medium)
  *   Rule 2   bot_protection / geo_blocked / rate_limited  → untestable  (high)
+ *   Rule 2b  AGENT_LIFECYCLE / MULTI_AGENT + no UI evidence → untestable (high)
  *   Rule 3   wallet_only_gate + noop ratio ≥ 0.8          → untestable  (high)
  *   Rule 4   DATA_DASHBOARD + (tableHeaders OR ownApi≥5 OR leaderboard API) → verified (high)
  *   Rule 4b  wallet connected + form accessible (UI_FEATURE / DEX+API only) → verified (high)
@@ -261,6 +262,43 @@ const rule2: Rule = {
       matchedRule:   `${this.name} (${found})`,
       blockerReason: `Blocked by ${label}`,
       reasons:       [`Automation blocker detected during interaction: ${found}`],
+    };
+  },
+};
+
+// Rule 2b: claim describes backend/runtime behavior that cannot be observed
+// through UI interaction (e.g. agent lifecycle loops, child agent spawning,
+// autonomous balance monitoring). Return UNTESTABLE immediately — not FAILED.
+const rule2b: Rule = {
+  name: 'Rule 2b: claim_describes_unobservable_backend_behavior',
+  evaluate(signals, featureType) {
+    if (!signals || signals.totalSteps <= 0) return null;
+    const isBackendClaim = featureType === 'AGENT_LIFECYCLE' || featureType === 'MULTI_AGENT';
+    if (!isBackendClaim) return null;
+
+    // If the agent observed meaningful UI evidence, let later rules and LLM decide.
+    const hasObservableEvidence =
+      signals.formAppeared ||
+      signals.reachedRelevantSurface ||
+      signals.ownDomainApiCalls.length > 0 ||
+      signals.tableHeaders.length > 0 ||
+      signals.modalOpened;
+
+    if (hasObservableEvidence) return null;
+
+    console.log('[verdict] Rule 2b MATCH — claim describes unobservable backend runtime behavior');
+    return {
+      resolved:      true,
+      verdict:       'untestable',
+      confidence:    'high',
+      matchedRule:   this.name,
+      blockerReason: 'Claim describes server-side runtime behavior not observable via browser',
+      reasons: [
+        'This claim describes backend agent lifecycle behavior (autonomous loops, child spawning, balance monitoring, model upgrades)',
+        'These behaviors run on backend infrastructure and cannot be directly observed or confirmed through UI interaction alone',
+        'No dedicated UI surface showing agent activity logs or lifecycle state was found',
+        'The feature may be real but requires server-side access to verify',
+      ],
     };
   },
 };
@@ -529,7 +567,7 @@ const rule7: Rule = {
 const RULES: Rule[] = [
   rule0a, rule0b, rule0c, rule0,
   rule1, rule1b,
-  rule2, rule3,
+  rule2, rule2b, rule3,
   rule4, rule4b, rule4a,
   rule5, rule6, rule7,
 ];

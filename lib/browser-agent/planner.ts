@@ -249,14 +249,26 @@ export async function planWorkflow(
   console.log('[planner] Blockers:', pageState.blockers);
   console.log('[planner] Route candidates:', pageState.routeCandidates);
 
-  // Hard early-return conditions
+  // Hard early-return conditions.
+  // auth_required only hard-stops when there is truly NO interactive UI — if CTAs
+  // or buttons are visible the agent can still demonstrate the feature surface.
+  const hasVisibleUi =
+    pageState.ctaCandidates.length > 0 ||
+    pageState.buttons.filter((b) => !b.disabled).length > 0 ||
+    pageState.forms.length > 0;
+
   const hardStop =
-    (pageState.blockers.includes('auth_required') && pageState.forms.length === 0 && pageState.buttons.filter(b => !b.disabled).length === 0) ||
+    (pageState.blockers.includes('auth_required') && !hasVisibleUi) ||
     pageState.blockers.includes('page_broken') ||
     pageState.blockers.includes('bot_protection');
 
   if (hardStop) {
-    console.log('[planner] Hard stop — returning empty plan');
+    console.log('[planner] Hard stop — returning empty plan', {
+      auth_required: pageState.blockers.includes('auth_required'),
+      page_broken:   pageState.blockers.includes('page_broken'),
+      bot_protection: pageState.blockers.includes('bot_protection'),
+      hasVisibleUi,
+    });
     return [];
   }
 
@@ -594,6 +606,9 @@ If a field explicitly expects a 0x wallet address as fee recipient (not @usernam
     case 'API_FEATURE':
     case 'api+fetch':
       return 'PRIORITY: Navigate to the feature surface → look for API endpoint documentation, interactive demos, or direct endpoint responses.';
+    case 'AGENT_LIFECYCLE':
+    case 'MULTI_AGENT':
+      return 'PRIORITY: Navigate to the agents/dashboard/activity surface → look for a list of active agents, lifecycle logs, activity feeds, or agent status indicators. If a "Deploy Agent" or "Create Agent" button is visible, click it to show the deployment form exists. Stop before any transaction submission.';
     default:
       return 'PRIORITY: Navigate to the most relevant page for this claim → interact with primary CTAs → observe state changes.';
   }

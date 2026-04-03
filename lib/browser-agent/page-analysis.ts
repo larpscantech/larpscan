@@ -676,6 +676,14 @@ export async function analyzePageState(
   // ── Blocker detection ─────────────────────────────────────────────────────
   let blockers = detectBlockers(visibleText, visibleText.length);
 
+  // Suppress false-positive page_broken when the page has clearly rendered
+  // (headings or interactive buttons present = JS ran, DOM is populated).
+  // page_broken fires when visibleText.length < 20 which can happen for SPAs
+  // whose innerText is captured before React hydration completes.
+  if (blockers.includes('page_broken') && (headings.length > 0 || buttons.length > 0)) {
+    blockers = blockers.filter((b) => b !== 'page_broken');
+  }
+
   // If the wallet address is already visible in the DOM (navbar shows "0x1b..."),
   // the site considers the wallet connected — suppress the wallet_required blocker
   // so the planner doesn't waste steps trying to re-connect.
