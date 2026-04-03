@@ -635,6 +635,10 @@ SPECIFIC ERROR RECOVERY:
 - If you see "transaction value exceeds safety limit" or "exceeds safety limit" →
   find the "Dev Buy" or any optional purchase-amount input field and set its value to "0",
   then click the submit/create button again. The dev buy is optional and can be skipped.
+- If you see "already exists" (e.g. "A soul for @X already exists") →
+  the input field currently contains a new handle value that hasn't been submitted yet.
+  Click the submit/Preview button immediately — do NOT fill the field again.
+  If the new value was also rejected, fill the handle field with "testuser" then click Preview.
 
 Return the single best next action as JSON:
   {"action":"click_text","text":"<exact button label>"}
