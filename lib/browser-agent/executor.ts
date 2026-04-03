@@ -1349,6 +1349,34 @@ export async function executeSteps(
       consecutiveNoops = 0;
     }
 
+    // ── Deterministic "already exists" handle recovery ───────────────────────
+    // fill_input is an intrinsicProgressAction so it never enters the noop
+    // block above. That means the LLM-based error recovery never fires after
+    // a handle fill — and on the next iteration the LLM sees the stale "already
+    // exists" error and fills yet another handle instead of clicking Preview.
+    // Bypass the LLM entirely: if we just filled an input and the page is still
+    // showing an "already exists" error, find the submit/Preview button and
+    // inject a click step immediately.
+    if (
+      step.action === 'fill_input' &&
+      stepSucceeded &&
+      stepsToRun.length === 0 &&
+      stepMessages.some((m) => /already\s+exists/i.test(m.text))
+    ) {
+      const submitBtnText = await page.$$eval(
+        'button:not([disabled]), [role="button"]:not([aria-disabled="true"])',
+        (els) => {
+          const submitRe = /^(preview|submit|create|launch|mint|deploy|confirm|next|continue|go|search)$/i;
+          const el = els.find((e) => submitRe.test((e.textContent ?? '').replace(/\s+/g, ' ').trim()));
+          return el ? (el.textContent ?? '').replace(/\s+/g, ' ').trim() : null;
+        },
+      ).catch(() => null);
+      if (submitBtnText) {
+        stepsToRun.unshift({ action: 'click_text', text: submitBtnText });
+        console.log(`[executor] "already exists" recovery: injecting click_text("${submitBtnText}")`);
+      }
+    }
+
     // ── Handle modal auto-fill if modal opened ───────────────────────────────
     let modalFilled: string[] = [];
     if (modalOpened) {

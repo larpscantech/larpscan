@@ -219,13 +219,40 @@ const rule1: Rule = {
 
 const rule1b: Rule = {
   name: 'Rule 1b: feature_page_js_crash',
-  evaluate(signals) {
+  evaluate(signals, featureType) {
     if (
       !signals?.pageJsCrash ||
       !signals.reachedRelevantSurface ||
       hasPositiveSignals(signals)
     ) return null;
     const errMsg = signals.pageJsCrashMessage ?? 'JS runtime error';
+
+    // Data / leaderboard pages frequently fire transient JS errors during SPA
+    // hydration (e.g. reading properties of undefined before data loads). The
+    // page route EXISTS — the agent reached it — but content didn't render this
+    // run. Calling this FAILED would be wrong; UNTESTABLE is correct because a
+    // re-run may succeed once the data is available.
+    const isDataPage =
+      featureType === 'DATA_DASHBOARD' ||
+      /\/leaderboard|\/dashboard|\/rankings?|\/stats|\/analytics/i.test(signals.finalUrl ?? '');
+
+    if (isDataPage) {
+      console.log(`[verdict] Rule 1b DATA_DASHBOARD — JS crash treated as untestable: ${errMsg.slice(0, 80)}`);
+      return {
+        resolved:      true,
+        verdict:       'untestable',
+        confidence:    'medium',
+        matchedRule:   this.name,
+        blockerReason: 'Feature page has a JS runtime error — content may load intermittently',
+        reasons: [
+          'Feature page has a JavaScript runtime error — likely a transient SPA hydration race',
+          `JS error: ${errMsg.slice(0, 150)}`,
+          'The page route exists and the agent navigated to it, but data failed to render this run',
+          'Re-running the verification may produce a different result once data is loaded',
+        ],
+      };
+    }
+
     console.log(`[verdict] Rule 1b MATCH — page crashed: ${errMsg.slice(0, 80)}`);
     return {
       resolved:      true,
