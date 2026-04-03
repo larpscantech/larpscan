@@ -710,6 +710,101 @@ Rules:
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// maybeReviseRemainingSteps
+//
+// Visual mid-plan revision: after a significant state change (URL navigation or
+// modal open), capture a screenshot and ask GPT-4o-mini whether the remaining
+// planned steps are still correct given what the page now looks like.
+//
+// If the model returns a revised set of steps, the caller replaces the queue.
+// If null is returned (steps still valid, or revision failed), the caller
+// keeps the existing queue unchanged.
+//
+// This is a lightweight gpt-4o-mini call (~400ms, <$0.0002) and fires at most
+// once per plan execution to keep costs bounded.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function maybeReviseRemainingSteps(
+  page:           Page,
+  remainingSteps: AgentStep[],
+  latestObs:      AgentObservation,
+  claim:          string,
+  featureType:    string,
+): Promise<AgentStep[] | null> {
+  if (remainingSteps.length < 2) return null;  // not worth revising 0-1 steps
+
+  let screenshotBuf: Buffer | null = null;
+  try {
+    screenshotBuf = await page.screenshot({ type: 'jpeg', quality: 50, fullPage: false });
+  } catch { return null; }
+
+  if (!screenshotBuf) return null;
+
+  const screenshotDataUrl = `data:image/jpeg;base64,${screenshotBuf.toString('base64')}`;
+  const remainingJson = JSON.stringify(remainingSteps, null, 2);
+
+  const SYSTEM = `You are a QA agent reviewing a mid-execution test plan. 
+The test was verifying this claim: "${claim}" (feature type: ${featureType}).
+
+After the last step, the page changed significantly (navigation or modal). 
+A screenshot of the current page is attached.
+
+The remaining planned steps are below. Your job is to decide if they are STILL CORRECT 
+given what you see on screen, or if they need to be revised to match the new page state.
+
+RULES:
+- If the remaining steps look correct for this page → return the EXACT same steps unchanged
+- If 1-2 steps are wrong (e.g. a button label changed, a modal is now open) → fix only those steps
+- If the plan is completely wrong for this page → return a new 3-5 step plan
+- NEVER add more than 5 steps total
+- Only use actions: navigate, click_text, scroll, fill_input, open_link_text, check_text
+- NEVER invent CSS selectors — only use ones visible in the page text or accessibility tree
+- Return ONLY a JSON array of steps: [{...}, {...}] — no explanation, no markdown`;
+
+  const userText = `Remaining steps to review:\n${remainingJson}\n\nWhat happened just now: ${latestObs.narrative ?? latestObs.result}\nCurrent URL: ${latestObs.url ?? 'unknown'}`;
+
+  type ContentPart = { type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string; detail: 'low' } };
+  const userContent: ContentPart[] = [
+    { type: 'text', text: userText },
+    { type: 'image_url', image_url: { url: screenshotDataUrl, detail: 'low' } },
+  ];
+
+  try {
+    const resp = await AgentStepExecutor.getAdaptiveClient().chat.completions.create({
+      model:       'gpt-4o-mini',
+      temperature: 0,
+      max_tokens:  500,
+      messages: [
+        { role: 'system', content: SYSTEM },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        { role: 'user',   content: userContent as any },
+      ],
+    });
+
+    const raw = (resp.choices[0]?.message?.content ?? '').trim();
+    if (!raw) return null;
+
+    // Parse: accept bare array or { steps: [...] }
+    let parsed: unknown;
+    try { parsed = JSON.parse(raw); } catch { return null; }
+
+    const arr: AgentStep[] = Array.isArray(parsed)
+      ? parsed as AgentStep[]
+      : (parsed as { steps?: AgentStep[] }).steps ?? [];
+
+    if (!Array.isArray(arr) || arr.length === 0) return null;
+
+    const valid = arr.filter((s): s is AgentStep => !!s?.action).slice(0, 5);
+    if (valid.length === 0) return null;
+
+    console.log(`[executor] Mid-plan visual revision: ${remainingSteps.length} → ${valid.length} step(s)`);
+    return valid;
+  } catch {
+    return null;  // never block on a revision failure
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // detectNewFormFields
 //
 // After a scroll step reveals new content, scan for form inputs that weren't
@@ -946,6 +1041,10 @@ export async function executeSteps(
   // TOKEN_CREATION ReAct switch flag: set to true after we land on a form surface,
   // at which point the static plan is discarded and every step is decided adaptively.
   let reactSwitchActivated = false;
+
+  // Mid-plan visual revision flag — fired at most once per executeSteps call to
+  // keep GPT-4o-mini costs bounded. Reset each time executeSteps is called.
+  let midPlanRevisionUsed = false;
 
   // Running narrative — one entry per executed step, built with buildStepNarrative().
   // Passed to decideAdaptiveStep so the LLM knows what has happened AND what the
@@ -1383,6 +1482,32 @@ export async function executeSteps(
       `[executor] → urlChanged=${urlChanged} modal=${modalOpened} noops=${consecutiveNoops} ` +
       `apiCalls=${stepApiCalls.length} signals=${visibleSignals.length} noop=${isNoop}${msgLog}`,
     );
+
+    // ── Mid-plan visual revision ─────────────────────────────────────────────
+    // After a significant state change (navigation or modal open), take a
+    // screenshot and ask GPT-4o-mini if the remaining planned steps still make
+    // sense given what the page now looks like. Fires at most once per plan to
+    // keep cost bounded. Only triggers when there are 2+ remaining steps to revise.
+    if (
+      (urlChanged || modalOpened) &&
+      !isNoop &&
+      stepsToRun.length >= 2 &&
+      !midPlanRevisionUsed &&
+      options?.claim &&
+      options?.featureType
+    ) {
+      midPlanRevisionUsed = true;
+      const revised = await maybeReviseRemainingSteps(
+        page,
+        [...stepsToRun],
+        builtObs,
+        options.claim,
+        options.featureType,
+      ).catch(() => null);
+      if (revised) {
+        stepsToRun.splice(0, stepsToRun.length, ...revised);
+      }
+    }
 
     // ── Stopping rules ───────────────────────────────────────────────────────
 

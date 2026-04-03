@@ -3,6 +3,8 @@ import type { AgentObservation, AgentStep, AttemptMemory, PageState } from './ty
 import { FEE_SHARE_SOCIAL_HANDLE_FILL_TOKEN, INVESTIGATION_WALLET_FILL_TOKEN } from './constants';
 import { getFeaturePlaybook, rankCtaCandidates, rankRouteCandidates } from './playbooks';
 import { buildWorkflowHypothesis } from './workflow';
+import { formatRunMemoryContext } from './run-memory';
+import type { RunMemory } from './run-memory';
 
 function countSemanticNoops(memory: AttemptMemory | undefined, prefix: string): number {
   if (!memory) return 0;
@@ -244,6 +246,9 @@ export async function planWorkflow(
   /** JPEG data URL of the current page — gives the LLM visual context so it
    *  plans like a human who SEES the page, not just reads its text. */
   pageScreenshotDataUrl?: string,
+  /** Accumulated knowledge from Plan A — injected as RUN CONTEXT so the planner
+   *  knows what was already discovered (visited routes, auth status, wallet state). */
+  runMemory?: RunMemory,
 ): Promise<AgentStep[]> {
   console.log('[planner] Planning workflow...');
   console.log('[planner] Blockers:', pageState.blockers);
@@ -309,6 +314,8 @@ export async function planWorkflow(
     ? `\nWALLET STATUS: ALREADY CONNECTED (address: ${connectedWalletAddress}). The investigation wallet is live in the browser. DO NOT plan any "Connect Wallet", "connect wallet", or wallet-modal steps — the wallet is connected and those steps will be no-ops. Skip directly to interacting with the feature (fill forms, click CTAs, observe results).\n`
     : '';
 
+  const runMemoryNote = runMemory ? formatRunMemoryContext(runMemory) : '';
+
   const systemPrompt = `${BASE_SYSTEM}
 
 FEATURE CONTEXT:
@@ -316,7 +323,7 @@ Feature type: ${featureType}
 Verification strategy: ${strategy}
 Configured surface: ${surface}
 ${walletConnectedNote}
-${featureGuidance}
+${runMemoryNote ? `${runMemoryNote}\n` : ''}${featureGuidance}
 
 PLANNING RULES:
 1. Treat this claim as a complete workflow: navigate → interact → observe result
@@ -407,6 +414,10 @@ export async function replanWorkflow(
   priorObservations: AgentObservation[],
   memory?:          AttemptMemory,
   connectedWalletAddress?: string,
+  /** Knowledge accumulated from Plan A — avoids replanning dead routes */
+  runMemory?: RunMemory,
+  /** JPEG screenshot of the current page for visual grounding of the recovery plan */
+  pageScreenshotDataUrl?: string,
 ): Promise<AgentStep[]> {
   console.log('[planner] Replanning — generating recovery plan...');
 
@@ -439,13 +450,15 @@ ${connectedWalletAddress ? `Connected wallet: ${connectedWalletAddress}. For exp
     ? `\nWALLET STATUS: ALREADY CONNECTED (address: ${connectedWalletAddress}). DO NOT plan wallet-connection steps — skip directly to the feature workflow.\n`
     : '';
 
+  const runMemoryNoteReplan = runMemory ? formatRunMemoryContext(runMemory) : '';
+
   const systemPrompt = `${BASE_SYSTEM}
 
 FEATURE CONTEXT:
 Feature type: ${featureType}
 Verification strategy: ${strategy}
 Configured surface: ${surface}
-${walletConnectedNoteReplan}${tokenVaultRecovery}
+${walletConnectedNoteReplan}${runMemoryNoteReplan ? `${runMemoryNoteReplan}\n` : ''}${tokenVaultRecovery}
 RECOVERY PLANNING RULES:
 1. The previous steps produced no meaningful progress — try a DIFFERENT approach
 2. Maximum 5 steps
@@ -492,7 +505,7 @@ RECOVERY PLANNING RULES:
       : (untriedCta ? { action: 'click_text', text: untriedCta.text } : undefined);
   }
 
-  const userMessage = [
+  const userMessageText = [
     `Claim: ${claim}`,
     `Pass condition: ${passCondition}`,
     '',
@@ -508,7 +521,19 @@ RECOVERY PLANNING RULES:
     '',
     'UPDATED PAGE STATE:',
     formatPageContext(updatedPageState),
+    pageScreenshotDataUrl ? '\nA screenshot of the current page is attached. Study it before choosing a recovery approach.' : '',
   ].join('\n');
+
+  type ReplanContentPart =
+    | { type: 'text'; text: string }
+    | { type: 'image_url'; image_url: { url: string; detail: 'low' } };
+
+  const userContent: ReplanContentPart[] | string = pageScreenshotDataUrl
+    ? [
+        { type: 'text', text: userMessageText },
+        { type: 'image_url', image_url: { url: pageScreenshotDataUrl, detail: 'low' } },
+      ]
+    : userMessageText;
 
   try {
     const resp = await getOpenAI().chat.completions.create({
@@ -518,7 +543,8 @@ RECOVERY PLANNING RULES:
       response_format: { type: 'json_object' },
       messages: [
         { role: 'system', content: systemPrompt },
-        { role: 'user',   content: userMessage },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        { role: 'user',   content: userContent as any },
       ],
     });
 

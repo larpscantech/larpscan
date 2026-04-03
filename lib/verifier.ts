@@ -20,7 +20,10 @@ import {
   injectWalletMockIntoContext,
   dismissConsentBanner,
 } from './browser-agent';
+import type { Page } from 'playwright';
 import type { AgentObservation, AttemptMemory, PageState } from './browser-agent/types';
+import { createRunMemory, updateRunMemory } from './browser-agent/run-memory';
+import type { RunMemory } from './browser-agent/run-memory';
 import { buildSignals } from './verdict-signals';
 import type { VerdictSignals } from './verdict-signals';
 import {
@@ -356,6 +359,23 @@ async function analyzeWebsite(baseUrl: string): Promise<AnalysisResult> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// waitForPageStability — ensures the DOM has hydrated before analyzePageState.
+//
+// SPAs (React/Next.js) render an empty body until JavaScript runs. If we call
+// analyzePageState immediately after navigation the page state snapshot may
+// capture empty forms/buttons, triggering false auth_required hard-stops.
+// This helper waits for either networkidle OR any visible heading/button —
+// whichever comes first — capping the wait at 2s so it never blocks long.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function waitForPageStability(page: Page): Promise<void> {
+  await Promise.race([
+    page.waitForLoadState('networkidle', { timeout: 2000 }),
+    page.waitForSelector('button, h1, h2', { timeout: 2000 }),
+  ]).catch(() => {});
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Session 2 — Interaction recording
 // Planning happens here in the live recording session so the planner always
 // sees the true rendered DOM state, not a stale Session 1 snapshot.
@@ -373,6 +393,7 @@ async function recordInteraction(
   strategy:      string,
   recordingsDir: string,
   sessionId:     string,
+  runMemory:     RunMemory,
 ): Promise<RecordingResult> {
   const probes: string[] = [];
   let videoUrl: string | undefined;
@@ -533,6 +554,9 @@ async function recordInteraction(
 
     // ── Phase 1: Live page analysis + Plan A ────────────────────────────────
     console.log('[verifier:record] Analyzing page state...');
+    // Wait for the DOM to hydrate before snapshotting — prevents false empty
+    // forms/buttons on SPAs that render after JS runs.
+    await waitForPageStability(page);
     // Pass the wallet address when connected so analyzePageState can suppress
     // the wallet_required blocker when the address is already visible in the DOM.
     const pageState = await analyzePageState(
@@ -573,6 +597,7 @@ async function recordInteraction(
       claim, passCondition, featureType, surface, strategy, pageState,
       walletAddress ?? undefined,
       planningScreenshotDataUrl,
+      runMemory,
     );
     console.log(`[verifier:record] Plan A: ${planA.length} step(s)`);
 
@@ -622,16 +647,31 @@ async function recordInteraction(
     if (shouldReplan) {
       console.log('[verifier:record] Replanning threshold reached — generating Plan B...');
 
+      // Build RunMemory from Plan A observations so Plan B knows what was already tried.
+      updateRunMemory(runMemory, allObservations, featureType, walletConnectedAny);
+
+      await waitForPageStability(page);
+
       const updatedPageState = await analyzePageState(
         page,
         walletConnectedAny ? walletAddress ?? undefined : undefined,
       );
       updatedPageState.apiSignals = [...runApiCalls];
 
+      // Capture a screenshot for the recovery planner so it reasons visually
+      // about the current page state, not just DOM text.
+      let replanScreenshotDataUrl: string | undefined;
+      try {
+        const buf = await page.screenshot({ type: 'jpeg', quality: 60, fullPage: false });
+        replanScreenshotDataUrl = `data:image/jpeg;base64,${buf.toString('base64')}`;
+      } catch { /* non-fatal */ }
+
       const planB = await replanWorkflow(
         claim, passCondition, featureType, surface, strategy,
         updatedPageState, allObservations, attemptMemory,
         walletAddress ?? undefined,
+        runMemory,
+        replanScreenshotDataUrl,
       );
 
       if (planB.length > 0) {
@@ -927,6 +967,7 @@ export async function verifyClaim(
     effectiveStrategy,
     recordingsDir,
     sessionId,
+    createRunMemory(),
   );
 
   // Collect any on-chain transaction hashes submitted during verification
