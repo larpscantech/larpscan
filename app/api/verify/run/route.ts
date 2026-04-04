@@ -39,7 +39,19 @@ export const POST = withErrorHandler(async (req: Request) => {
     return ok({ runId, results: [], message: 'No website to verify' });
   }
 
-  // ── Fetch pending claims ──────────────────────────────────────────────────
+  const { data: checkingClaims } = await supabase
+    .from('claims')
+    .select('*')
+    .eq('verification_run_id', runId)
+    .eq('status', 'checking')
+    .order('created_at', { ascending: true })
+    .returns<DbClaim[]>();
+
+  if (checkingClaims?.length) {
+    return ok({ runId, results: [], message: 'A claim is already running' });
+  }
+
+  // ── Fetch next pending claim only ─────────────────────────────────────────
   const { data: claims } = await supabase
     .from('claims')
     .select('*')
@@ -58,25 +70,37 @@ export const POST = withErrorHandler(async (req: Request) => {
   await log(runId, `Browser verification starting — ${claims.length} claim(s)`);
   await log(runId, `Target: ${project.website}`);
 
-  // ── Dispatch each claim to its own Lambda ─────────────────────────────────
-  // Each /api/verify/claim invocation gets its own 300s timeout, so even
-  // 10 claims won't cause a single-function timeout.
+  // ── Dispatch exactly one claim ────────────────────────────────────────────
+  // Running claims sequentially removes cross-claim contention (Browserless,
+  // OpenAI, wallet mock state, Supabase writes) and stops "pending" claims
+  // from aging out before they even start.
   const origin = new URL((req as NextRequest).url).origin;
+  const claim = claims[0];
+  await log(runId, `Dispatching claim: ${claim.claim}`);
 
-  for (const [idx, claim] of claims.entries()) {
-    await log(runId, `Claim ${String(idx + 1).padStart(2, '0')}: ${claim.claim}`);
+  // Claim the row before dispatch so duplicate /api/verify/run calls cannot
+  // start the same claim twice.
+  const { data: claimed } = await supabase
+    .from('claims')
+    .update({ status: 'checking' })
+    .eq('id', claim.id)
+    .eq('status', 'pending')
+    .select('*')
+    .single<DbClaim>();
 
-    // Fire-and-forget — we don't await the response.
-    fetch(`${origin}/api/verify/claim`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ runId, claimId: claim.id }),
-    }).catch((e) => {
-      console.error(`[verify/run] Failed to dispatch claim ${claim.id}:`, e);
-    });
+  if (!claimed) {
+    return ok({ runId, results: [], message: 'Claim was already claimed by another worker' });
   }
 
-  console.log(`[verify/run] Dispatched ${claims.length} claim(s) for run ${runId}`);
+  fetch(`${origin}/api/verify/claim`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ runId, claimId: claim.id }),
+  }).catch((e) => {
+    console.error(`[verify/run] Failed to dispatch claim ${claim.id}:`, e);
+  });
+
+  console.log(`[verify/run] Dispatched claim ${claim.id} for run ${runId}`);
 
   // Return immediately — the frontend polls /api/verify/status for progress.
   // Return empty results array for backward compatibility.

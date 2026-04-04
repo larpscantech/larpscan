@@ -44,8 +44,9 @@ export const POST = withErrorHandler(async (req: Request) => {
 
   console.log(`[verify/claim] ══ ${claim.claim.slice(0, 60)} ══`);
 
-  // ── Mark as checking ──────────────────────────────────────────────────────
-  await supabase.from('claims').update({ status: 'checking' }).eq('id', claimId);
+  // ── Mark as checking if still pending, and record actual start time ───────
+  await supabase.from('claims').update({ status: 'checking' }).eq('id', claimId).eq('status', 'pending');
+  await log(runId, `claim-start:${claimId}`);
 
   let evidenceSummary   = 'No evidence collected';
   let screenshotDataUrl: string | undefined;
@@ -83,7 +84,7 @@ export const POST = withErrorHandler(async (req: Request) => {
       await supabase.from('claims').update({ status: fastVerdict }).eq('id', claimId);
       await saveEvidence(claimId, evidenceSummary, fastVerdict, 'Site unreachable or bot-blocked', 'high', screenshotDataUrl);
       await log(runId, `verdict → ${fastVerdict.toUpperCase()} (high confidence)`);
-      await maybeCompleteRun(runId);
+      await maybeCompleteRun(runId, new URL((req as NextRequest).url).origin);
       return ok({ claimId, verdict: fastVerdict, confidence: 'high' });
     }
   } catch (e) {
@@ -130,17 +131,17 @@ export const POST = withErrorHandler(async (req: Request) => {
     await log(runId, `Transaction was attempted but not broadcast (insufficient BNB for gas)`);
   }
 
-  await maybeCompleteRun(runId);
+  await maybeCompleteRun(runId, new URL((req as NextRequest).url).origin);
 
   return ok({ claimId, verdict: verdict.verdict, confidence: verdict.confidence });
 });
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-async function maybeCompleteRun(runId: string) {
+async function maybeCompleteRun(runId: string, origin: string) {
   const { data: remaining } = await supabase
     .from('claims')
-    .select('id, status, created_at')
+    .select('id, status')
     .eq('verification_run_id', runId)
     .in('status', ['pending', 'checking']);
 
@@ -154,35 +155,16 @@ async function maybeCompleteRun(runId: string) {
     return;
   }
 
-  // Safety: if claims have been stuck in 'pending' or 'checking' for too long,
-  // they likely had their Lambda dropped or crashed. Mark them as failed so
-  // the run can eventually complete instead of hanging forever.
-  const now = Date.now();
-  for (const claim of remaining) {
-    const age = now - new Date(claim.created_at).getTime();
-    const stuckPending  = claim.status === 'pending'  && age > 5 * 60 * 1000;
-    const stuckChecking = claim.status === 'checking' && age > 7 * 60 * 1000;
-    if (stuckPending || stuckChecking) {
-      console.warn(`[verify/claim] Claim ${claim.id} stuck in ${claim.status} for ${Math.round(age / 1000)}s — marking as failed`);
-      await supabase.from('claims').update({ status: 'failed' }).eq('id', claim.id);
-      await log(runId, `Claim timed out in ${claim.status} state (Lambda may have been dropped or crashed)`);
-    }
-  }
-
-  // Re-check after marking stuck claims
-  const { data: stillRemaining } = await supabase
-    .from('claims')
-    .select('id')
-    .eq('verification_run_id', runId)
-    .in('status', ['pending', 'checking']);
-
-  if (!stillRemaining?.length) {
-    await supabase
-      .from('verification_runs')
-      .update({ status: 'complete' })
-      .eq('id', runId);
-    await log(runId, 'Verification complete (some claims timed out)');
-    console.log('[verify/claim] All claims resolved (with timeouts) — run marked complete');
+  const hasChecking = remaining.some((c) => c.status === 'checking');
+  const hasPending  = remaining.some((c) => c.status === 'pending');
+  if (!hasChecking && hasPending) {
+    fetch(`${origin}/api/verify/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runId }),
+    }).catch((e) => {
+      console.error(`[verify/claim] Failed to dispatch next claim for run ${runId}:`, e);
+    });
   }
 }
 
