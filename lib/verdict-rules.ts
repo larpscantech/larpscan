@@ -220,24 +220,34 @@ const rule1: Rule = {
 const rule1b: Rule = {
   name: 'Rule 1b: feature_page_js_crash',
   evaluate(signals, featureType) {
-    if (
-      !signals?.pageJsCrash ||
-      !signals.reachedRelevantSurface ||
-      hasPositiveSignals(signals)
-    ) return null;
+    if (!signals?.pageJsCrash || !signals.reachedRelevantSurface) return null;
     const errMsg = signals.pageJsCrashMessage ?? 'JS runtime error';
+    const positive = hasPositiveSignals(signals);
 
-    // Data / leaderboard pages frequently fire transient JS errors during SPA
-    // hydration (e.g. reading properties of undefined before data loads). The
-    // page route EXISTS — the agent reached it — but content didn't render this
-    // run. Calling this FAILED would be wrong; UNTESTABLE is correct because a
-    // re-run may succeed once the data is available.
     const isDataPage =
       featureType === 'DATA_DASHBOARD' ||
       /\/leaderboard|\/dashboard|\/rankings?|\/stats|\/analytics/i.test(signals.finalUrl ?? '');
 
-    if (isDataPage) {
-      console.log(`[verdict] Rule 1b DATA_DASHBOARD — JS crash treated as untestable: ${errMsg.slice(0, 80)}`);
+    // DATA_DASHBOARD / leaderboard: ALWAYS resolve here — never fall through
+    // to the LLM, which would return FAILED based on the JS error text.
+    if (isDataPage && positive) {
+      console.log(`[verdict] Rule 1b DATA_DASHBOARD + positive signals — JS crash is noise: ${errMsg.slice(0, 80)}`);
+      return {
+        resolved:      true,
+        verdict:       'verified',
+        confidence:    'medium',
+        matchedRule:   this.name,
+        blockerReason: 'JS error present but data page has positive signals',
+        reasons: [
+          'A JavaScript runtime error fired but positive feature signals were still observed',
+          `JS error: ${errMsg.slice(0, 150)}`,
+          'The JS error is transient SPA noise — the data page route exists and content is loading',
+        ],
+      };
+    }
+
+    if (isDataPage && !positive) {
+      console.log(`[verdict] Rule 1b DATA_DASHBOARD — JS crash, no signals: ${errMsg.slice(0, 80)}`);
       return {
         resolved:      true,
         verdict:       'untestable',
@@ -252,6 +262,10 @@ const rule1b: Rule = {
         ],
       };
     }
+
+    // Non-data pages: only resolve when there are no positive signals.
+    // When positive signals exist, let the LLM weigh the JS error vs evidence.
+    if (positive) return null;
 
     console.log(`[verdict] Rule 1b MATCH — page crashed: ${errMsg.slice(0, 80)}`);
     return {

@@ -4,8 +4,9 @@ import type { AgentObservation, AgentStep, BlockerType, PageMessage, PageState, 
 import type { NarrationSegment } from '../tts';
 import { analyzePageState, capturePageText } from './page-analysis';
 import {
-  FEE_SHARE_SOCIAL_HANDLE_FILL_TOKEN,
-  FEE_SHARE_X_HANDLE_VALUE,
+  SOCIAL_HANDLE_FILL_TOKEN,
+  SOCIAL_HANDLE_VALUE,
+  HANDLE_FALLBACK_SEQUENCE,
   INVESTIGATION_WALLET_FILL_TOKEN,
 } from './constants';
 import type { WorkflowHypothesis } from './workflow';
@@ -420,11 +421,11 @@ function substituteInvestigationWallet(step: AgentStep, addr?: string): AgentSte
   return { ...step, value: v.split(INVESTIGATION_WALLET_FILL_TOKEN).join(addr) };
 }
 
-function substituteFeeShareSocialHandle(step: AgentStep, handle: string): AgentStep {
+function substituteSocialHandle(step: AgentStep, handle: string): AgentStep {
   if (!handle || step.action !== 'fill_input') return step;
   const v = step.value;
-  if (typeof v !== 'string' || !v.includes(FEE_SHARE_SOCIAL_HANDLE_FILL_TOKEN)) return step;
-  return { ...step, value: v.split(FEE_SHARE_SOCIAL_HANDLE_FILL_TOKEN).join(handle) };
+  if (typeof v !== 'string' || !v.includes(SOCIAL_HANDLE_FILL_TOKEN)) return step;
+  return { ...step, value: v.split(SOCIAL_HANDLE_FILL_TOKEN).join(handle) };
 }
 
 const DEV_BUY_PATTERN = /dev.?buy|initial.?buy|launch.?buy|buy.?amount|purchase.?amount/i;
@@ -443,10 +444,10 @@ function substituteDevBuyToZero(step: AgentStep): AgentStep {
   return step;
 }
 
-/** Applies wallet + fee-share + dev-buy tokens in order for fill_input steps */
+/** Applies wallet + social handle + dev-buy tokens in order for fill_input steps */
 function applyFillInputSubstitutions(step: AgentStep, opts?: { investigationWalletAddress?: string }): AgentStep {
   let s = substituteInvestigationWallet(step, opts?.investigationWalletAddress);
-  s = substituteFeeShareSocialHandle(s, FEE_SHARE_X_HANDLE_VALUE);
+  s = substituteSocialHandle(s, SOCIAL_HANDLE_VALUE);
   s = substituteDevBuyToZero(s);
   return s;
 }
@@ -636,9 +637,8 @@ SPECIFIC ERROR RECOVERY:
   find the "Dev Buy" or any optional purchase-amount input field and set its value to "0",
   then click the submit/create button again. The dev buy is optional and can be skipped.
 - If you see "already exists" (e.g. "A soul for @X already exists") →
-  compare the handle in the error message to what is currently in the input field.
-  If the field already shows a DIFFERENT handle than the one in the error → click Preview.
-  If the field still shows the SAME handle as in the error → fill a different handle value first.
+  the system handles this automatically. Return null and let the deterministic
+  recovery inject the next handle from the fallback sequence.
 
 Return the single best next action as JSON:
   {"action":"click_text","text":"<exact button label>"}
@@ -891,7 +891,7 @@ async function detectNewFormFields(
     if (
       /twitter|github|tiktok|twitch|instagram|social|handle|username|creator|x\.com|@/i.test(hint)
     ) {
-      value = FEE_SHARE_SOCIAL_HANDLE_FILL_TOKEN;
+      value = SOCIAL_HANDLE_FILL_TOKEN;
     } else if (/wallet|address|recipient|0x/i.test(hint)) {
       value = walletAddress ? INVESTIGATION_WALLET_FILL_TOKEN : '';
     } else if (inp.type === 'email') {
@@ -1054,6 +1054,10 @@ export async function executeSteps(
   // Passed to decideAdaptiveStep so the LLM knows what has happened AND what the
   // page said at each step, just like a human tester's mental model.
   const runningNarratives: string[] = [];
+
+  // Tracks how many "already exists" handle fallbacks have been attempted.
+  // Persists across loop iterations so each attempt picks the next handle.
+  let alreadyExistsAttempt = 0;
 
   // Use a mutable queue so we can dynamically inject steps discovered
   // after content loads (e.g. Mint button revealed after Preview completes).
@@ -1350,78 +1354,55 @@ export async function executeSteps(
     }
 
     // ── Deterministic "already exists" handle recovery ───────────────────────
-    // Fires after ANY step. Reads the current field value and compares it to
-    // the handle mentioned in the error ("A soul for @X already exists" → X).
-    //   • Same handle still in field → fill a unique handle, then let the main
-    //     loop click Preview on the next adaptive/planned step.
-    //   • Different handle already in field → just inject click_text(submit).
-    // This is fully deterministic: no LLM call, no guessing.
+    // Fires after ANY step when the page shows an "already exists" error.
+    // Injects BOTH fill_input + click_text as a pair so the submit always
+    // follows the fill without LLM intervention in between.
+    // Uses HANDLE_FALLBACK_SEQUENCE with a persistent counter so each
+    // attempt picks the next handle deterministically.
     if (
       stepsToRun.length === 0 &&
+      alreadyExistsAttempt < HANDLE_FALLBACK_SEQUENCE.length &&
       stepMessages.some((m) => /already\s+exists/i.test(m.text))
     ) {
-      const alreadyExistsMsg = stepMessages.find((m) => /already\s+exists/i.test(m.text))?.text ?? '';
-      // Extract rejected handle: "A soul for @testuser already exists" → "testuser"
-      const rejectedHandleMatch = alreadyExistsMsg.match(/@([\w\d_.-]+)/i);
-      const rejectedHandle = rejectedHandleMatch?.[1]?.toLowerCase() ?? '';
-
-      // Read the current value in the social handle input field
-      const currentFieldValue = await page.$$eval(
+      // Find the social handle input selector
+      const selector = await page.$$eval(
         'input[type="text"], input:not([type]), input[type="search"]',
-        (inputs, rejected) => {
+        (inputs) => {
           const socialRe = /handle|twitter|username|social|soul|x\.com/i;
           const inp = inputs.find(
             (i) =>
               socialRe.test((i as HTMLInputElement).name ?? '') ||
               socialRe.test((i as HTMLInputElement).placeholder ?? '') ||
-              socialRe.test(i.closest('label')?.textContent ?? '') ||
-              (i as HTMLInputElement).value === rejected,
+              socialRe.test(i.closest('label')?.textContent ?? ''),
           ) as HTMLInputElement | undefined;
-          return inp?.value?.trim().toLowerCase() ?? null;
+          if (!inp) return null;
+          if (inp.id)   return `#${inp.id}`;
+          if (inp.name) return `[name="${inp.name}"]`;
+          return 'input[type="text"]';
         },
-        rejectedHandle,
       ).catch(() => null);
 
-      if (currentFieldValue !== null && currentFieldValue === rejectedHandle) {
-        // Field still has the rejected handle — fill a unique one
-        const uniqueHandle = `testuser${Date.now().toString().slice(-4)}`;
-        const selector = await page.$$eval(
-          'input[type="text"], input:not([type]), input[type="search"]',
-          (inputs, rejected) => {
-            const socialRe = /handle|twitter|username|social|soul|x\.com/i;
-            const inp = inputs.find(
-              (i) =>
-                socialRe.test((i as HTMLInputElement).name ?? '') ||
-                socialRe.test((i as HTMLInputElement).placeholder ?? '') ||
-                socialRe.test(i.closest('label')?.textContent ?? '') ||
-                (i as HTMLInputElement).value === rejected,
-            ) as HTMLInputElement | undefined;
-            if (!inp) return null;
-            if (inp.id)   return `#${inp.id}`;
-            if (inp.name) return `[name="${inp.name}"]`;
-            return 'input[type="text"]';
-          },
-          rejectedHandle,
-        ).catch(() => null);
+      // Find the submit button text
+      const submitBtnText = await page.$$eval(
+        'button:not([disabled]), [role="button"]:not([aria-disabled="true"])',
+        (els) => {
+          const submitRe = /^(preview|submit|create|launch|mint|deploy|confirm|next|continue|go|search)$/i;
+          const el = els.find((e) => submitRe.test((e.textContent ?? '').replace(/\s+/g, ' ').trim()));
+          return el ? (el.textContent ?? '').replace(/\s+/g, ' ').trim() : null;
+        },
+      ).catch(() => null);
 
-        if (selector) {
-          stepsToRun.unshift({ action: 'fill_input', selector, value: uniqueHandle });
-          console.log(`[executor] "already exists": field still has rejected handle — filling "${uniqueHandle}" via ${selector}`);
-        }
-      } else if (currentFieldValue !== null && currentFieldValue !== rejectedHandle) {
-        // Field has a new handle — just click the submit button
-        const submitBtnText = await page.$$eval(
-          'button:not([disabled]), [role="button"]:not([aria-disabled="true"])',
-          (els) => {
-            const submitRe = /^(preview|submit|create|launch|mint|deploy|confirm|next|continue|go|search)$/i;
-            const el = els.find((e) => submitRe.test((e.textContent ?? '').replace(/\s+/g, ' ').trim()));
-            return el ? (el.textContent ?? '').replace(/\s+/g, ' ').trim() : null;
-          },
-        ).catch(() => null);
-        if (submitBtnText) {
-          stepsToRun.unshift({ action: 'click_text', text: submitBtnText });
-          console.log(`[executor] "already exists": field has new handle "${currentFieldValue}" — injecting click_text("${submitBtnText}")`);
-        }
+      if (selector && submitBtnText) {
+        alreadyExistsAttempt++;
+        const nextHandle = HANDLE_FALLBACK_SEQUENCE[
+          Math.min(alreadyExistsAttempt, HANDLE_FALLBACK_SEQUENCE.length - 1)
+        ];
+        // Inject fill THEN click as a pair — click always follows fill
+        stepsToRun.push(
+          { action: 'fill_input', selector, value: nextHandle },
+          { action: 'click_text', text: submitBtnText },
+        );
+        console.log(`[executor] "already exists" attempt ${alreadyExistsAttempt}: filling "${nextHandle}" via ${selector}, then clicking "${submitBtnText}"`);
       }
     }
 

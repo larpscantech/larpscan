@@ -185,8 +185,11 @@ CRITICAL RULES
       → return VERIFIED. The backend responded with data; the JS error is from a non-critical
       component (wallet hook, analytics, third-party widget) and did NOT prevent data from rendering.
   (b) If a JS error is present AND the claimed feature's content is ABSENT (no table, no leaderboard,
-      no data rendered) AND no own-domain API calls → return FAILED. The JS error explains WHY
-      the feature content is missing. This is a broken implementation, NOT LARP.
+      no data rendered) AND no own-domain API calls:
+      - For DATA_DASHBOARD claims → return UNTESTABLE, NOT FAILED. JS errors on data/leaderboard
+        pages are transient SPA hydration races; the page route exists and may render on retry.
+      - For all other feature types → return FAILED. The JS error explains WHY the feature
+        content is missing. This is a broken implementation, NOT LARP.
   (c) If a JS error is present BUT positive signals also exist (API calls, partial UI, table headers)
       → treat the JS error as background noise and focus on the positive signals.
   (d) NEVER return LARP based solely on a JS error with no other evidence — if a JS error
@@ -438,6 +441,12 @@ function buildSignalContext(
         'The JS error is from a non-critical component (e.g. wallet hook, analytics widget) ' +
         'and did NOT prevent the dashboard data from loading — own-domain API calls prove the backend responded. ' +
         'Return VERIFIED. Do NOT return FAILED based on this JS error.',
+      );
+    } else if (featureType === 'DATA_DASHBOARD') {
+      lines.push(
+        'DIRECTIVE: This is a DATA_DASHBOARD claim with a JS error. ' +
+        'JS errors on data/leaderboard pages are transient SPA hydration races. ' +
+        'Return UNTESTABLE — NEVER return FAILED for a data page based on a JS error.',
       );
     } else {
       lines.push(

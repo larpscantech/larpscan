@@ -349,11 +349,24 @@ function ClaimsSection({
     return (
       <div className="space-y-1">
         {claims.map((claim, i) => {
+          const stripped = {
+            ...claim,
+            verdict: undefined,
+            evidence: undefined,
+            screenshotDataUrl: undefined,
+            videoUrl: undefined,
+            transactionHash: undefined,
+            transactionExplorerUrl: undefined,
+            transactionReceiptStatus: undefined as 'success' | 'reverted' | 'timeout' | undefined,
+            transactionAttempted: undefined,
+            walletAddress: undefined,
+            blockerReason: undefined,
+          };
           if (i === checkingClaimIndex) {
             return (
               <AuditClaimCard
                 key={claim.id}
-                claim={{ ...claim, verdict: undefined, evidence: undefined }}
+                claim={stripped}
                 index={i}
                 isChecking={true}
               />
@@ -363,7 +376,7 @@ function ClaimsSection({
             return (
               <AuditClaimCard
                 key={claim.id}
-                claim={{ ...claim, verdict: undefined, evidence: undefined }}
+                claim={stripped}
                 index={i}
                 defaultExpanded={false}
               />

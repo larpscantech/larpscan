@@ -1,6 +1,6 @@
 import OpenAI from 'openai';
 import type { AgentObservation, AgentStep, AttemptMemory, PageState } from './types';
-import { FEE_SHARE_SOCIAL_HANDLE_FILL_TOKEN, INVESTIGATION_WALLET_FILL_TOKEN } from './constants';
+import { SOCIAL_HANDLE_FILL_TOKEN, INVESTIGATION_WALLET_FILL_TOKEN } from './constants';
 import { getFeaturePlaybook, rankCtaCandidates, rankRouteCandidates } from './playbooks';
 import { buildWorkflowHypothesis } from './workflow';
 import { formatRunMemoryContext } from './run-memory';
@@ -34,7 +34,7 @@ AVAILABLE ACTIONS (JSON format):
 - { "action": "scroll",            "direction": "down", "amount": 600 }
 - { "action": "click_text",        "text": "button or CTA text" }
 - { "action": "click_selector",    "selector": "CSS selector" }
-- { "action": "fill_input",        "selector": "CSS input selector", "value": "text to type" } — for social fee-sharing username fields use value exactly "${FEE_SHARE_SOCIAL_HANDLE_FILL_TOKEN}" (substituted with hardcoded handle in executor)
+- { "action": "fill_input",        "selector": "CSS input selector", "value": "text to type" } — for social / username fields use value exactly "${SOCIAL_HANDLE_FILL_TOKEN}" (substituted with hardcoded handle in executor)
 - { "action": "wait_for_selector", "selector": "CSS selector" }
 - { "action": "wait_for_text",     "text": "text to wait for" }
 - { "action": "back" }
@@ -440,7 +440,7 @@ export async function replanWorkflow(
     featureType === 'TOKEN_CREATION'
       ? `
 TOKEN_CREATION / FEE SHARING RECOVERY:
-- If you see "Please enter a username for fee sharing" (or similar validation error), fill the X/Twitter username field using EXACT selector from Form fields and value exactly: ${FEE_SHARE_SOCIAL_HANDLE_FILL_TOKEN}
+- If you see "Please enter a username for fee sharing" (or similar validation error), fill the X/Twitter username field using EXACT selector from Form fields and value exactly: ${SOCIAL_HANDLE_FILL_TOKEN}
 - Do NOT disable the fee-sharing toggle — keep it enabled and fill the username.
 ${connectedWalletAddress ? `Connected wallet: ${connectedWalletAddress}. For explicit 0x recipient fields use: ${INVESTIGATION_WALLET_FILL_TOKEN}` : ''}
 `
@@ -608,15 +608,15 @@ function buildFeatureGuidance(
     case 'form+browser':
       return `PRIORITY — demonstrate token creation with fee sharing enabled.
 
-Fee sharing / social handles (BNBshare, Flap-style launchpads):
-- When "Enable Fee Sharing" is on and a field is labeled X/Twitter/GitHub/TikTok/Twitch Username (or similar), fill it using value EXACTLY: ${FEE_SHARE_SOCIAL_HANDLE_FILL_TOKEN} (executor substitutes a hardcoded real handle).
-- Do NOT disable the fee-sharing toggle — leave it on and fill the username so the social vault path is used.
-- Do NOT leave the username field empty — that will cause a validation error ("Please enter a username for fee sharing") and the form will not submit.
+Social handles (Ensoul, BNBshare, Flap-style launchpads, etc.):
+- When a field is labeled X/Twitter/GitHub/TikTok/Twitch Username, social handle, or similar, fill it using value EXACTLY: ${SOCIAL_HANDLE_FILL_TOKEN} (executor substitutes a hardcoded handle).
+- If "Enable Fee Sharing" is on, keep it enabled and fill the username field.
+- Do NOT leave social/username fields empty — that will cause a validation error and the form will not submit.
 
 Workflow:
 1. Navigate to the token creation form.
 2. Fill name "TestToken", symbol "TST", description, optional website/telegram — EXACT selectors from "Form fields".
-3. Fill every visible social / fee-sharing username field with ${FEE_SHARE_SOCIAL_HANDLE_FILL_TOKEN}.
+3. Fill every visible social / username field with ${SOCIAL_HANDLE_FILL_TOKEN}.
 4. Scroll down 600px; fill any newly revealed fields the same way.
 5. Image uploads are automatic — do not click upload.
 6. Click "Create Token" / "Launch" / "Deploy" submit; use check_text for the outcome.

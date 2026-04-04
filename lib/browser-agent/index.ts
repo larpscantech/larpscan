@@ -1,7 +1,9 @@
 export {
+  SOCIAL_HANDLE_FILL_TOKEN,
+  SOCIAL_HANDLE_VALUE,
+  INVESTIGATION_WALLET_FILL_TOKEN,
   FEE_SHARE_SOCIAL_HANDLE_FILL_TOKEN,
   FEE_SHARE_X_HANDLE_VALUE,
-  INVESTIGATION_WALLET_FILL_TOKEN,
 } from './constants';
 export * from './types';
 export { analyzePageState, capturePageText, getInteractiveElements } from './page-analysis';
