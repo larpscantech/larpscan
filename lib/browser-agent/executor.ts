@@ -636,9 +636,9 @@ SPECIFIC ERROR RECOVERY:
   find the "Dev Buy" or any optional purchase-amount input field and set its value to "0",
   then click the submit/create button again. The dev buy is optional and can be skipped.
 - If you see "already exists" (e.g. "A soul for @X already exists") →
-  the input field currently contains a new handle value that hasn't been submitted yet.
-  Click the submit/Preview button immediately — do NOT fill the field again.
-  If the new value was also rejected, fill the handle field with "testuser" then click Preview.
+  compare the handle in the error message to what is currently in the input field.
+  If the field already shows a DIFFERENT handle than the one in the error → click Preview.
+  If the field still shows the SAME handle as in the error → fill a different handle value first.
 
 Return the single best next action as JSON:
   {"action":"click_text","text":"<exact button label>"}
@@ -1350,30 +1350,78 @@ export async function executeSteps(
     }
 
     // ── Deterministic "already exists" handle recovery ───────────────────────
-    // fill_input is an intrinsicProgressAction so it never enters the noop
-    // block above. That means the LLM-based error recovery never fires after
-    // a handle fill — and on the next iteration the LLM sees the stale "already
-    // exists" error and fills yet another handle instead of clicking Preview.
-    // Bypass the LLM entirely: if we just filled an input and the page is still
-    // showing an "already exists" error, find the submit/Preview button and
-    // inject a click step immediately.
+    // Fires after ANY step. Reads the current field value and compares it to
+    // the handle mentioned in the error ("A soul for @X already exists" → X).
+    //   • Same handle still in field → fill a unique handle, then let the main
+    //     loop click Preview on the next adaptive/planned step.
+    //   • Different handle already in field → just inject click_text(submit).
+    // This is fully deterministic: no LLM call, no guessing.
     if (
-      step.action === 'fill_input' &&
-      stepSucceeded &&
       stepsToRun.length === 0 &&
       stepMessages.some((m) => /already\s+exists/i.test(m.text))
     ) {
-      const submitBtnText = await page.$$eval(
-        'button:not([disabled]), [role="button"]:not([aria-disabled="true"])',
-        (els) => {
-          const submitRe = /^(preview|submit|create|launch|mint|deploy|confirm|next|continue|go|search)$/i;
-          const el = els.find((e) => submitRe.test((e.textContent ?? '').replace(/\s+/g, ' ').trim()));
-          return el ? (el.textContent ?? '').replace(/\s+/g, ' ').trim() : null;
+      const alreadyExistsMsg = stepMessages.find((m) => /already\s+exists/i.test(m.text))?.text ?? '';
+      // Extract rejected handle: "A soul for @testuser already exists" → "testuser"
+      const rejectedHandleMatch = alreadyExistsMsg.match(/@([\w\d_.-]+)/i);
+      const rejectedHandle = rejectedHandleMatch?.[1]?.toLowerCase() ?? '';
+
+      // Read the current value in the social handle input field
+      const currentFieldValue = await page.$$eval(
+        'input[type="text"], input:not([type]), input[type="search"]',
+        (inputs, rejected) => {
+          const socialRe = /handle|twitter|username|social|soul|x\.com/i;
+          const inp = inputs.find(
+            (i) =>
+              socialRe.test((i as HTMLInputElement).name ?? '') ||
+              socialRe.test((i as HTMLInputElement).placeholder ?? '') ||
+              socialRe.test(i.closest('label')?.textContent ?? '') ||
+              (i as HTMLInputElement).value === rejected,
+          ) as HTMLInputElement | undefined;
+          return inp?.value?.trim().toLowerCase() ?? null;
         },
+        rejectedHandle,
       ).catch(() => null);
-      if (submitBtnText) {
-        stepsToRun.unshift({ action: 'click_text', text: submitBtnText });
-        console.log(`[executor] "already exists" recovery: injecting click_text("${submitBtnText}")`);
+
+      if (currentFieldValue !== null && currentFieldValue === rejectedHandle) {
+        // Field still has the rejected handle — fill a unique one
+        const uniqueHandle = `testuser${Date.now().toString().slice(-4)}`;
+        const selector = await page.$$eval(
+          'input[type="text"], input:not([type]), input[type="search"]',
+          (inputs, rejected) => {
+            const socialRe = /handle|twitter|username|social|soul|x\.com/i;
+            const inp = inputs.find(
+              (i) =>
+                socialRe.test((i as HTMLInputElement).name ?? '') ||
+                socialRe.test((i as HTMLInputElement).placeholder ?? '') ||
+                socialRe.test(i.closest('label')?.textContent ?? '') ||
+                (i as HTMLInputElement).value === rejected,
+            ) as HTMLInputElement | undefined;
+            if (!inp) return null;
+            if (inp.id)   return `#${inp.id}`;
+            if (inp.name) return `[name="${inp.name}"]`;
+            return 'input[type="text"]';
+          },
+          rejectedHandle,
+        ).catch(() => null);
+
+        if (selector) {
+          stepsToRun.unshift({ action: 'fill_input', selector, value: uniqueHandle });
+          console.log(`[executor] "already exists": field still has rejected handle — filling "${uniqueHandle}" via ${selector}`);
+        }
+      } else if (currentFieldValue !== null && currentFieldValue !== rejectedHandle) {
+        // Field has a new handle — just click the submit button
+        const submitBtnText = await page.$$eval(
+          'button:not([disabled]), [role="button"]:not([aria-disabled="true"])',
+          (els) => {
+            const submitRe = /^(preview|submit|create|launch|mint|deploy|confirm|next|continue|go|search)$/i;
+            const el = els.find((e) => submitRe.test((e.textContent ?? '').replace(/\s+/g, ' ').trim()));
+            return el ? (el.textContent ?? '').replace(/\s+/g, ' ').trim() : null;
+          },
+        ).catch(() => null);
+        if (submitBtnText) {
+          stepsToRun.unshift({ action: 'click_text', text: submitBtnText });
+          console.log(`[executor] "already exists": field has new handle "${currentFieldValue}" — injecting click_text("${submitBtnText}")`);
+        }
       }
     }
 

@@ -90,7 +90,7 @@ export function RecentVerificationsTable({ verifications, onSelect }: RecentVeri
           </thead>
           <tbody>
             {verifications.map((v, i) => {
-              const isClickable = (v.status === 'complete' || v.status === 'in_progress') && Boolean(onSelect);
+              const isClickable = v.status === 'complete' && Boolean(onSelect);
               return (
               <tr
                 key={v.id}
