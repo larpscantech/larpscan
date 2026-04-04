@@ -231,33 +231,30 @@ const rule1b: Rule = {
     // DATA_DASHBOARD / leaderboard: ALWAYS resolve here — never fall through
     // to the LLM, which would return FAILED based on the JS error text.
     if (isDataPage && positive) {
-      console.log(`[verdict] Rule 1b DATA_DASHBOARD + positive signals — JS crash is noise: ${errMsg.slice(0, 80)}`);
+      console.log(`[verdict] Rule 1b DATA_DASHBOARD + positive signals — client noise (ignored): ${errMsg.slice(0, 80)}`);
       return {
         resolved:      true,
         verdict:       'verified',
         confidence:    'medium',
         matchedRule:   this.name,
-        blockerReason: 'JS error present but data page has positive signals',
+        blockerReason: 'Transient client-side noise; data signals still observed',
         reasons: [
-          'A JavaScript runtime error fired but positive feature signals were still observed',
-          `JS error: ${errMsg.slice(0, 150)}`,
-          'The JS error is transient SPA noise — the data page route exists and content is loading',
+          'Positive feature signals were observed despite transient client-side noise during the run',
+          'The data page route exists and relevant content or network activity was detected',
         ],
       };
     }
 
     if (isDataPage && !positive) {
-      console.log(`[verdict] Rule 1b DATA_DASHBOARD — JS crash, no signals: ${errMsg.slice(0, 80)}`);
+      console.log(`[verdict] Rule 1b DATA_DASHBOARD — no signals, client noise: ${errMsg.slice(0, 80)}`);
       return {
         resolved:      true,
         verdict:       'untestable',
         confidence:    'medium',
         matchedRule:   this.name,
-        blockerReason: 'Feature page has a JS runtime error — content may load intermittently',
+        blockerReason: 'Data surface may load intermittently — retry recommended',
         reasons: [
-          'Feature page has a JavaScript runtime error — likely a transient SPA hydration race',
-          `JS error: ${errMsg.slice(0, 150)}`,
-          'The page route exists and the agent navigated to it, but data failed to render this run',
+          'The agent reached the target route but strong table/API signals were not captured this run',
           'Re-running the verification may produce a different result once data is loaded',
         ],
       };
@@ -273,11 +270,10 @@ const rule1b: Rule = {
       verdict:       'failed',
       confidence:    'medium',
       matchedRule:   this.name,
-      blockerReason: 'Feature page crashed with a JS runtime error',
+      blockerReason: 'Feature page did not render usable evidence this run',
       reasons: [
-        'Feature page crashed with a JavaScript runtime error — this is a bug in the site\'s code, not evidence the feature is absent',
-        `JS error: ${errMsg.slice(0, 150)}`,
-        'No positive feature signals were observed (no data, no form, no own-domain API calls) — the crash prevented the feature from rendering',
+        'Unhandled client-side failure prevented the feature from rendering — this is a bug in the site code, not evidence the feature is absent',
+        'No positive feature signals were observed (no data, no form, no own-domain API calls)',
         'This is FAILED (broken implementation), not LARP (feature does not exist)',
       ],
     };

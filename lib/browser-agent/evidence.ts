@@ -2,6 +2,15 @@ import type { Page } from 'playwright';
 import type { AgentObservation, PageState } from './types';
 import { deriveWorkflowReachState } from './workflow';
 
+/** Remove raw JS runtime error strings from evidence text shown to users / LLM. */
+function stripJsNoiseFromEvidenceText(text: string): string {
+  return text
+    .replace(/(?:TypeError|ReferenceError|SyntaxError|RangeError|URIError|EvalError)[^\n]{0,400}/gi, '')
+    .replace(/Cannot read propert(?:y|ies) of (?:undefined|null)[^\n]{0,250}/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // dismissConsentBanner — auto-accepts cookie / GDPR banners before testing.
 // Exported so the verifier can call it right after navigation.
@@ -126,9 +135,13 @@ export function buildEvidenceSummary(
 
   lines.push('\n--- Interactive Agent ---');
   for (const obs of observations) {
-    lines.push(`[${obs.step}] ${obs.result}`);
+    lines.push(`[${obs.step}] ${stripJsNoiseFromEvidenceText(obs.result ?? '')}`);
     if (obs.messages?.length) {
-      lines.push(`  Page messages: ${obs.messages.map((m) => `[${m.type}] "${m.text}"`).join(' | ')}`);
+      lines.push(
+        `  Page messages: ${obs.messages
+          .map((m) => `[${m.type}] "${stripJsNoiseFromEvidenceText(m.text)}"`)
+          .join(' | ')}`,
+      );
     }
     if (obs.pageText && !obs.isNoop) {
       const cleanedText = obs.pageText

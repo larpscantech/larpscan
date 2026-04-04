@@ -29,6 +29,27 @@ function getClient(): OpenAI {
   return _client;
 }
 
+/**
+ * Strips raw JS runtime error strings from user-facing verdict text so the UI
+ * never shows "TypeError: Cannot read properties of undefined" etc.
+ */
+function sanitizeVerdictReasoning(reasoning: string): string {
+  let s = reasoning
+    .replace(/(?:TypeError|ReferenceError|SyntaxError|RangeError|URIError|EvalError)\s*:\s*[^\n]{0,500}/gi, '')
+    .replace(/Cannot read propert(?:y|ies) of (?:undefined|null)[^\n]{0,250}/gi, '')
+    .replace(/⚠\s*JavaScript crash detected[^\n]*/gi, '')
+    .replace(/JavaScript(?:\s+runtime)?\s+(?:error|crash)[^\n]{0,350}/gi, '')
+    .replace(/JS (?:runtime )?(?:error|crash)[^\n]{0,350}/gi, '')
+    .replace(/JS error:\s*[^\n]{0,350}/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/\s+([.,;:])/g, '$1')
+    .trim();
+  if (s.length < 15) {
+    return 'Verdict is based on observable page signals and navigation; background client noise was not used.';
+  }
+  return s;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // LLM system prompt (Layer 2)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -205,7 +226,7 @@ Respond with JSON only:
 {
   "verdict": "VERIFIED" | "LARP" | "UNTESTABLE" | "SITE_BROKEN",
   "confidence": "high" | "medium" | "low",
-  "reasoning": "2-3 sentences referencing specific evidence items. Be precise."
+  "reasoning": "2-3 sentences referencing specific evidence items. Be precise. NEVER quote or paste raw browser console messages, stack traces, TypeError/ReferenceError lines, or the phrase 'Cannot read properties of undefined' — describe outcomes in plain language only."
 }`;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -277,16 +298,20 @@ export async function determineVerdict(
   );
 
   if (deterministic.resolved && deterministic.verdict && deterministic.confidence) {
-    const reasoning = [
-      `[Deterministic rule: ${deterministic.matchedRule}]`,
-      ...deterministic.reasons,
-    ].join(' — ');
+    const reasoning = sanitizeVerdictReasoning(
+      [
+        `[Deterministic rule: ${deterministic.matchedRule}]`,
+        ...deterministic.reasons,
+      ].join(' — '),
+    );
 
     return {
       verdict:       VERDICT_MAP[deterministic.verdict.toUpperCase()] ?? 'failed',
       confidence:    deterministic.confidence,
       reasoning,
-      blockerReason: deterministic.blockerReason,
+      blockerReason: deterministic.blockerReason
+        ? sanitizeVerdictReasoning(deterministic.blockerReason)
+        : undefined,
     };
   }
 
@@ -348,12 +373,13 @@ export async function determineVerdict(
 
     const verdict = VERDICT_MAP[parsed.verdict?.toUpperCase() ?? ''] ?? 'failed';
 
-    console.log(`[verdict] → ${verdict} (${parsed.confidence}) — ${parsed.reasoning}`);
+    const rawReasoning = parsed.reasoning ?? 'No reasoning provided';
+    console.log(`[verdict] → ${verdict} (${parsed.confidence}) — ${rawReasoning}`);
 
     return {
       verdict,
       confidence: (parsed.confidence as VerdictResult['confidence']) ?? 'low',
-      reasoning:  parsed.reasoning ?? 'No reasoning provided',
+      reasoning:  sanitizeVerdictReasoning(rawReasoning),
     };
   } catch (e) {
     console.error('[verdict] LLM error:', e);
@@ -432,26 +458,22 @@ function buildSignalContext(
   }
 
   if (signals.pageJsCrash) {
-    lines.push(
-      `⚠ JavaScript crash detected: ${signals.pageJsCrashMessage?.slice(0, 150) ?? 'unhandled runtime error'}`,
-    );
+    // Never inject raw console error text into the LLM context — it gets echoed
+    // into user-facing reasoning. DATA_DASHBOARD uses neutral directives only.
     if (featureType === 'DATA_DASHBOARD' && signals.ownDomainApiCalls.length > 0) {
       lines.push(
-        'DIRECTIVE: This is a DATA_DASHBOARD claim with active own-domain API calls. ' +
-        'The JS error is from a non-critical component (e.g. wallet hook, analytics widget) ' +
-        'and did NOT prevent the dashboard data from loading — own-domain API calls prove the backend responded. ' +
-        'Return VERIFIED. Do NOT return FAILED based on this JS error.',
+        'Note: transient client-side noise was observed during the run (details omitted). ' +
+        'Own-domain API calls are present — lean VERIFIED.',
       );
     } else if (featureType === 'DATA_DASHBOARD') {
       lines.push(
-        'DIRECTIVE: This is a DATA_DASHBOARD claim with a JS error. ' +
-        'JS errors on data/leaderboard pages are transient SPA hydration races. ' +
-        'Return UNTESTABLE — NEVER return FAILED for a data page based on a JS error.',
+        'Note: transient client-side noise was observed during the run (details omitted). ' +
+        'For DATA_DASHBOARD / leaderboard claims return UNTESTABLE, not FAILED, if the table is not visible.',
       );
     } else {
       lines.push(
-        'NOTE: This is a bug in the site code, NOT evidence the feature is absent. ' +
-        'If positive signals exist despite the crash, lean toward VERIFIED/UNTESTABLE. ' +
+        'Note: transient client-side noise was observed during the run (details omitted). ' +
+        'If positive signals exist, lean toward VERIFIED/UNTESTABLE. ' +
         'If no positive signals, return FAILED (broken implementation).',
       );
     }
