@@ -34,6 +34,20 @@ const DB_STATUS_TO_VERDICT: Partial<Record<string, Verdict>> = {
   failed:     'FAILED',
 };
 
+function sanitizeFrontendEvidence(text?: string): string | undefined {
+  if (!text) return undefined;
+  const cleaned = text
+    .replace(/(?:TypeError|ReferenceError|SyntaxError|RangeError|URIError|EvalError)\s*:\s*[^\n]{0,500}/gi, '')
+    .replace(/Cannot read propert(?:y|ies) of (?:undefined|null)[^\n]{0,250}/gi, '')
+    .replace(/\bstartsWith\b[^\n]{0,200}/gi, '')
+    .replace(/JavaScript(?:\s+runtime)?\s+(?:error|crash)[^\n]{0,350}/gi, '')
+    .replace(/JS (?:runtime )?(?:error|crash)[^\n]{0,350}/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/\s+([.,;:])/g, '$1')
+    .trim();
+  return cleaned || undefined;
+}
+
 function toFrontendClaim(c: DbClaim | DbClaimWithEvidence): Claim {
   const withEvidence = c as DbClaimWithEvidence;
   // Cast to a wider type that includes dynamic JSON fields written by saveEvidence
@@ -46,7 +60,7 @@ function toFrontendClaim(c: DbClaim | DbClaimWithEvidence): Claim {
     verdict:          (c.status !== 'pending' && c.status !== 'checking')
                         ? DB_STATUS_TO_VERDICT[c.status]
                         : undefined,
-    evidence:               (evidenceData?.['reasoning']              as string  | undefined) ?? undefined,
+    evidence:               sanitizeFrontendEvidence((evidenceData?.['reasoning'] as string | undefined) ?? undefined),
     screenshotDataUrl:      (evidenceData?.['screenshotDataUrl']      as string  | undefined) ?? undefined,
     videoUrl:               (evidenceData?.['videoUrl']               as string  | undefined) ?? undefined,
     transactionHash:        (evidenceData?.['transactionHash']        as string  | undefined) ?? undefined,
@@ -55,7 +69,7 @@ function toFrontendClaim(c: DbClaim | DbClaimWithEvidence): Claim {
       (evidenceData?.['transactionReceiptStatus'] as Claim['transactionReceiptStatus']) ?? undefined,
     transactionAttempted:   (evidenceData?.['transactionAttempted']   as boolean | undefined) ?? undefined,
     walletAddress:          (evidenceData?.['walletAddress']          as string  | undefined) ?? undefined,
-    blockerReason:          (evidenceData?.['blockerReason']          as string  | undefined) ?? undefined,
+    blockerReason:          sanitizeFrontendEvidence((evidenceData?.['blockerReason'] as string | undefined) ?? undefined),
   };
 }
 

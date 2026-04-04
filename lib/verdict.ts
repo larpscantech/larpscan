@@ -50,6 +50,32 @@ function sanitizeVerdictReasoning(reasoning: string): string {
   return s;
 }
 
+function isLeaderboardLikeClaim(
+  claim: string,
+  passCondition: string,
+  featureType?: string,
+  signals?: VerdictSignals,
+): boolean {
+  if (featureType === 'DATA_DASHBOARD') return true;
+  const combined = `${claim}\n${passCondition}\n${signals?.finalUrl ?? ''}`.toLowerCase();
+  return /leaderboard|dashboard|ranking|rankings|ranked|table|scoreboard|digital souls|fees earned|claimed amounts/.test(combined);
+}
+
+function shouldOverrideJsFailure(
+  claim: string,
+  passCondition: string,
+  featureType: string | undefined,
+  signals: VerdictSignals | undefined,
+  verdict: ClaimStatus,
+  reasoning: string,
+): boolean {
+  if (!isLeaderboardLikeClaim(claim, passCondition, featureType, signals)) return false;
+  const r = reasoning.toLowerCase();
+  const hasJsLikeText =
+    /cannot read propert|startswith|typeerror|referenceerror|javascript|js error|client-side noise|broken implementation|failed to render/.test(r);
+  return verdict === 'failed' || hasJsLikeText;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // LLM system prompt (Layer 2)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -305,6 +331,15 @@ export async function determineVerdict(
       ].join(' — '),
     );
 
+    if (shouldOverrideJsFailure(claim, passCondition, featureType, signals, VERDICT_MAP[deterministic.verdict.toUpperCase()] ?? 'failed', reasoning)) {
+      return {
+        verdict: 'untestable',
+        confidence: deterministic.confidence,
+        reasoning: 'The agent reached a leaderboard/data surface, but stable table evidence was not captured on this run. This result is treated as untestable rather than a broken implementation.',
+        blockerReason: 'Leaderboard data did not stabilize during this run',
+      };
+    }
+
     return {
       verdict:       VERDICT_MAP[deterministic.verdict.toUpperCase()] ?? 'failed',
       confidence:    deterministic.confidence,
@@ -375,6 +410,14 @@ export async function determineVerdict(
 
     const rawReasoning = parsed.reasoning ?? 'No reasoning provided';
     console.log(`[verdict] → ${verdict} (${parsed.confidence}) — ${rawReasoning}`);
+
+    if (shouldOverrideJsFailure(claim, passCondition, featureType, signals, verdict, rawReasoning)) {
+      return {
+        verdict: 'untestable',
+        confidence: (parsed.confidence as VerdictResult['confidence']) ?? 'medium',
+        reasoning: 'The agent reached a leaderboard/data surface, but stable table evidence was not captured on this run. This result is treated as untestable rather than a broken implementation.',
+      };
+    }
 
     return {
       verdict,

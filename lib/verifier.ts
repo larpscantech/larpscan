@@ -327,8 +327,8 @@ async function analyzeWebsite(baseUrl: string): Promise<AnalysisResult> {
     if (title)  probes.push(`Page title: "${title}"`);
     const cleanedProbeText = stripJsRuntimeErrors(pageText);
     if (cleanedProbeText.length > 20)  probes.push(`Page content:\n${cleanedProbeText}`);
-    else if (pageText.length > 20)     probes.push('Page content: JS error overlay only — feature page may be broken');
-    else                               probes.push('Page content: empty (SPA render failure or auth wall)');
+    else if (pageText.length > 20)     probes.push('Page content: initial client render noise only — no stable text captured');
+    else                               probes.push('Page content: empty (SPA render delay or auth wall)');
 
     // Log detected blockers
     if (pageState.blockers.length > 0) {
