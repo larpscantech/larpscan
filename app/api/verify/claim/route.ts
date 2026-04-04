@@ -9,6 +9,14 @@ import type { DbClaim, DbProject, DbVerificationRun } from '@/lib/db-types';
 export const runtime = 'nodejs';
 export const maxDuration = 300;
 
+function summarizeBrowserFailure(error: unknown): string {
+  const msg = error instanceof Error ? error.message : 'Unknown Playwright error';
+  if (/startsWith/i.test(msg) || /Cannot read propert(?:y|ies) of (?:undefined|null)/i.test(msg)) {
+    return 'Browser interaction failed before stable evidence was captured';
+  }
+  return 'Browser interaction failed before verification could complete';
+}
+
 export const POST = withErrorHandler(async (req: Request) => {
   const body = await (req as NextRequest).json().catch(() => ({}));
   const runId   = (body?.runId   ?? '').trim();
@@ -79,9 +87,8 @@ export const POST = withErrorHandler(async (req: Request) => {
       return ok({ claimId, verdict: fastVerdict, confidence: 'high' });
     }
   } catch (e) {
-    const msg = e instanceof Error ? e.message : 'Unknown Playwright error';
     console.error('[verify/claim] Playwright error:', e);
-    evidenceSummary = `Browser error: ${msg}`;
+    evidenceSummary = summarizeBrowserFailure(e);
     await log(runId, evidenceSummary);
   }
 

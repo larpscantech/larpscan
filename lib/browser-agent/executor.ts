@@ -1734,12 +1734,28 @@ async function injectFakeImagesIfNeeded(page: Page): Promise<void> {
   }
 }
 
+function normalizeStepPath(path: unknown): string {
+  if (typeof path !== 'string') return '/';
+  const trimmed = path.trim();
+  if (!trimmed) return '/';
+  return trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+}
+
+function normalizeHrefToUrl(href: unknown, baseDomain: string): string | null {
+  if (typeof href !== 'string') return null;
+  const trimmed = href.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith('http')) return trimmed;
+  const base = baseDomain.replace(/\/$/, '');
+  return `${base}${trimmed.startsWith('/') ? '' : '/'}${trimmed}`;
+}
+
 async function performStep(page: Page, step: AgentStep, baseDomain: string, walletAddress?: string): Promise<void> {
   switch (step.action) {
 
     case 'navigate': {
       const base = baseDomain.replace(/\/$/, '');
-      const path = step.path.startsWith('/') ? step.path : `/${step.path}`;
+      const path = normalizeStepPath(step.path);
       await page.goto(`${base}${path}`, { waitUntil: 'load', timeout: 12_000 }).catch(() =>
         page.goto(`${base}${path}`, { waitUntil: 'domcontentloaded', timeout: 10_000 }),
       );
@@ -1755,9 +1771,8 @@ async function performStep(page: Page, step: AgentStep, baseDomain: string, wall
         return match ? (match as HTMLAnchorElement).getAttribute('href') : null;
       }, step.text);
 
-      if (href) {
-        const base = baseDomain.replace(/\/$/, '');
-        const url  = href.startsWith('http') ? href : `${base}${href.startsWith('/') ? '' : '/'}${href}`;
+      const url = normalizeHrefToUrl(href, baseDomain);
+      if (url) {
         await page.goto(url, { waitUntil: 'load', timeout: 12_000 }).catch(() => null);
         await page.waitForTimeout(1_500);
         await triggerWalletReconnect(page);
