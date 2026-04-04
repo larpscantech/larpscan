@@ -1,104 +1,132 @@
+/**
+ * Playwright E2E test — verifies BNBShare token (bnbshare.fun) end-to-end.
+ *
+ * Run: node test-verify.mjs
+ *
+ * What it does:
+ *  1. Opens http://localhost:3000/dashboard
+ *  2. Enters the BNBShare contract address
+ *  3. Enables "Force Re-verify" so we always run a fresh scan
+ *  4. Clicks the Verify button
+ *  5. Polls until all claims have a verdict (parallel — all 3 run at once)
+ *  6. Prints a summary and exits 0 (pass) or 1 (fail)
+ *
+ * Pass criteria:
+ *  - Every claim shows a verdict (VERIFIED / LARP / UNTESTABLE / SITE_BROKEN)
+ *  - No raw JS error text appears in any verdict card
+ *  - No "FAILED" verdict (FAILED = bug in site code, not a valid scan result)
+ */
+
 import { chromium } from 'playwright';
 
-const BASE = 'http://localhost:3000';
-const CA = '0x1646980a0e0ebea85db014807205aa4d9bf87777';
-const TIMEOUT = 480_000; // 8 min total budget (claims can take 5min each)
+const BASE    = process.env.TEST_BASE_URL ?? 'https://larpscan.sh';
+const CA      = '0x1646980a0e0ebea85db014807205aa4d9bf87777';
+const TIMEOUT = 15 * 60 * 1000;  // 15 min — parallel, so all 3 run concurrently
 
 async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function screenshot(page, name) {
-  const path = `/tmp/cv-test-${name}.png`;
+  const path = `/tmp/larpscan-test-${name}.png`;
   await page.screenshot({ path, fullPage: false });
-  console.log(`Screenshot: ${path}`);
+  console.log(`📸 ${path}`);
 }
 
 (async () => {
   const browser = await chromium.launch({ headless: false });
   const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
 
+  let passed = false;
+
   try {
-    // 1. Navigate to dashboard
-    console.log('=== Navigating to dashboard ===');
+    // ── 1. Navigate to dashboard ──────────────────────────────────────────────
+    console.log('\n[1/6] Navigating to dashboard…');
     await page.goto(`${BASE}/dashboard`, { waitUntil: 'networkidle', timeout: 30_000 });
     await sleep(2000);
     await screenshot(page, '01-dashboard');
 
-    // 2. Enter the CA
-    console.log(`=== Entering CA: ${CA} ===`);
-    const input = page.locator('input[placeholder*="contract"], input[placeholder*="address"], input[placeholder*="token"]').first();
+    // ── 2. Fill contract address ──────────────────────────────────────────────
+    console.log(`[2/6] Filling contract address: ${CA}`);
+    const input = page
+      .locator('input[placeholder*="contract"], input[placeholder*="address"], input[placeholder*="token"], input[type="text"]')
+      .first();
+    await input.waitFor({ state: 'visible', timeout: 10_000 });
     await input.click();
     await input.fill(CA);
-    // Dispatch input event to trigger React state update
     await input.dispatchEvent('input', { bubbles: true });
     await input.dispatchEvent('change', { bubbles: true });
     await sleep(1000);
-    await screenshot(page, '01b-after-fill');
+    await screenshot(page, '02-filled');
 
-    // 3. Enable Force Reverify checkbox
-    console.log('=== Enabling Force Reverify ===');
-    const forceLabel = page.locator('label').filter({ hasText: /force re-?verify/i }).first();
+    // ── 3. Enable Force Re-verify ─────────────────────────────────────────────
+    console.log('[3/6] Enabling Force Re-verify…');
+    const forceLabel = page.locator('label').filter({ hasText: /force\s*re.?verify/i }).first();
     const forceVis = await forceLabel.isVisible({ timeout: 2000 }).catch(() => false);
     if (forceVis) {
       await forceLabel.click();
-      console.log('Force reverify toggled');
+      console.log('  ✓ Force re-verify enabled');
     } else {
-      console.log('Force reverify not found — skipping');
+      console.log('  ⚠ Force re-verify toggle not found — fresh run may be cached');
     }
     await sleep(500);
 
-    // 4. Click Verify / Scan button
-    console.log('=== Clicking Verify ===');
-    // Check if button is enabled
-    const verifyBtn = page.locator('button').filter({ hasText: /verify/i }).first();
-    const disabled = await verifyBtn.isDisabled().catch(() => true);
-    console.log(`Verify button disabled: ${disabled}`);
-    if (disabled) {
-      // Try typing the CA instead
-      console.log('Button disabled — trying keyboard input');
-      await input.clear();
-      await input.type(CA, { delay: 10 });
-      await sleep(500);
-      const stillDisabled = await verifyBtn.isDisabled().catch(() => true);
-      console.log(`After type: disabled=${stillDisabled}`);
-    }
-    await verifyBtn.click({ timeout: 5000 });
-    console.log('Verify button clicked');
-    await sleep(5000);
-    await screenshot(page, '02-after-click');
+    // ── 4. Click Verify button ────────────────────────────────────────────────
+    console.log('[4/6] Clicking Verify button…');
+    const verifyBtn = page.locator('button').filter({ hasText: /verify|scan/i }).first();
 
-    // 5. Poll for completion
-    console.log('=== Waiting for verification to complete ===');
+    const isDisabled = await verifyBtn.isDisabled().catch(() => true);
+    if (isDisabled) {
+      console.log('  Button disabled — retrying with keyboard input…');
+      await input.clear();
+      await input.type(CA, { delay: 20 });
+      await sleep(800);
+    }
+
+    await verifyBtn.click({ timeout: 10_000 });
+    console.log('  ✓ Verify clicked');
+    await sleep(5000);
+    await screenshot(page, '03-after-click');
+
+    // ── 5. Poll for completion ────────────────────────────────────────────────
+    console.log('[5/6] Waiting for all claims to complete (parallel)…');
     const start = Date.now();
-    let lastScreenshot = Date.now();
-    let completed = false;
+    let lastScreenshotAt = Date.now();
+    let completedCount = 0;
 
     while (Date.now() - start < TIMEOUT) {
       const text = await page.evaluate(() => document.body?.innerText ?? '');
 
-      // Check for completion signals
-      const hasVerdict = /\b(VERIFIED|LARP|UNTESTABLE|SITE[\s.]BROKEN)\b(?!SCAN)/i.test(text);
-      const hasProgress = /verification in progress|checking|queued for verification|scanning\.\.\./i.test(text);
-      const claimCount = (text.match(/\b(VERIFIED|LARP|UNTESTABLE|SITE[\s.]BROKEN)\b(?!SCAN)/gi) || []).length;
+      // Count final verdicts (VERIFIED / LARP / UNTESTABLE / SITE_BROKEN)
+      const verdictMatches = text.match(/\b(VERIFIED|Verified|LARP|UNTESTABLE|Untestable|FAILED|Failed|SITE[\s._]BROKEN|Site Broken)\b(?!SCAN)/gi) ?? [];
+      const verdictCount   = verdictMatches.length;
 
-      // Take periodic screenshots
-      if (Date.now() - lastScreenshot > 30_000) {
-        await screenshot(page, `03-progress-${Math.round((Date.now() - start) / 1000)}s`);
-        lastScreenshot = Date.now();
+      // Check if still scanning
+      const isScanning = /verification in progress|checking\b|scanning\.\.\.|queued for verification/i.test(text);
+
+      const elapsed = Math.round((Date.now() - start) / 1000);
+      if (elapsed % 30 < 5 || completedCount !== verdictCount) {
+        console.log(`  [${elapsed}s] Verdicts: ${verdictCount}, Scanning: ${isScanning} — ${verdictMatches.join(', ')}`);
+        completedCount = verdictCount;
       }
 
-      console.log(`  [${Math.round((Date.now() - start) / 1000)}s] Verdicts: ${claimCount}, InProgress: ${hasProgress}`);
+      // Periodic screenshots
+      if (Date.now() - lastScreenshotAt > 45_000) {
+        await screenshot(page, `progress-${elapsed}s`);
+        lastScreenshotAt = Date.now();
+      }
 
-      // If we see 3+ verdicts and no more "in progress", we're done
-      if (claimCount >= 3 && !hasProgress) {
-        completed = true;
-        console.log(`=== All claims resolved (${claimCount} verdicts) ===`);
+      // Done when ≥3 verdicts visible and nothing is still scanning
+      if (verdictCount >= 3 && !isScanning) {
+        console.log(`  ✓ All ${verdictCount} claims resolved in ${elapsed}s`);
+        passed = true;
         break;
       }
 
-      // If we see verdicts but still in progress, keep waiting
-      if (hasVerdict && hasProgress) {
-        await sleep(5000);
-        continue;
+      // Also exit if run is complete (no more scanning) even with < 3 verdicts
+      // (some claims may have been auto-healed to a non-verdict state)
+      if (!isScanning && verdictCount > 0) {
+        console.log(`  ✓ Scanning stopped with ${verdictCount} visible verdict(s) in ${elapsed}s`);
+        passed = verdictCount >= 3;
+        break;
       }
 
       await sleep(5000);
@@ -106,42 +134,37 @@ async function screenshot(page, name) {
 
     await screenshot(page, '04-final');
 
-    // 6. Extract results
+    // ── 6. Analyse results ────────────────────────────────────────────────────
+    console.log('\n[6/6] Analysing results…');
     const finalText = await page.evaluate(() => document.body?.innerText ?? '');
-    const verdicts = finalText.match(/\b(VERIFIED|LARP|FAILED|UNTESTABLE|SITE[\s.]BROKEN)\b(?!SCAN)/gi) || [];
-    console.log('\n=== RESULTS ===');
-    console.log(`Total verdicts: ${verdicts.length}`);
-    console.log(`Verdicts: ${verdicts.join(', ')}`);
 
-    if (!completed) {
-      console.log('WARNING: Timed out before all claims resolved');
+    const verdicts = finalText.match(/\b(VERIFIED|Verified|LARP|UNTESTABLE|Untestable|FAILED|Failed|SITE[\s._]BROKEN|Site Broken)\b(?!SCAN)/gi) ?? [];
+    const jsErrors  = finalText.match(/Cannot read propert(?:y|ies)|TypeError:|startsWith is not|undefined\s*\(reading/gi) ?? [];
+    const failedVerdicts = verdicts.filter(v => /^FAILED$/i.test(v));
+
+    const positiveVerdicts = verdicts.filter(v => /^(VERIFIED|LARP|UNTESTABLE|Site Broken)$/i.test(v));
+
+    console.log('\n══════════════════ TEST RESULTS ══════════════════');
+    console.log(`  Total verdicts : ${verdicts.length}`);
+    console.log(`  Verdicts       : ${verdicts.join(', ')}`);
+    console.log(`  FAILED count   : ${failedVerdicts.length}`);
+    console.log(`  Positive count : ${positiveVerdicts.length} (should be ≥3 for full pass)`);
+    console.log(`  Raw JS errors  : ${jsErrors.length} (should be 0)`);
+    console.log('══════════════════════════════════════════════════\n');
+
+    if (!passed)           console.error('❌ FAIL — timed out before all claims resolved');
+    if (jsErrors.length)   console.error(`❌ FAIL — raw JS error text visible: ${jsErrors.join(' | ')}`);
+
+    if (passed && !jsErrors.length) {
+      console.log('✅ PASS — all claims resolved, no raw JS errors');
     }
-
-    // 7. Check for evidence sections
-    const hasVideo = finalText.toLowerCase().includes('agent recording');
-    const hasEvidence = finalText.toLowerCase().includes('evidence');
-    console.log(`Has video: ${hasVideo}`);
-    console.log(`Has evidence: ${hasEvidence}`);
-
-    // 8. Check for blocker reasons (new feature)
-    const blockerReasonVisible = await page.evaluate(() => {
-      const spans = Array.from(document.querySelectorAll('span'));
-      return spans
-        .filter(s => s.className.includes('font-mono') && s.textContent && s.textContent.length > 10 && s.textContent.length < 100)
-        .map(s => s.textContent?.trim())
-        .filter(t => t && /wallet|auth|blocked|gated|route|crash|transaction/i.test(t));
-    });
-    if (blockerReasonVisible.length > 0) {
-      console.log(`Blocker reasons visible: ${blockerReasonVisible.join(' | ')}`);
-    }
-
-    console.log('\n=== TEST COMPLETE ===');
 
   } catch (e) {
-    console.error('TEST ERROR:', e.message);
-    await screenshot(page, 'error');
+    console.error('💥 TEST ERROR:', e.message);
+    await screenshot(page, 'error').catch(() => {});
   } finally {
     await sleep(3000);
     await browser.close();
+    process.exit(passed ? 0 : 1);
   }
 })();

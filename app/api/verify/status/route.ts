@@ -4,7 +4,7 @@ import { log } from '@/lib/logger';
 import { ok, err, withErrorHandler } from '@/lib/api-helpers';
 import type { DbVerificationRun, DbAgentLog, DbClaimWithEvidence } from '@/lib/db-types';
 
-const STUCK_CHECKING_MS = 7 * 60 * 1000;  // 7 min
+const STUCK_CHECKING_MS = 5.5 * 60 * 1000; // 5.5 min — just above Vercel's 300s hard kill
 
 function claimStartTimes(logs: DbAgentLog[]): Map<string, number> {
   const map = new Map<string, number>();
@@ -55,9 +55,9 @@ export const GET = withErrorHandler(async (req: Request) => {
   let claims = claimsResult.data ?? [];
   const logs = logsResult.data ?? [];
 
-  // Auto-heal only claims that actually STARTED running and then got stuck in
-  // "checking". Pending claims are now expected to wait their turn because the
-  // pipeline dispatches one claim at a time for consistency.
+  // Auto-heal claims stuck in "checking" (Vercel killed the worker at the
+  // 300s hard limit). Then close the run whenever ALL claims are terminal,
+  // regardless of whether healing happened this cycle or a previous one.
   if (run.status !== 'complete' && run.status !== 'failed') {
     const now = Date.now();
     let healed = false;
@@ -69,33 +69,26 @@ export const GET = withErrorHandler(async (req: Request) => {
       const stuckChecking = claim.status === 'checking' && age > STUCK_CHECKING_MS;
 
       if (stuckChecking) {
-        console.warn(`[verify/status] Auto-healing stuck claim ${claim.id} (${claim.status} for ${Math.round(age / 1000)}s)`);
-        await supabase.from('claims').update({ status: 'failed' }).eq('id', claim.id);
-        await log(runId, `Claim timed out in ${claim.status} state — marking as failed`);
-        claim.status = 'failed';
+        console.warn(`[verify/status] Auto-healing stuck claim ${claim.id} (checking for ${Math.round(age / 1000)}s)`);
+        await supabase.from('claims').update({ status: 'untestable' }).eq('id', claim.id);
+        await log(runId, `Claim timed out — browser worker exceeded time limit`);
+        claim.status = 'untestable';
         healed = true;
       }
     }
 
-    if (healed) {
-      const allDone = claims.every((c) => c.status !== 'pending' && c.status !== 'checking');
-      if (allDone) {
-        await supabase.from('verification_runs').update({ status: 'complete' }).eq('id', runId);
-        await log(runId, 'Verification complete (some claims timed out)');
-        run.status = 'complete';
+    // Close the run whenever every claim is in a terminal state — regardless
+    // of whether healing happened this cycle or was done in a previous poll.
+    const allDone = claims.every((c) => c.status !== 'pending' && c.status !== 'checking');
+    if (allDone) {
+      await supabase.from('verification_runs').update({ status: 'complete' }).eq('id', runId);
+      await log(runId, 'Verification complete');
+      run.status = 'complete';
+      if (healed) {
         console.log(`[verify/status] Auto-completed run ${runId} after healing stuck claims`);
+      } else {
+        console.log(`[verify/status] Closing stale verifying run ${runId} — all claims already terminal`);
       }
-    }
-
-    const hasChecking = claims.some((c) => c.status === 'checking');
-    const hasPending  = claims.some((c) => c.status === 'pending');
-    if (run.status !== 'complete' && !hasChecking && hasPending) {
-      const origin = new URL((req as NextRequest).url).origin;
-      fetch(`${origin}/api/verify/run`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ runId }),
-      }).catch(() => {});
     }
   }
 

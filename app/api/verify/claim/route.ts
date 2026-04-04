@@ -138,7 +138,7 @@ export const POST = withErrorHandler(async (req: Request) => {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-async function maybeCompleteRun(runId: string, origin: string) {
+async function maybeCompleteRun(runId: string, _origin: string) {
   const { data: remaining } = await supabase
     .from('claims')
     .select('id, status')
@@ -152,19 +152,6 @@ async function maybeCompleteRun(runId: string, origin: string) {
       .eq('id', runId);
     await log(runId, 'Verification complete');
     console.log('[verify/claim] All claims done — run marked complete');
-    return;
-  }
-
-  const hasChecking = remaining.some((c) => c.status === 'checking');
-  const hasPending  = remaining.some((c) => c.status === 'pending');
-  if (!hasChecking && hasPending) {
-    fetch(`${origin}/api/verify/run`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ runId }),
-    }).catch((e) => {
-      console.error(`[verify/claim] Failed to dispatch next claim for run ${runId}:`, e);
-    });
   }
 }
 
