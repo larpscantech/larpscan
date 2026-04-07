@@ -223,9 +223,23 @@ export const POST = withErrorHandler(async (req: Request) => {
   }
 
   if (!websiteText) {
-    await supabase.from('verification_runs').update({ status: 'complete' }).eq('id', runId);
-    await log(runId, 'No website content available — 0 claims extracted');
-    return ok({ runId, project, status: 'started' as const });
+    // Scraping failed — try to extract claims from project metadata (description,
+    // name, Twitter) if we have enough to work with. Projects like bortagent.xyz
+    // block headless browsers but have rich descriptions via CoinGecko / DexScreener.
+    const syntheticContent = [
+      project.description ?? '',
+      project.twitter ? `Twitter: ${project.twitter}` : '',
+      project.name ? `Project: ${project.name} (${project.symbol ?? ''})` : '',
+    ].filter(Boolean).join('\n').trim();
+
+    if (syntheticContent.length < 50) {
+      await supabase.from('verification_runs').update({ status: 'complete' }).eq('id', runId);
+      await log(runId, 'No website content or metadata available — 0 claims extracted');
+      return ok({ runId, project, status: 'started' as const });
+    }
+
+    await log(runId, `Website blocked — falling back to project metadata for claim extraction (${syntheticContent.length} chars)`);
+    websiteText = syntheticContent;
   }
 
   // ── 6. Extract claims via LLM ─────────────────────────────────────────────
@@ -242,7 +256,12 @@ export const POST = withErrorHandler(async (req: Request) => {
     }
   }
 
-  const extracted = await extractClaimsFromText(project.name, websiteText, xText);
+  const extracted = await extractClaimsFromText(project.name, websiteText, xText, {
+    symbol:      project.symbol,
+    chain:       project.chain,
+    twitter:     project.twitter,
+    description: project.description,
+  });
 
   if (extracted.length === 0) {
     await supabase.from('verification_runs').update({ status: 'complete' }).eq('id', runId);

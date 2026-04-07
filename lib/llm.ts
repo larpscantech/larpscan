@@ -177,13 +177,41 @@ export async function extractClaimsFromText(
   projectName: string,
   websiteText: string,
   xText?: string,
+  /** Optional project metadata to supplement minimal website content */
+  projectMeta?: {
+    symbol?: string | null;
+    chain?: string | null;
+    twitter?: string | null;
+    description?: string | null;
+  },
 ): Promise<ExtractedClaim[]> {
   const client = getClient();
 
   const sections: string[] = [
-    `Project name: ${projectName}`,
-    `--- Website content ---\n${websiteText}`,
+    `Project name: ${projectName}${projectMeta?.symbol ? ` (${projectMeta.symbol})` : ''}`,
   ];
+
+  // When website content is minimal, supplement with available metadata
+  if (websiteText.split('\n\n--- Navigation paths')[0].length < 250) {
+    const meta: string[] = [];
+    if (projectMeta?.chain)       meta.push(`Chain: ${projectMeta.chain.toUpperCase()}`);
+    if (projectMeta?.twitter)     meta.push(`Twitter/X: ${projectMeta.twitter}`);
+    if (projectMeta?.description) meta.push(`Description: ${projectMeta.description}`);
+    if (meta.length > 0) {
+      sections.push(`--- Project metadata (website content was too minimal to scrape) ---\n${meta.join('\n')}`);
+    }
+    sections.push(`--- Website content (minimal — site may block scrapers) ---\n${websiteText}`);
+    // Instruct LLM to infer from name/symbol/context when content is sparse
+    sections.push(
+      `NOTE: Website returned very little content. Infer 2–3 realistic claims from the project ` +
+      `name, symbol, and any metadata above. Use your knowledge of BSC/BNB chain DeFi patterns ` +
+      `(token launches, staking, trading, cashback, leaderboards) to construct plausible claims ` +
+      `that a legitimate project with this name would actually implement.`,
+    );
+  } else {
+    sections.push(`--- Website content ---\n${websiteText}`);
+  }
+
   if (xText && xText.length > 20) {
     sections.push(`--- Recent X (Twitter) posts ---\n${xText}`);
   }

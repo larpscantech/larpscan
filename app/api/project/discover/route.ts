@@ -71,8 +71,9 @@ function normalizeTwitter(raw: string | null | undefined): string | null {
 interface DexPair {
   info?: {
     imageUrl?: string;
-    websites?: { url: string }[];
+    websites?: { url: string; label?: string }[];
     socials?: { type: string; url: string }[];
+    description?: string;
   };
 }
 
@@ -89,11 +90,19 @@ async function getDexScreenerData(address: string): Promise<Enrichment> {
     const pair  = pairs.find((p) => p.info) ?? pairs[0];
     const info  = pair?.info;
 
+    // Prefer a website labeled "Dapp" or "App" over the first entry (which is
+    // often just a marketing landing page). Falls back to first URL if none found.
+    const dappLabels = /dapp|app|launch|platform/i;
+    const websiteUrl =
+      info?.websites?.find((w) => dappLabels.test(w.label ?? ''))?.url ??
+      info?.websites?.[0]?.url ??
+      null;
+
     return {
-      website:     info?.websites?.[0]?.url ?? null,
+      website:     websiteUrl,
       twitter:     normalizeTwitter(info?.socials?.find((s) => s.type === 'twitter')?.url),
       logoUrl:     info?.imageUrl ?? null,
-      description: null,
+      description: info?.description?.trim() || null,
       source:      'dexscreener',
     };
   } catch {
@@ -185,6 +194,26 @@ async function getGeckoTerminalData(address: string): Promise<Enrichment> {
       description: null,
       source:      'geckoterminal',
     };
+  } catch {
+    return EMPTY;
+  }
+}
+
+// ─── Source 3b: CoinGecko — description only ─────────────────────────────────
+// Free tier, no key required. Good source for project descriptions.
+
+async function getCoinGeckoDescription(address: string): Promise<Enrichment> {
+  try {
+    const res = await fetch(
+      `https://api.coingecko.com/api/v3/coins/bsc/contract/${address}`,
+      { next: { revalidate: 600 } },
+    );
+    if (!res.ok) return EMPTY;
+    const data = await res.json() as { description?: { en?: string }; links?: { homepage?: string[] } };
+    const description = data.description?.en?.trim().slice(0, 400) || null;
+    // CoinGecko sometimes has a homepage that's more reliable than aggregators
+    const website = data.links?.homepage?.find((u) => u?.startsWith('http')) ?? null;
+    return { website: website || null, twitter: null, logoUrl: null, description, source: 'coingecko' };
   } catch {
     return EMPTY;
   }
@@ -489,15 +518,16 @@ export const POST = withErrorHandler(async (req: Request) => {
   const { name, symbol } = await getTokenMetadata(contractAddress);
   console.log('[discover] On-chain token:', { name, symbol });
 
-  // 3. All seven enrichment sources fire in parallel — no waiting on each other.
+  // 3. All eight enrichment sources fire in parallel — no waiting on each other.
   // Launchpad-native sources (FLAP, four.meme) are first in the merge so their
   // authoritative IPFS/API metadata wins over aggregator guesses.
-  const [flap, fourMeme, dex, onChain, gecko, moralis, trustWallet] = await Promise.all([
+  const [flap, fourMeme, dex, onChain, gecko, coinGecko, moralis, trustWallet] = await Promise.all([
     getFlapData(contractAddress),
     getFourMemeData(contractAddress),
     getDexScreenerData(contractAddress),
     getOnChainMetadata(contractAddress),
     getGeckoTerminalData(contractAddress),
+    getCoinGeckoDescription(contractAddress),
     getMoralisData(contractAddress),
     getTrustWalletData(contractAddress),
   ]);
@@ -507,11 +537,12 @@ export const POST = withErrorHandler(async (req: Request) => {
   console.log('[discover] DexScreener   :', dex);
   console.log('[discover] On-chain      :', onChain);
   console.log('[discover] GeckoTerminal :', gecko);
+  console.log('[discover] CoinGecko     :', { description: coinGecko.description, website: coinGecko.website });
   console.log('[discover] Moralis       :', moralis);
   console.log('[discover] TrustWallet   :', trustWallet);
 
   // FLAP → four.meme → aggregators: launchpad sources win
-  const rawEnrichment = merge(flap, fourMeme, dex, onChain, gecko, moralis, trustWallet);
+  const rawEnrichment = merge(flap, fourMeme, dex, onChain, gecko, coinGecko, moralis, trustWallet);
 
   // Resolve any short-link website URLs (t.co etc.) to their final destinations
   // so the DB stores the real site and the scraper can extract meaningful content.

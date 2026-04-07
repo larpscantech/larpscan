@@ -406,6 +406,32 @@ export async function determineVerdict(
       reasoning?:  string;
     };
 
+    // If GPT-4o returned an empty/incomplete JSON, retry once with a simpler prompt
+    if (!parsed.verdict && !parsed.reasoning) {
+      console.warn('[verdict] LLM returned empty response — retrying with simplified prompt');
+      const retry = await client.chat.completions.create({
+        model:           'gpt-4o-mini',
+        temperature:     0,
+        max_tokens:      300,
+        response_format: { type: 'json_object' },
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a smart contract claim auditor. Respond ONLY with JSON: {"verdict":"VERIFIED"|"FAILED"|"UNTESTABLE"|"LARP","confidence":"high"|"medium"|"low","reasoning":"1-2 sentences"}',
+          },
+          {
+            role: 'user',
+            content: `Claim: "${claim}"\n\nEvidence summary: ${evidenceSummary.slice(0, 1000)}\n\nGive your verdict.`,
+          },
+        ],
+      });
+      const retryRaw    = retry.choices[0]?.message?.content ?? '{}';
+      const retryParsed = JSON.parse(retryRaw) as typeof parsed;
+      if (retryParsed.verdict) {
+        Object.assign(parsed, retryParsed);
+      }
+    }
+
     const verdict = VERDICT_MAP[parsed.verdict?.toUpperCase() ?? ''] ?? 'failed';
 
     const rawReasoning = parsed.reasoning ?? 'No reasoning provided';

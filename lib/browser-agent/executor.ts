@@ -1059,9 +1059,23 @@ export async function executeSteps(
   // Persists across loop iterations so each attempt picks the next handle.
   let alreadyExistsAttempt = 0;
 
+  // Post-fill submit injection flag — ensures we attempt a submit-button click
+  // exactly once after all form inputs have been filled, by scrolling to reveal
+  // any below-fold submit/create/deploy button and injecting a click_text step.
+  let hasInjectedPostFillSubmit = false;
+
   // Use a mutable queue so we can dynamically inject steps discovered
   // after content loads (e.g. Mint button revealed after Preview completes).
   const stepsToRun: AgentStep[] = [...steps];
+
+  // Pre-compute whether the original LLM plan already included fill_input steps
+  // or a submit-button click. Used to skip the form-fill pass and post-fill submit
+  // injection when the planner has already accounted for them.
+  const SUBMIT_KW = ['create', 'deploy', 'mint', 'launch', 'submit', 'confirm', 'publish', 'generate', 'save', 'add', 'next'];
+  const planHadFillSteps   = steps.some((s) => s.action === 'fill_input');
+  const planHadSubmitClick = steps.some(
+    (s) => s.action === 'click_text' && SUBMIT_KW.some((k) => ((s as { action: string; text?: string }).text ?? '').toLowerCase().includes(k)),
+  );
 
   // Dismiss cookie/GDPR banners once before the first step
   await dismissConsentBanner(page);
@@ -1089,7 +1103,8 @@ export async function executeSteps(
       // then adaptiveCallCount is incremented so the condition never fires again.
       if (
         options?.featureType === 'TOKEN_CREATION' &&
-        adaptiveCallCount === 0
+        adaptiveCallCount === 0 &&
+        !planHadFillSteps   // skip when the planner already included fill steps
       ) {
         adaptiveCallCount++;  // consume one adaptive slot so this never loops
         const visibleInputs = await page.$$eval(
@@ -1117,6 +1132,56 @@ export async function executeSteps(
           }
         }
         // no inputs found — fall through to normal adaptive step below
+      }
+
+      // ── Post-fill submit injection ─────────────────────────────────────────
+      // After all form inputs have been filled (by either the form-fill pass or
+      // the adaptive planner), scroll down to reveal any below-fold submit/create
+      // button and inject a click_text step. This prevents the agent from stopping
+      // right after filling the last field without ever clicking "Submit"/"Create".
+      // Skipped when the LLM plan already included a submit-button click so we
+      // don't double-submit (e.g. bnbshare.fun already has "Create Token" in plan).
+      if (
+        !hasInjectedPostFillSubmit &&
+        !planHadSubmitClick &&
+        adaptiveCallCount > 0 &&
+        observations.some((o) => typeof o.step === 'string' && o.step.startsWith('fill_input'))
+      ) {
+        hasInjectedPostFillSubmit = true;
+
+        // Scroll toward the bottom to surface any below-fold submit button
+        await page.evaluate(() => window.scrollBy(0, 600)).catch(() => {});
+        await page.waitForTimeout(700);
+
+        const SUBMIT_KEYWORDS = SUBMIT_KW;
+        const submitText = await page.$$eval(
+          'button:not([disabled]), [role="button"]:not([aria-disabled="true"]), input[type="submit"]:not([disabled])',
+          (els, keywords) => {
+            const visible = els.filter((el) => {
+              const s = window.getComputedStyle(el);
+              if (s.display === 'none' || s.visibility === 'hidden') return false;
+              const r = (el as HTMLElement).getBoundingClientRect();
+              return r.width > 0 && r.height > 0;
+            });
+            const scored = visible.map((el) => {
+              const text = (el.textContent ?? '').replace(/\s+/g, ' ').trim();
+              const lower = text.toLowerCase();
+              const idx   = (keywords as string[]).findIndex((k) => lower.includes(k));
+              return { text, score: idx === -1 ? 999 : idx };
+            });
+            scored.sort((a, b) => a.score - b.score);
+            return scored.length > 0 && scored[0].score < 999 ? scored[0].text : null;
+          },
+          SUBMIT_KEYWORDS,
+        ).catch(() => null);
+
+        if (submitText) {
+          console.log(`[executor] Post-fill submit: injecting click_text "${submitText}"`);
+          stepsToRun.unshift({ action: 'click_text', text: submitText.slice(0, 60) });
+          continue;
+        } else {
+          console.log('[executor] Post-fill submit: no submit button visible after scroll — falling through to adaptive');
+        }
       }
 
       // Queue empty but budget remains — ask the LLM what to do next.
@@ -1273,6 +1338,31 @@ export async function executeSteps(
     const urlChanged     = urlAfter !== urlBefore;
     const modalOpened    = !modalBefore && modalAfter;
     const newInputs      = inputsAfter.filter((i) => !inputsBefore.includes(i));
+
+    // ── Off-domain auto-recovery ─────────────────────────────────────────────
+    // If the agent followed an external auth redirect (Twitter, GitHub, Google,
+    // Privy OAuth, etc.) and landed outside the target website, navigate back
+    // immediately. This prevents wasted steps on the wrong domain and keeps the
+    // Browserless recording session on the correct origin.
+    const baseDomainHost = (() => {
+      try { return new URL(baseDomain).hostname.replace(/^www\./, ''); } catch { return ''; }
+    })();
+    const urlAfterHost = (() => {
+      try { return new URL(urlAfter).hostname.replace(/^www\./, ''); } catch { return ''; }
+    })();
+    const isOffDomain = baseDomainHost.length > 0 &&
+      urlAfterHost.length > 0 &&
+      !urlAfterHost.endsWith(baseDomainHost) &&
+      !baseDomainHost.endsWith(urlAfterHost);
+
+    if (isOffDomain && urlChanged) {
+      console.log(`[executor] Off-domain redirect detected: ${urlAfterHost} ≠ ${baseDomainHost} — navigating back`);
+      await page.goto(baseDomain, { waitUntil: 'domcontentloaded', timeout: 10_000 }).catch(() => {});
+      await page.waitForTimeout(1_000);
+      obs.result = `Off-domain auth redirect (${urlAfterHost}) — agent returned to site. Feature likely requires social login.`;
+      observations.push(obs as AgentObservation);
+      continue;
+    }
     const visibleSignals = headingsAfter.filter((h) => !headingsBefore.includes(h));
     const pageTextDiff   = Math.abs(textAfter.length - textBefore.length);
     const ctaStateChanged =

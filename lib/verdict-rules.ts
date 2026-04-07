@@ -111,6 +111,33 @@ const rule0a: Rule = {
     if (!signals?.transactionHash || signals.transactionReceiptStatus !== 'reverted') return null;
     const explorerUrl = signals.transactionExplorerUrl ?? `https://bscscan.com/tx/${signals.transactionHash}`;
     console.log(`[verdict] Rule 0a MATCH — tx reverted: ${signals.transactionHash}`);
+
+    // If the platform IS accessible (form visible, own API calls made, CTA enabled),
+    // a reverted TX likely means the test wallet/data hit platform-specific requirements
+    // (e.g. registered social handle, minimum balance for creation fee). The feature
+    // exists and the UI works — downgrade to UNTESTABLE so we don't wrongly flag
+    // a working platform as FAILED just because our test data didn't pass validation.
+    const platformFunctional =
+      signals.formAppeared &&
+      signals.ownDomainApiCalls.length > 0 &&
+      signals.enabledCtaPresent;
+
+    if (platformFunctional) {
+      return {
+        resolved:      true,
+        verdict:       'untestable',
+        confidence:    'medium',
+        matchedRule:   this.name,
+        blockerReason: 'Transaction reverted — platform requires validated data (handle/fee) beyond test scope',
+        reasons: [
+          'The form was reachable and interactable, but the on-chain transaction was reverted by the smart contract',
+          'This is likely due to platform-specific validation (e.g. unregistered social handle, creation fee) rather than a broken feature',
+          `Transaction hash: ${signals.transactionHash}`,
+          `Explorer: ${explorerUrl}`,
+        ],
+      };
+    }
+
     return {
       resolved:      true,
       verdict:       'failed',
@@ -118,10 +145,9 @@ const rule0a: Rule = {
       matchedRule:   this.name,
       blockerReason: 'On-chain transaction was mined but reverted',
       reasons: [
-        'Transaction was mined on BSC but execution reverted — contract logic rejected it (not a gas/funds issue; the node already accepted and mined the tx)',
+        'Transaction was mined on BSC but execution reverted — contract logic rejected it',
         `Transaction hash: ${signals.transactionHash}`,
         `Explorer: ${explorerUrl}`,
-        'UI "Transaction failed" is consistent with a reverted on-chain execution',
       ],
     };
   },
@@ -598,6 +624,57 @@ const rule7: Rule = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Rule 8: Pure landing page — many steps, all scrolls/navigates, zero signals
+// When the agent ran multiple adaptive steps but every one was just scrolling
+// or re-navigating the homepage (no form, no API, no modal, no CTA engagement),
+// the site is a placeholder / larp — the claimed feature doesn't exist yet.
+// ─────────────────────────────────────────────────────────────────────────────
+const rule8: Rule = {
+  name: 'Rule 8: pure_landing_page_no_feature',
+  evaluate(signals) {
+    if (!signals) return null;
+
+    const steps    = signals.totalSteps;
+    const noops    = signals.noopCount;
+    const hasForm  = signals.formAppeared;
+    const hasApi   = signals.ownDomainApiCalls.length > 0;
+    const hasModal = signals.modalOpened;
+
+    // Require: many steps were run (agent tried hard), none led to a feature
+    // Allow route_missing blocker (feature simply doesn't exist) but NOT auth gates
+    const authBlockers = signals.blockersEncountered.filter(b =>
+      b === 'auth_required' || b === 'wallet_only_gate' || b === 'page_broken',
+    );
+    if (
+      steps >= 5 &&
+      !hasForm &&
+      !hasApi &&
+      !hasModal &&
+      authBlockers.length === 0 &&  // no login/wallet gate — the site just has nothing
+      noops < steps   // steps DID have some effect (scrolls count as non-noop)
+    ) {
+      return {
+        resolved:      true,
+        verdict:       'larp',
+        confidence:    'medium',
+        matchedRule:   this.name,
+        blockerReason: 'Website appears to be a placeholder — no functional feature surface found',
+        reasons: [
+          `Agent ran ${steps} steps but found no form, no API calls, no CTA, and no modal`,
+          'Site only has a landing page — the claimed feature does not appear to be implemented',
+          'Pattern consistent with a pre-launch placeholder or unbuilt product',
+        ],
+      };
+    }
+
+    if (steps >= 5 && !hasForm && !hasApi && !hasModal)
+      console.log(`[verdict:l1] Rule 8 skipped: blockers=[${signals.blockersEncountered.join(',')}] noops=${noops}/${steps} authBlockers=${authBlockers.join(',')}`);
+
+    return null;
+  },
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Ordered rule chain — evaluated top to bottom, first match wins
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -606,7 +683,7 @@ const RULES: Rule[] = [
   rule1, rule1b,
   rule2, rule2b, rule3,
   rule4, rule4b, rule4a,
-  rule5, rule6, rule7,
+  rule5, rule6, rule7, rule8,
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────

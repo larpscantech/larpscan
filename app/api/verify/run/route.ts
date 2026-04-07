@@ -79,37 +79,58 @@ export const POST = withErrorHandler(async (req: Request) => {
   // Each claim row is atomically flipped to "checking" via a conditional
   // UPDATE (.eq('status','pending')) before firing the fetch, preventing
   // duplicate workers if this endpoint is called more than once.
+  // Claims are staggered by 1.5s each to avoid saturating the local dev
+  // HTTP connection pool (a Vercel serverless environment doesn't have this
+  // problem — each claim is its own isolated function invocation).
   const origin = new URL((req as NextRequest).url).origin;
 
   const dispatched: string[] = [];
+  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-  await Promise.all(
-    pendingClaims.map(async (claim) => {
-      const { data: claimed } = await supabase
-        .from('claims')
-        .update({ status: 'checking' })
-        .eq('id', claim.id)
-        .eq('status', 'pending')
-        .select('id')
-        .single<{ id: string }>();
+  const stakeAndDispatch = async (claim: DbClaim, idx: number) => {
+    const { data: claimed } = await supabase
+      .from('claims')
+      .update({ status: 'checking' })
+      .eq('id', claim.id)
+      .eq('status', 'pending')
+      .select('id')
+      .single<{ id: string }>();
 
-      if (!claimed) {
-        console.log(`[verify/run] Claim ${claim.id} already taken — skipping`);
-        return;
+    if (!claimed) {
+      console.log(`[verify/run] Claim ${claim.id} already taken — skipping`);
+      return;
+    }
+
+    dispatched.push(claim.id);
+    await log(runId, `Dispatching claim: ${claim.claim}`);
+
+    // Stagger each claim by 1.5s × index so the local dev Node.js HTTP server
+    // isn't flooded with simultaneous connections before it's ready.
+    if (idx > 0) await sleep(1500 * idx);
+
+    const dispatchWithRetry = async (attempt = 0): Promise<void> => {
+      try {
+        fetch(`${origin}/api/verify/claim`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ runId, claimId: claim.id }),
+        }).catch((e) => {
+          console.error(`[verify/run] Fire-and-forget claim ${claim.id} ended with error:`, e);
+        });
+      } catch (e) {
+        if (attempt < 2) {
+          console.warn(`[verify/run] Dispatch attempt ${attempt + 1} failed for claim ${claim.id} — retrying in ${(attempt + 1) * 2}s`);
+          await sleep((attempt + 1) * 2000);
+          return dispatchWithRetry(attempt + 1);
+        }
+        console.error(`[verify/run] Failed to dispatch claim ${claim.id} after retries:`, e);
       }
+    };
 
-      dispatched.push(claim.id);
-      await log(runId, `Dispatching claim: ${claim.claim}`);
+    await dispatchWithRetry();
+  };
 
-      fetch(`${origin}/api/verify/claim`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ runId, claimId: claim.id }),
-      }).catch((e) => {
-        console.error(`[verify/run] Failed to dispatch claim ${claim.id}:`, e);
-      });
-    }),
-  );
+  await Promise.all(pendingClaims.map((claim, idx) => stakeAndDispatch(claim, idx)));
 
   console.log(`[verify/run] Dispatched ${dispatched.length} claim(s) in parallel for run ${runId}`);
 

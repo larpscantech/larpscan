@@ -247,23 +247,25 @@ async function fetchViaHttp(url: string): Promise<string> {
 
 // ── Strategy 2: Playwright render (for SPAs / React / Next / Vue apps) ───────
 
-async function fetchViaPlaywright(url: string): Promise<string> {
-  console.log('[scraper] SPA detected — launching Playwright render...');
+async function fetchViaPlaywright(url: string, mobile = false, gotoTimeout = 25_000): Promise<string> {
+  console.log(`[scraper] SPA detected — launching Playwright render${mobile ? ' (mobile UA)' : ''}...`);
 
   const browser = await launchChromium({ headless: true });
 
   try {
     const context = await browser.newContext({
-      userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-        '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      userAgent: mobile
+        ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
+        : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+          '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      ...(mobile ? { viewport: { width: 390, height: 844 } } : {}),
     });
     const page = await context.newPage();
 
     // Use 'domcontentloaded' so pages with continuous rAF animation loops
     // (or long-running background fetches) don't stall the scrape forever.
     // We add an extra wait after load to let JS-rendered content paint.
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 });
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: gotoTimeout });
 
     // Wait for either a known JS-framework mount signal or a fixed time cap
     await Promise.race([
@@ -361,8 +363,15 @@ export async function fetchWebsiteText(rawUrl: string): Promise<string> {
       const rendered = await fetchViaPlaywright(url);
       const renderedTextOnly = rendered.split('\n\n--- Navigation paths')[0];
       if (renderedTextOnly.length > textOnly.length) return rendered;
-      // Playwright ran but returned equally empty content — log for visibility
-      console.warn(`[scraper] Playwright returned no more content than HTTP (${renderedTextOnly.length} chars) — site may block headless browsers`);
+      // Playwright ran but returned equally empty content — try mobile UA fallback
+      console.warn(`[scraper] Playwright returned no more content than HTTP (${renderedTextOnly.length} chars) — trying mobile user-agent`);
+      const mobile = await fetchViaPlaywright(url, /* mobile */ true, /* timeout */ 15_000);
+      const mobileTextOnly = mobile.split('\n\n--- Navigation paths')[0];
+      if (mobileTextOnly.length > textOnly.length) {
+        console.log(`[scraper] Mobile UA fallback succeeded: ${mobileTextOnly.length} chars`);
+        return mobile;
+      }
+      console.warn(`[scraper] Mobile UA also returned no more content — site likely blocks all headless browsers`);
     } catch (e) {
       console.warn('[scraper] Playwright fallback failed:', (e as Error)?.message ?? e);
     }
