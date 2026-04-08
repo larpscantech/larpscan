@@ -1071,7 +1071,7 @@ export async function executeSteps(
   // Pre-compute whether the original LLM plan already included fill_input steps
   // or a submit-button click. Used to skip the form-fill pass and post-fill submit
   // injection when the planner has already accounted for them.
-  const SUBMIT_KW = ['create', 'deploy', 'mint', 'launch', 'submit', 'confirm', 'publish', 'generate', 'save', 'add', 'next'];
+  const SUBMIT_KW = ['create', 'deploy', 'mint', 'launch', 'submit', 'confirm', 'publish', 'generate', 'save', 'add', 'next', 'start', 'mine', 'claim', 'stake', 'swap', 'send', 'buy', 'sell'];
   const planHadFillSteps   = steps.some((s) => s.action === 'fill_input');
   const planHadSubmitClick = steps.some(
     (s) => s.action === 'click_text' && SUBMIT_KW.some((k) => ((s as { action: string; text?: string }).text ?? '').toLowerCase().includes(k)),
@@ -1132,6 +1132,63 @@ export async function executeSteps(
           }
         }
         // no inputs found — fall through to normal adaptive step below
+      }
+
+      // ── General address-input fill pass (all feature types) ────────────────
+      // When the plan queue empties and no fill steps were planned, check if
+      // the page has visible unfilled address/wallet inputs (e.g. mining reward
+      // address, airdrop recipient, claim-to address). If found, fill them with
+      // the investigation wallet address and inject the most relevant action
+      // button click (Start Mining, Claim, Submit, etc.).
+      // Runs exactly once (adaptiveCallCount === 0 for non-TOKEN_CREATION).
+      if (
+        options?.featureType !== 'TOKEN_CREATION' &&
+        adaptiveCallCount === 0 &&
+        !planHadFillSteps
+      ) {
+        adaptiveCallCount++;  // consume one adaptive slot
+
+        // Only look for address/wallet/BSC inputs — not generic text fields
+        const addressInputs = await page.$$eval(
+          'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([disabled])',
+          (els) => els
+            .filter((el) => {
+              const s = window.getComputedStyle(el);
+              if (s.display === 'none' || s.visibility === 'hidden') return false;
+              const r = (el as HTMLElement).getBoundingClientRect();
+              if (r.width === 0 || r.height === 0) return false;
+              // Only target address/wallet-style inputs
+              const hint = [
+                (el as HTMLInputElement).placeholder ?? '',
+                (el as HTMLInputElement).name ?? '',
+                el.id ?? '',
+              ].join(' ').toLowerCase();
+              return /address|wallet|recipient|bsc|0x|reward/i.test(hint);
+            })
+            .map((el) => ({
+              selector: el.id
+                ? `#${CSS.escape(el.id)}`
+                : (el as HTMLInputElement).placeholder
+                  ? `[placeholder="${CSS.escape((el as HTMLInputElement).placeholder)}"]`
+                  : (el as HTMLInputElement).name
+                    ? `[name="${CSS.escape((el as HTMLInputElement).name)}"]`
+                    : 'input',
+              currentValue: (el as HTMLInputElement).value ?? '',
+            })),
+        ).catch(() => [] as { selector: string; currentValue: string }[]);
+
+        const unfilledAddr = addressInputs.filter((i) => !i.currentValue.trim());
+        if (unfilledAddr.length > 0 && options?.investigationWalletAddress) {
+          console.log(`[executor] Address-input fill pass: ${unfilledAddr.length} unfilled address input(s) — injecting fill + action`);
+          const fillSteps: AgentStep[] = unfilledAddr.map((inp) => ({
+            action: 'fill_input' as const,
+            selector: inp.selector,
+            value: options.investigationWalletAddress ?? '',
+          }));
+          stepsToRun.unshift(...fillSteps);
+          continue;
+        }
+        // no unfilled address inputs — fall through to LLM adaptive step
       }
 
       // ── Post-fill submit injection ─────────────────────────────────────────

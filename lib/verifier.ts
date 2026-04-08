@@ -76,7 +76,7 @@ async function convertWebmToMp4(webmBuffer: Buffer, tag: string): Promise<Buffer
       '-an',
       '-movflags', '+faststart',
       tmpOut,
-    ], { timeout: 120_000, maxBuffer: 10 * 1024 * 1024 });
+    ], { timeout: 120_000, maxBuffer: 50 * 1024 * 1024 });
 
     const mp4Buffer = await fs.readFile(tmpOut);
     const inKB  = (webmBuffer.length / 1024).toFixed(0);
