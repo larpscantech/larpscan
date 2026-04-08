@@ -92,17 +92,25 @@ async function screenshot(page, name) {
       await forceLabel.click();
       console.log('  ✓ Force Re-verify enabled');
     }
-    await sleep(300);
+    // Wait for the 600ms debounce active-run check to fire before deciding
+    // whether to click Verify manually.
+    await sleep(1500);
 
-    // ── 4. Click Verify ──────────────────────────────────────────────────────────
+    // ── 4. Click Verify (skip if debounce already auto-started a run) ────────────
     console.log('[4/5] Clicking Verify…');
-    const verifyBtn = page.locator('button:not([disabled])').filter({ hasText: /verify/i }).last();
-    for (let i = 0; i < 10; i++) {
-      if (await verifyBtn.isVisible().catch(() => false)) break;
-      await sleep(500);
+
+    if (capturedRunId) {
+      // Debounce auto-teleported to an existing active run — no manual click needed
+      console.log(`  ✓ Auto-teleport already started run ${capturedRunId.slice(0, 8)}… — skipping manual click`);
+    } else {
+      const verifyBtn = page.locator('button:not([disabled])').filter({ hasText: /verify/i }).last();
+      for (let i = 0; i < 10; i++) {
+        if (await verifyBtn.isVisible().catch(() => false)) break;
+        await sleep(500);
+      }
+      await verifyBtn.click({ timeout: 10_000 });
+      console.log('  ✓ Verify clicked');
     }
-    await verifyBtn.click({ timeout: 10_000 });
-    console.log('  ✓ Verify clicked');
     await screenshot(page, '03-after-click');
 
     // ── Wait up to 120s for runId to be captured from network ──────────────────

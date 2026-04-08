@@ -2,7 +2,7 @@ import { NextRequest } from 'next/server';
 import { supabase } from '@/lib/supabase';
 import { log } from '@/lib/logger';
 import { ok, err, withErrorHandler } from '@/lib/api-helpers';
-import type { DbVerificationRun, DbAgentLog, DbClaimWithEvidence } from '@/lib/db-types';
+import type { DbVerificationRun, DbAgentLog, DbClaimWithEvidence, DbProject } from '@/lib/db-types';
 
 const STUCK_CHECKING_MS = 5.5 * 60 * 1000; // 5.5 min — just above Vercel's 300s hard kill
 
@@ -55,6 +55,13 @@ export const GET = withErrorHandler(async (req: Request) => {
   let claims = claimsResult.data ?? [];
   const logs = logsResult.data ?? [];
 
+  // Fetch the associated project so callers don't need a second round-trip
+  const { data: project } = await supabase
+    .from('projects')
+    .select('*')
+    .eq('id', run.project_id)
+    .maybeSingle<DbProject>();
+
   // Auto-heal claims stuck in "checking" (Vercel killed the worker at the
   // 300s hard limit). Then close the run whenever ALL claims are terminal,
   // regardless of whether healing happened this cycle or a previous one.
@@ -96,5 +103,6 @@ export const GET = withErrorHandler(async (req: Request) => {
     run,
     claims,
     logs,
+    project: project ?? null,
   });
 });

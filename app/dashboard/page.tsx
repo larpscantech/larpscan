@@ -445,7 +445,11 @@ export default function DashboardPage() {
   const [resolvedResultsCount, setResolvedResultsCount] = useState(0);
   const [checkingClaimIndex, setCheckingClaimIndex]     = useState(-1);
 
-  const runIdRef = useRef(0);
+  const runIdRef  = useRef(0);
+  // Kept in sync with `phase` so effects with stable deps can read the latest phase
+  // without adding `phase` to their dependency array (avoids spurious re-runs).
+  const phaseRef  = useRef<Phase>('idle');
+  useEffect(() => { phaseRef.current = phase; }, [phase]);
 
   // ── Recent scans (real data from DB) ─────────────────────────────────────────
   const [recentScans, setRecentScans] = useState<RecentVerification[]>([]);
@@ -474,6 +478,14 @@ export default function DashboardPage() {
       window.sessionStorage.removeItem('larpscan_dashboard_entry');
     }
     setEntryChecked(true);
+
+    // ── Restore CA from URL on refresh / direct link ─────────────────────────
+    // If the URL has ?ca=0x..., prefill the input. The debounced active-run
+    // check further below will auto-join the run if it's still in progress.
+    const urlCa = new URLSearchParams(window.location.search).get('ca')?.trim();
+    if (urlCa && /^0x[0-9a-fA-F]{40,}$/i.test(urlCa)) {
+      setInput(urlCa);
+    }
   }, []);
 
   useEffect(() => {
@@ -498,6 +510,81 @@ export default function DashboardPage() {
       delete w.__larpscanSetAddress;
     };
   }, []);
+
+  // ── Debounced active-run check ────────────────────────────────────────────
+  // When the user types a valid-looking CA (or one is restored from the URL),
+  // we wait 600 ms then ask the server if there's already an active run for it.
+  // Active run  → auto-teleport (join via startVerification → orchestrate join path).
+  // Completed   → load result directly from /api/verify/status (skip orchestrate).
+  // Idle phases only to avoid interrupting an in-progress scan.
+  useEffect(() => {
+    const trimmed = input.trim();
+    if (!trimmed || !/^0x[0-9a-fA-F]{40,}$/i.test(trimmed)) return;
+    if (phaseRef.current !== 'idle') return;
+
+    const timer = window.setTimeout(async () => {
+      if (phaseRef.current !== 'idle') return;
+      try {
+        const res = await fetch(`/api/verify/active?ca=${encodeURIComponent(trimmed)}`);
+        if (!res.ok) return;
+        const data = await res.json() as {
+          hasActiveRun:    boolean;
+          hasCompletedRun: boolean;
+          runId:           string | null;
+          runStatus:       string | null;
+        };
+        if (phaseRef.current !== 'idle') return;
+
+        if (data.hasActiveRun && data.runId) {
+          // In-flight run — join through the normal pipeline
+          console.log(`[dashboard] Auto-teleporting to active run ${data.runId} for CA ${trimmed}`);
+          void startVerification(trimmed);
+          return;
+        }
+
+        if (data.hasCompletedRun && data.runId) {
+          // Completed run — load directly from status, bypassing orchestrate
+          console.log(`[dashboard] Auto-loading completed run ${data.runId} for CA ${trimmed}`);
+          try {
+            const statusRes = await fetch(`/api/verify/status?runId=${data.runId}`);
+            if (!statusRes.ok || phaseRef.current !== 'idle') return;
+            const statusData = await statusRes.json() as {
+              run:     DbVerificationRun;
+              claims:  DbClaimWithEvidence[];
+              logs:    { message: string }[];
+              project: DbProject | null;
+            };
+            if (phaseRef.current !== 'idle') return;
+
+            if (statusData.project) setRealProject(statusData.project);
+            setCurrentRunId(data.runId);
+            setRealClaims(statusData.claims);
+            setVisibleClaimsCount(statusData.claims.length);
+            setResolvedResultsCount(statusData.claims.length);
+            setCheckingClaimIndex(-1);
+            setProjectLoaded(true);
+            setPhase('complete');
+            setDisplayedLogs(['Restored from previous run ✓']);
+
+            // Push CA to URL
+            if (typeof window !== 'undefined') {
+              const url = new URL(window.location.href);
+              url.searchParams.set('ca', trimmed);
+              window.history.replaceState({}, '', url.toString());
+            }
+          } catch {
+            // Non-fatal — user can click verify manually
+          }
+        }
+      } catch {
+        // Non-fatal — user can still click verify manually
+      }
+    }, 600);
+
+    return () => window.clearTimeout(timer);
+  // `startVerification` is stable (useCallback). `input` changes drive this effect.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [input]);
 
   // ── Elapsed timer ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -688,6 +775,13 @@ export default function DashboardPage() {
     setProjectLoaded(true);
     setCurrentRunId(runId);
 
+    // ── Push CA to URL so a refresh auto-reconnects ───────────────────────────
+    if (typeof window !== 'undefined') {
+      const url = new URL(window.location.href);
+      url.searchParams.set('ca', address);
+      window.history.replaceState({}, '', url.toString());
+    }
+
     addLog(`Token: ${project.name} (${project.symbol})`);
     if (project.website) addLog(`Website: ${project.website}`);
     addLog(`Run ID: ${runId.slice(0, 8)}...`);
@@ -747,9 +841,51 @@ export default function DashboardPage() {
     setPhase('analyzing');
     addLog('Waiting for claim extraction and verification...');
 
-    // Give the server a moment to dispatch and start processing claims
-    await sleep(3_000);
+    // Give the server a moment to dispatch and start processing claims.
+    // When joining an already-running session we skip the warm-up wait and
+    // immediately detect the real phase from the live run state.
+    if (orchResult.status === 'joined') {
+      // Fetch the current run state so we can set the correct phase immediately.
+      try {
+        const liveStatus = await apiGet<{
+          run: DbVerificationRun;
+          claims: DbClaimWithEvidence[];
+          logs: { message: string }[];
+        }>('/api/verify/status', `/api/verify/status?runId=${runId}`);
+
+        if (alive()) {
+          const allDone = liveStatus.claims.every(
+            (c) => c.status !== 'pending' && c.status !== 'checking',
+          );
+          if (allDone && liveStatus.run?.status === 'complete') {
+            setRealClaims(liveStatus.claims);
+            setVisibleClaimsCount(liveStatus.claims.length);
+            setResolvedResultsCount(liveStatus.claims.length);
+            setCheckingClaimIndex(-1);
+            setPhase('complete');
+            addLog('Verification complete (joined finished run) ✓');
+            void fetchRecentScans();
+            console.groupEnd();
+            return;
+          }
+
+          if (liveStatus.claims.length > 0) {
+            setRealClaims(liveStatus.claims);
+            setVisibleClaimsCount(liveStatus.claims.length);
+            const resolved = liveStatus.claims.filter(
+              (c) => c.status !== 'pending' && c.status !== 'checking',
+            ).length;
+            setResolvedResultsCount(resolved);
+          }
+        }
+      } catch {
+        // Non-fatal — fall through to normal polling
+      }
+    } else {
+      // Give the server a moment to dispatch and start processing claims
+      await sleep(3_000);
       if (!alive()) { console.groupEnd(); return; }
+    }
 
     await pollRunToCompletion(runId, alive, sleep);
 
