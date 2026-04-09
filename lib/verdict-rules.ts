@@ -22,6 +22,7 @@
  *   Rule 3   wallet_only_gate + noop ratio ≥ 0.8          → untestable  (high)
  *   Rule 4   DATA_DASHBOARD + (tableHeaders OR ownApi≥5 OR leaderboard API) → verified (high)
  *   Rule 4b  wallet connected + form accessible (UI_FEATURE / DEX+API only) → verified (high)
+ *   Rule 4c  WALLET_FLOW + form + CTA + own-domain API responded           → verified (medium)
  *   Rule 4a  wallet_required + formAppeared               → untestable  (high)
  *   Rule 5   auth_required + no form + no CTA             → untestable  (high)
  *   Rule 6   form + CTA + ownApi + surface (selective FT) → verified    (medium)
@@ -483,6 +484,45 @@ const rule4b: Rule = {
   },
 };
 
+const rule4c: Rule = {
+  name: 'Rule 4c: wallet_flow_form_api_interaction',
+  // WALLET_FLOW is intentionally excluded from rule 4b (which requires wallet
+  // connection evidence and form accessibility for UI_FEATURE/DEX_SWAP).
+  // This rule handles the common WALLET_FLOW pattern: the agent fills an address
+  // input, clicks the primary action button (Verify, Start Mining, Claim, etc.),
+  // and the site responds with a real API call — even if the response is
+  // "Ineligible" or "Insufficient balance". That response IS strong evidence the
+  // feature exists and functions. Without this rule every such claim falls through
+  // to LLM verdict which returns UNTESTABLE.
+  evaluate(signals, featureType) {
+    if (!signals) return null;
+    if (featureType !== 'WALLET_FLOW') return null;
+    if (signals.ownDomainApiCalls.length < 1) return null;
+    if (!signals.formAppeared) return null;
+    if (!signals.enabledCtaPresent) return null;
+    if (!signals.reachedRelevantSurface) return null;
+    if (signals.blockersEncountered.includes('wallet_only_gate')) return null;
+    if (signals.totalSteps <= 0) return null;
+
+    const reasons = [
+      `WALLET_FLOW form visible on ${signals.finalUrl}`,
+      `Enabled CTA present — agent attempted the action`,
+      `Own-domain API responded (${signals.ownDomainApiCalls.length} call(s)): ${signals.ownDomainApiCalls.slice(0, 2).join(', ')}`,
+    ];
+    if (signals.blockersEncountered.includes('wallet_required')) {
+      reasons.push('Site responded (eligibility check or balance requirement) — feature is real');
+    }
+    return {
+      resolved:      true,
+      verdict:       'verified',
+      confidence:    'medium',
+      matchedRule:   this.name,
+      blockerReason: 'WALLET_FLOW feature demonstrated: form filled, action attempted, backend responded',
+      reasons,
+    };
+  },
+};
+
 const rule4a: Rule = {
   name: 'Rule 4a: wallet_required_form_visible',
   evaluate(signals, featureType) {
@@ -682,7 +722,7 @@ const RULES: Rule[] = [
   rule0a, rule0b, rule0c, rule0,
   rule1, rule1b,
   rule2, rule2b, rule3,
-  rule4, rule4b, rule4a,
+  rule4, rule4b, rule4c, rule4a,
   rule5, rule6, rule7, rule8,
 ];
 
