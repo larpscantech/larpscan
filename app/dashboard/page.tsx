@@ -486,6 +486,46 @@ export default function DashboardPage() {
     if (urlCa && /^0x[0-9a-fA-F]{40,}$/i.test(urlCa)) {
       setInput(urlCa);
     }
+
+    // ── Instantly restore run from ?runId= on refresh / direct link ──────────
+    // If the URL has ?runId=, skip the debounce+orchestrate path entirely:
+    // fetch the run status directly and restore the UI state in <1s.
+    const urlRunId = new URLSearchParams(window.location.search).get('runId')?.trim();
+    if (urlRunId && /^[0-9a-f-]{36}$/i.test(urlRunId)) {
+      void (async () => {
+        try {
+          const res = await fetch(`/api/verify/status?runId=${urlRunId}`);
+          if (!res.ok) return;
+          const data = await res.json() as {
+            run:     DbVerificationRun;
+            claims:  DbClaimWithEvidence[];
+            logs:    { message: string }[];
+            project: DbProject | null;
+          };
+          // Only restore if in-flight or recently completed
+          if (!data.run) return;
+          if (data.project) setRealProject(data.project);
+          setCurrentRunId(urlRunId);
+          setRealClaims(data.claims ?? []);
+          setVisibleClaimsCount(data.claims?.length ?? 0);
+          setProjectLoaded(true);
+
+          if (data.run.status === 'complete') {
+            setResolvedResultsCount(data.claims?.length ?? 0);
+            setCheckingClaimIndex(-1);
+            setPhase('complete');
+            setDisplayedLogs(['Restored from previous run ✓']);
+          } else {
+            // Still verifying — restore verifying phase and let poll loop take over
+            setPhase('verifying');
+            setCheckingClaimIndex(0);
+            setDisplayedLogs([`Reconnected to run ${urlRunId.slice(0, 8)}…`]);
+          }
+        } catch {
+          // Non-fatal — user can click verify manually
+        }
+      })();
+    }
   }, []);
 
   useEffect(() => {
@@ -775,10 +815,13 @@ export default function DashboardPage() {
     setProjectLoaded(true);
     setCurrentRunId(runId);
 
-    // ── Push CA to URL so a refresh auto-reconnects ───────────────────────────
+    // ── Push CA + runId to URL so a refresh auto-reconnects instantly ────────
+    // With ?runId= in the URL, a refresh can directly load the run status
+    // without calling orchestrate again (avoids the 20-60s re-scrape delay).
     if (typeof window !== 'undefined') {
       const url = new URL(window.location.href);
       url.searchParams.set('ca', address);
+      url.searchParams.set('runId', runId);
       window.history.replaceState({}, '', url.toString());
     }
 
