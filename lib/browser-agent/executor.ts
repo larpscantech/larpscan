@@ -564,8 +564,10 @@ async function decideAdaptiveStep(
   // buttons, loaded previews, and UI state a text snippet would miss entirely.
   // The page messages tell it what the page is explicitly communicating right now.
   // liveFormFields provides EXACT CSS selectors so the model never has to guess them.
+  // Screenshot: quality 80 + detail 'high' so small text (labels, errors, button states)
+  // is actually readable. Always required — without vision the model is guessing.
   const [screenshotBuf, btns, currentMessages, liveFormFields] = await Promise.all([
-    page.screenshot({ type: 'jpeg', quality: 60, fullPage: false }).catch(() => null as Buffer | null),
+    page.screenshot({ type: 'jpeg', quality: 80, fullPage: false }).catch(() => null as Buffer | null),
     page.$$eval(
       'button:not([disabled]), [role="button"]:not([aria-disabled="true"])',
       (els) => els
@@ -673,10 +675,12 @@ Rules:
       : '',
   ].filter((l) => l !== undefined).join('\n');
 
-  // Build multimodal content when screenshot is available; fall back to text-only
+  // Build multimodal content — screenshot is always required for reliable decisions.
+  // Without vision, the model guesses from button name lists and can't read labels,
+  // error messages, or form state. detail:'high' lets it read small text properly.
   type ContentPart =
     | { type: 'text'; text: string }
-    | { type: 'image_url'; image_url: { url: string; detail: 'low' } };
+    | { type: 'image_url'; image_url: { url: string; detail: 'high' } };
 
   const userContent: ContentPart[] | string = screenshotBuf
     ? [
@@ -685,7 +689,7 @@ Rules:
           type: 'image_url',
           image_url: {
             url:    `data:image/jpeg;base64,${screenshotBuf.toString('base64')}`,
-            detail: 'low',
+            detail: 'high',
           },
         },
       ]
@@ -1037,10 +1041,10 @@ export async function executeSteps(
   let consecutiveNoops  = 0;
   let adaptiveCallCount = 0;
   const NOOP_THRESHOLD  = 3;
-  // TOKEN_CREATION flows require many adaptive steps: fill name, symbol, description,
-  // scroll, click fee-sharing toggle, fill handle, click submit — 9-11 decisions minimum.
-  // Other feature types rarely need more than 5.
-  const MAX_ADAPTIVE = options?.featureType === 'TOKEN_CREATION' ? 12 : 5;
+  // All feature types now get 12 adaptive steps. TOKEN_CREATION was already 12;
+  // WALLET_FLOW/DATA_DASHBOARD/UI_FEATURE were capped at 5 which was too low for
+  // the universal ReAct loop (observe-reason-act after every navigation).
+  const MAX_ADAPTIVE = 12;
 
   // TOKEN_CREATION ReAct switch flag: set to true after we land on a form surface,
   // at which point the static plan is discarded and every step is decided adaptively.
@@ -1079,6 +1083,79 @@ export async function executeSteps(
 
   // Dismiss cookie/GDPR banners once before the first step
   await dismissConsentBanner(page);
+
+  // ── Upfront address-input fill (BEFORE any planned steps) ────────────────
+  // Claim 01-style WALLET_FLOW claims often have a BSC/wallet address input
+  // already visible on the start URL. If we wait for the LLM plan to run
+  // those fills, a preceding click_text step (e.g. FAQ accordion) triggers
+  // hasInteracted → passConditionMet fires → agent stops before the fill ever
+  // runs. By prepending fill + action steps here we guarantee the address is
+  // entered as the very first actions, before any planned navigation or clicks.
+  if (options?.investigationWalletAddress && options?.featureType !== 'TOKEN_CREATION') {
+    const upfrontAddrInputs = await page.$$eval(
+      'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([disabled])',
+      (els) => els
+        .filter((el) => {
+          const s = window.getComputedStyle(el);
+          if (s.display === 'none' || s.visibility === 'hidden') return false;
+          const r = (el as HTMLElement).getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) return false;
+          const hint = [
+            (el as HTMLInputElement).placeholder ?? '',
+            (el as HTMLInputElement).name ?? '',
+            el.id ?? '',
+          ].join(' ').toLowerCase();
+          return /address|wallet|recipient|bsc|0x|reward/i.test(hint);
+        })
+        .map((el) => ({
+          selector: el.id
+            ? `#${CSS.escape(el.id)}`
+            : (el as HTMLInputElement).placeholder
+              ? `[placeholder="${CSS.escape((el as HTMLInputElement).placeholder)}"]`
+              : (el as HTMLInputElement).name
+                ? `[name="${CSS.escape((el as HTMLInputElement).name)}"]`
+                : 'input',
+          currentValue: (el as HTMLInputElement).value ?? '',
+        })),
+    ).catch(() => [] as { selector: string; currentValue: string }[]);
+
+    const unfilledUpfront = upfrontAddrInputs.filter((i) => !i.currentValue.trim());
+    if (unfilledUpfront.length > 0) {
+      console.log(`[executor] Upfront address-fill: ${unfilledUpfront.length} unfilled input(s) — prepending before plan`);
+      const prefillSteps: AgentStep[] = unfilledUpfront.map((inp) => ({
+        action: 'fill_input' as const,
+        selector: inp.selector,
+        value: options.investigationWalletAddress!,
+      }));
+      // Scan for an action button (Start Mining, Claim, Stake, etc.) to inject
+      // after the fill so the flow completes in one pass.
+      const actionBtn = await page.$$eval(
+        'button:not([disabled]), [role="button"]:not([aria-disabled="true"]), input[type="submit"]:not([disabled])',
+        (els, kw) => {
+          const vis = els.filter((el) => {
+            const s = window.getComputedStyle(el);
+            if (s.display === 'none' || s.visibility === 'hidden') return false;
+            const r = (el as HTMLElement).getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+          });
+          const scored = vis.map((el) => {
+            const txt = (el.textContent ?? '').trim().toLowerCase();
+            const matchIdx = kw.findIndex((k) => txt.includes(k));
+            return { text: (el.textContent ?? '').trim(), score: matchIdx === -1 ? 999 : matchIdx };
+          });
+          const best = scored.filter((b) => b.score < 999).sort((a, b) => a.score - b.score)[0];
+          return best ? best.text : null;
+        },
+        ['start mining', 'mine', 'claim', 'stake', 'swap', 'send', 'submit', 'start'],
+      ).catch(() => null as string | null);
+
+      if (actionBtn) {
+        prefillSteps.push({ action: 'click_text' as const, text: actionBtn });
+      }
+      // Prepend so fill runs before any LLM-planned step
+      stepsToRun.unshift(...prefillSteps);
+    }
+  }
 
   // ── Main adaptive execution loop ────────────────────────────────────────
   // Why while(true) instead of for…of:
@@ -1143,8 +1220,7 @@ export async function executeSteps(
       // Runs exactly once (adaptiveCallCount === 0 for non-TOKEN_CREATION).
       if (
         options?.featureType !== 'TOKEN_CREATION' &&
-        adaptiveCallCount === 0 &&
-        !planHadFillSteps
+        adaptiveCallCount === 0
       ) {
         adaptiveCallCount++;  // consume one adaptive slot
 
@@ -1627,24 +1703,117 @@ export async function executeSteps(
       return urlChanged ? 'fallback' : 'wrong';
     })();
 
-    // ── TOKEN_CREATION ReAct switch ──────────────────────────────────────────
-    // The static plan was generated from an above-fold snapshot — it never saw
-    // below-fold fields (fee-sharing toggle, social handle). Once we land on the
-    // form surface, discard the remaining static steps and switch to pure
-    // adaptive: every subsequent step is decided from the actual live page state.
+    // ── Universal ReAct switch ───────────────────────────────────────────────
+    // When the agent navigates to a new URL and finds interactive content,
+    // discard the remaining stale plan and switch to pure adaptive reasoning.
+    // This mirrors how TOKEN_CREATION already works — the static plan is only
+    // used to get to the right surface; from there, the LLM decides each step
+    // from a fresh screenshot. Applying this universally makes every feature
+    // type as reliable as TOKEN_CREATION.
+    //
+    // Thresholds per feature type:
+    //   TOKEN_CREATION   — ≥2 inputs (full form must be present)
+    //   WALLET_FLOW      — ≥1 input (single address/wallet field is the feature)
+    //   DATA_DASHBOARD   — any visible content (headings, signals, text)
+    //   All others       — ≥1 input or headings suggest interactive content
     if (
       !reactSwitchActivated &&
-      options?.featureType === 'TOKEN_CREATION' &&
       (effectiveStep.action === 'navigate' || effectiveStep.action === 'open_link_text') &&
       urlChanged &&
-      inputsAfter.length >= 2
+      blockerDetected !== 'route_missing'
     ) {
-      reactSwitchActivated = true;
-      const discarded = stepsToRun.splice(0);
-      adaptiveCallCount = 0;  // full fresh budget for the form-filling phase
-      console.log(
-        `[executor] TOKEN_CREATION ReAct switch activated — discarded ${discarded.length} static step(s), switching to pure adaptive`,
-      );
+      const ft = options?.featureType ?? 'UI_FEATURE';
+      const sufficientContent =
+        ft === 'TOKEN_CREATION'
+          ? inputsAfter.length >= 2
+          : ft === 'DATA_DASHBOARD'
+          ? (visibleSignals.length > 0 || headingsAfter.length > 0 || textAfter.trim().length > 200)
+          : inputsAfter.length >= 1 || headingsAfter.length >= 1;  // WALLET_FLOW, UI_FEATURE, DEX_SWAP
+
+      if (sufficientContent) {
+        reactSwitchActivated = true;
+        const discarded = stepsToRun.splice(0);
+        adaptiveCallCount = 0;  // full fresh budget for the interactive phase
+        console.log(
+          `[executor] Universal ReAct switch activated (${ft}) — discarded ${discarded.length} static step(s), switching to pure adaptive`,
+        );
+      }
+    }
+
+    // ── Post-navigation address re-scan ──────────────────────────────────────
+    // When the URL changes (navigation arrived at a new page), immediately scan
+    // the new page for unfilled address/wallet inputs and prepend fill + action.
+    // The upfront fill only ran on the start URL — if the form is on a sub-page
+    // (/mine, /stake, /claim) it was missed. This ensures the fill happens on
+    // the correct page, independent of whether the ReAct switch fired.
+    if (
+      urlChanged &&
+      options?.investigationWalletAddress &&
+      options?.featureType !== 'TOKEN_CREATION' &&
+      (effectiveStep.action === 'navigate' || effectiveStep.action === 'open_link_text')
+    ) {
+      await page.waitForTimeout(400);  // let SPA settle before scanning
+      const postNavAddrInputs = await page.$$eval(
+        'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([disabled])',
+        (els) => els
+          .filter((el) => {
+            const s = window.getComputedStyle(el);
+            if (s.display === 'none' || s.visibility === 'hidden') return false;
+            const r = (el as HTMLElement).getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return false;
+            const hint = [
+              (el as HTMLInputElement).placeholder ?? '',
+              (el as HTMLInputElement).name ?? '',
+              el.id ?? '',
+            ].join(' ').toLowerCase();
+            return /address|wallet|recipient|bsc|0x|reward/i.test(hint);
+          })
+          .map((el) => ({
+            selector: el.id
+              ? `#${CSS.escape(el.id)}`
+              : (el as HTMLInputElement).placeholder
+                ? `[placeholder="${CSS.escape((el as HTMLInputElement).placeholder)}"]`
+                : (el as HTMLInputElement).name
+                  ? `[name="${CSS.escape((el as HTMLInputElement).name)}"]`
+                  : 'input',
+            currentValue: (el as HTMLInputElement).value ?? '',
+          })),
+      ).catch(() => [] as { selector: string; currentValue: string }[]);
+
+      const unfilledPostNav = postNavAddrInputs.filter((i) => !i.currentValue.trim());
+      if (unfilledPostNav.length > 0 && options.investigationWalletAddress) {
+        console.log(`[executor] Post-nav address fill: ${unfilledPostNav.length} input(s) on new page — prepending fill + action`);
+        const navFillSteps: AgentStep[] = unfilledPostNav.map((inp) => ({
+          action: 'fill_input' as const,
+          selector: inp.selector,
+          value: options.investigationWalletAddress!,
+        }));
+        // Also detect an action button on the new page
+        const navActionBtn = await page.$$eval(
+          'button:not([disabled]), [role="button"]:not([aria-disabled="true"]), input[type="submit"]:not([disabled])',
+          (els, kw) => {
+            const vis = els.filter((el) => {
+              const s = window.getComputedStyle(el);
+              if (s.display === 'none' || s.visibility === 'hidden') return false;
+              const r = (el as HTMLElement).getBoundingClientRect();
+              return r.width > 0 && r.height > 0;
+            });
+            const scored = vis.map((el) => {
+              const txt = (el.textContent ?? '').trim().toLowerCase();
+              const matchIdx = kw.findIndex((k) => txt.includes(k));
+              return { text: (el.textContent ?? '').trim(), score: matchIdx === -1 ? 999 : matchIdx };
+            });
+            const best = scored.filter((b) => b.score < 999).sort((a, b) => a.score - b.score)[0];
+            return best ? best.text : null;
+          },
+          ['start mining', 'mine', 'claim', 'verify', 'stake', 'swap', 'send', 'submit', 'start'],
+        ).catch(() => null as string | null);
+
+        if (navActionBtn) {
+          navFillSteps.push({ action: 'click_text' as const, text: navActionBtn });
+        }
+        stepsToRun.unshift(...navFillSteps);
+      }
     }
 
     // ── Build observation ────────────────────────────────────────────────────
@@ -1729,12 +1898,16 @@ export async function executeSteps(
     // has filled any fields or attempted a transaction.
     // Has the agent done at least one meaningful interaction?
     // Navigation and scroll alone never count — the agent must have filled a
-    // field or clicked something non-wallet before the pass condition can fire.
+    // field or clicked a primary action button before the pass condition can fire.
+    // FAQ/accordion/info clicks intentionally excluded — they prove nothing about
+    // whether the feature was actually exercised.
+    const ACTION_CLICK_KW = /\b(start|mine|verify|claim|stake|swap|submit|create|launch|deploy|mint|confirm|send|buy|sell|connect wallet)\b/i;
     const hasInteracted = observations.some((o) => {
       if (o.isNoop) return false;
       if (o.step.startsWith('fill_input'))  return true;
       if (o.step.startsWith('click_text') &&
-          !/connect wallet|sign in|log in/i.test(o.step)) return true;
+          ACTION_CLICK_KW.test(o.step) &&
+          !/sign in|log in|\blogin\b/i.test(o.step)) return true;
       return false;
     });
 
@@ -1754,13 +1927,32 @@ export async function executeSteps(
     const successMessageFound = stepMessages.some(
       (m) => m.type === 'success' && passConditionMet(options?.passCondition ?? '', m.text),
     );
+    // passConditionMet early-stop: only fires for TOKEN_CREATION and UI_FEATURE.
+    // WALLET_FLOW and DATA_DASHBOARD are handled by the ReAct adaptive loop —
+    // the adaptive LLM returns null when it judges the objective achieved.
+    // For those types, keyword matching is too unreliable (mining/dashboard pages
+    // always contain the claim keywords, causing premature stops after FAQ clicks).
+    const featureTypeAllowsKeywordStop =
+      options?.featureType !== 'WALLET_FLOW' &&
+      options?.featureType !== 'DATA_DASHBOARD';
     if (
+      featureTypeAllowsKeywordStop &&
       options?.passCondition &&
       hasInteracted &&
       tokenCreationReady &&
       (passConditionMet(options.passCondition, textAfter) || successMessageFound)
     ) {
       console.log('[executor] Pass condition appears met — stopping early');
+      return { observations, stopReason: 'completed', consecutiveNoops, narrationSegments };
+    }
+    // For WALLET_FLOW/DATA_DASHBOARD: still stop on explicit success message
+    if (
+      !featureTypeAllowsKeywordStop &&
+      options?.passCondition &&
+      hasInteracted &&
+      successMessageFound
+    ) {
+      console.log('[executor] Explicit success message found — stopping early');
       return { observations, stopReason: 'completed', consecutiveNoops, narrationSegments };
     }
 
