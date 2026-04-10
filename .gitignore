@@ -1,3 +1,6 @@
 public/recordings/
 node_modules
 .next/
+.cursor/
+.env
+.env.*

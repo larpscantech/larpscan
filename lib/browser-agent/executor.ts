@@ -710,7 +710,9 @@ Rules:
     if (!raw || raw === 'null') return null;
 
     const parsed = JSON.parse(raw) as AgentStep;
-    if (!parsed?.action) return null;
+    // Treat {"action":"null"}, {"action":"none"}, {"action":"done"} as done signals
+    const actionStr = String(parsed.action ?? '');
+    if (!parsed?.action || actionStr === 'null' || actionStr === 'none' || actionStr === 'done') return null;
     return parsed;
   } catch {
     return null;  // never block the run on an adaptive failure
@@ -1064,9 +1066,10 @@ export async function executeSteps(
   let alreadyExistsAttempt = 0;
 
   // Post-fill submit injection flag — ensures we attempt a submit-button click
-  // exactly once after all form inputs have been filled, by scrolling to reveal
-  // any below-fold submit/create/deploy button and injecting a click_text step.
-  let hasInjectedPostFillSubmit = false;
+  // after form inputs have been filled. Uses a fill-count tracker so the
+  // injection re-fires whenever new adaptive fills happen (e.g. on "already
+  // exists" recovery cycles — each new handle fill gets a fresh click attempt).
+  let postFillSubmitInjectedAtFillCount = -1;
 
   // Use a mutable queue so we can dynamically inject steps discovered
   // after content loads (e.g. Mint button revealed after Preview completes).
@@ -1075,7 +1078,7 @@ export async function executeSteps(
   // Pre-compute whether the original LLM plan already included fill_input steps
   // or a submit-button click. Used to skip the form-fill pass and post-fill submit
   // injection when the planner has already accounted for them.
-  const SUBMIT_KW = ['create', 'deploy', 'mint', 'launch', 'submit', 'confirm', 'publish', 'generate', 'save', 'add', 'next', 'start', 'mine', 'claim', 'stake', 'swap', 'send', 'buy', 'sell'];
+  const SUBMIT_KW = ['preview', 'create', 'deploy', 'mint', 'launch', 'submit', 'confirm', 'publish', 'generate', 'save', 'add', 'next', 'continue', 'start', 'mine', 'claim', 'stake', 'swap', 'send', 'buy', 'sell'];
   const planHadFillSteps   = steps.some((s) => s.action === 'fill_input');
   const planHadSubmitClick = steps.some(
     (s) => s.action === 'click_text' && SUBMIT_KW.some((k) => ((s as { action: string; text?: string }).text ?? '').toLowerCase().includes(k)),
@@ -1272,15 +1275,19 @@ export async function executeSteps(
       // the adaptive planner), scroll down to reveal any below-fold submit/create
       // button and inject a click_text step. This prevents the agent from stopping
       // right after filling the last field without ever clicking "Submit"/"Create".
-      // Skipped when the LLM plan already included a submit-button click so we
-      // don't double-submit (e.g. bnbshare.fun already has "Create Token" in plan).
+      // Re-fires whenever the fill count increases (e.g. on "already exists" cycles
+      // where the agent fills a new handle but needs a fresh click each time).
+      // Skipped when the LLM plan already included a submit-button click.
+      const currentFillCount = observations.filter(
+        (o) => typeof o.step === 'string' && o.step.startsWith('fill_input'),
+      ).length;
       if (
-        !hasInjectedPostFillSubmit &&
+        currentFillCount > postFillSubmitInjectedAtFillCount &&
         !planHadSubmitClick &&
         adaptiveCallCount > 0 &&
-        observations.some((o) => typeof o.step === 'string' && o.step.startsWith('fill_input'))
+        currentFillCount > 0
       ) {
-        hasInjectedPostFillSubmit = true;
+        postFillSubmitInjectedAtFillCount = currentFillCount;
 
         // Scroll toward the bottom to surface any below-fold submit button
         await page.evaluate(() => window.scrollBy(0, 600)).catch(() => {});
@@ -1288,7 +1295,7 @@ export async function executeSteps(
 
         const SUBMIT_KEYWORDS = SUBMIT_KW;
         const submitText = await page.$$eval(
-          'button:not([disabled]), [role="button"]:not([aria-disabled="true"]), input[type="submit"]:not([disabled])',
+          'button:not([disabled]), [role="button"]:not([aria-disabled="true"]), input[type="submit"]:not([disabled]), a.btn, a[class*="button"], a[class*="Button"]',
           (els, keywords) => {
             const visible = els.filter((el) => {
               const s = window.getComputedStyle(el);
@@ -1333,6 +1340,41 @@ export async function executeSteps(
         break;
       }
       console.log(`[executor] Adaptive step: ${JSON.stringify(adaptive)}`);
+
+      // ── Auto-pair adaptive fill_input with a submit click ─────────────────
+      // When the LLM returns fill_input, it often forgets to follow up with a
+      // click on the submit/preview button, causing an infinite fill loop.
+      // Immediately scan for a visible submit-like element and queue it after
+      // the fill so the form actually gets submitted.
+      if (adaptive.action === 'fill_input') {
+        const BROAD_SUBMIT_SEL = 'button:not([disabled]), [role="button"]:not([aria-disabled="true"]), input[type="submit"]:not([disabled]), a.btn, a[class*="button"], a[class*="Button"]';
+        const pairedClick = await page.$$eval(
+          BROAD_SUBMIT_SEL,
+          (els, keywords) => {
+            const visible = els.filter((el) => {
+              const s = window.getComputedStyle(el);
+              if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+              const r = (el as HTMLElement).getBoundingClientRect();
+              return r.width > 0 && r.height > 0;
+            });
+            const scored = visible.map((el) => {
+              const text = (el.textContent ?? '').replace(/\s+/g, ' ').trim();
+              const lower = text.toLowerCase();
+              const idx = (keywords as string[]).findIndex((k) => lower.includes(k));
+              return { text, score: idx === -1 ? 999 : idx };
+            });
+            scored.sort((a, b) => a.score - b.score);
+            return scored.length > 0 && scored[0].score < 999 ? scored[0].text : null;
+          },
+          SUBMIT_KW,
+        ).catch(() => null);
+
+        if (pairedClick) {
+          console.log(`[executor] Auto-pairing adaptive fill with click_text "${pairedClick}"`);
+          stepsToRun.unshift({ action: 'click_text', text: pairedClick.slice(0, 60) } as AgentStep);
+        }
+      }
+
       step = adaptive;
     } else {
       break;  // no more steps and no adaptive budget — done
@@ -1577,15 +1619,22 @@ export async function executeSteps(
     }
 
     // ── Deterministic "already exists" handle recovery ───────────────────────
-    // Fires after ANY step when the page shows an "already exists" error.
-    // Injects BOTH fill_input + click_text as a pair so the submit always
-    // follows the fill without LLM intervention in between.
-    // Uses HANDLE_FALLBACK_SEQUENCE with a persistent counter so each
-    // attempt picks the next handle deterministically.
+    // Fires after a CLICK step when the page still shows an "already exists" error
+    // meaning the submitted handle was taken. Injects fill + click for the next
+    // handle in the fallback sequence.
+    //
+    // IMPORTANT: only fires after click_text / click_selector — NOT after fill_input.
+    // After a fill the OLD error from the previous submission is still visible on
+    // the page (the user hasn't submitted yet), so firing here would skip the
+    // pending Preview click and go straight to another fill, looping forever.
+    const alreadyExistsInMessages = stepMessages.some((m) => /already\s+exists/i.test(m.text));
+    const alreadyExistsInPageText = /already\s+exists|soul.*already.*minted|handle.*taken|username.*taken|name.*already.*used/i.test(textAfter);
+    const stepWasClick = effectiveStep.action === 'click_text' || effectiveStep.action === 'click_selector';
     if (
-      stepsToRun.length === 0 &&
+      stepWasClick &&
+      stepsToRun.length <= 1 &&
       alreadyExistsAttempt < HANDLE_FALLBACK_SEQUENCE.length &&
-      stepMessages.some((m) => /already\s+exists/i.test(m.text))
+      (alreadyExistsInMessages || alreadyExistsInPageText)
     ) {
       // Find the social handle input selector
       const selector = await page.$$eval(
@@ -1605,12 +1654,19 @@ export async function executeSteps(
         },
       ).catch(() => null);
 
-      // Find the submit button text
+      // Find the submit button text — use CONTAINS match (not exact) so
+      // "Create Soul", "Mint a Soul", "Preview & Create" all fire correctly.
       const submitBtnText = await page.$$eval(
         'button:not([disabled]), [role="button"]:not([aria-disabled="true"])',
         (els) => {
-          const submitRe = /^(preview|submit|create|launch|mint|deploy|confirm|next|continue|go|search)$/i;
-          const el = els.find((e) => submitRe.test((e.textContent ?? '').replace(/\s+/g, ' ').trim()));
+          const submitRe = /\b(preview|submit|create|launch|mint|deploy|confirm|next|continue|search)\b/i;
+          const visible = els.filter((el) => {
+            const s = window.getComputedStyle(el);
+            if (s.display === 'none' || s.visibility === 'hidden') return false;
+            const r = (el as HTMLElement).getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+          });
+          const el = visible.find((e) => submitRe.test((e.textContent ?? '').replace(/\s+/g, ' ').trim()));
           return el ? (el.textContent ?? '').replace(/\s+/g, ' ').trim() : null;
         },
       ).catch(() => null);
@@ -1622,10 +1678,19 @@ export async function executeSteps(
         ];
         // Inject fill THEN click as a pair — click always follows fill
         stepsToRun.push(
-          { action: 'fill_input', selector, value: nextHandle },
-          { action: 'click_text', text: submitBtnText },
+          { action: 'fill_input' as const, selector, value: nextHandle },
+          { action: 'click_text' as const, text: submitBtnText },
         );
         console.log(`[executor] "already exists" attempt ${alreadyExistsAttempt}: filling "${nextHandle}" via ${selector}, then clicking "${submitBtnText}"`);
+      } else if (selector) {
+        // Button not found yet — fill the next handle and let post-fill injection
+        // handle the click once the submit button becomes visible after fill.
+        alreadyExistsAttempt++;
+        const nextHandle = HANDLE_FALLBACK_SEQUENCE[
+          Math.min(alreadyExistsAttempt, HANDLE_FALLBACK_SEQUENCE.length - 1)
+        ];
+        stepsToRun.push({ action: 'fill_input' as const, selector, value: nextHandle });
+        console.log(`[executor] "already exists" attempt ${alreadyExistsAttempt}: no submit button found — filling "${nextHandle}", relying on post-fill injection`);
       }
     }
 
