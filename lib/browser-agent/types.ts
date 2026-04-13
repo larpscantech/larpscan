@@ -87,6 +87,7 @@ export type AgentStep =
   | { action: 'wait_for_selector'; selector: string }
   | { action: 'wait_for_text';     text: string }       // wait until text appears in DOM
   | { action: 'open_link_text';    text: string }       // navigate via a[href] matching text
+  | { action: 'wait';              ms?: number }        // pause and retry — used by ReAct when page is loading
   | { action: 'back' }
   | { action: 'check_text';        text: string };
 
