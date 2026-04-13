@@ -48,6 +48,51 @@ import type { WalletRequestContext } from './wallet/request-classifier';
 // Uses ffmpeg-static which runs natively on Vercel (Fluid compute).
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Parse the response from Browserless.stopRecording into a Buffer.
+ *
+ * Browserless has returned different formats across versions:
+ *   1. response.value is already a Buffer / Uint8Array (older versions)
+ *   2. response.value is a binary string (older Browserless < v2)
+ *   3. response.value is { type: "Buffer", data: number[] } (newer versions)
+ *   4. response.value is a base64 string
+ *
+ * We handle all four and return null if we can't produce a non-empty Buffer.
+ */
+function parseRecordingResponse(response: unknown): Buffer | null {
+  if (!response || typeof response !== 'object') return null;
+  const r = response as Record<string, unknown>;
+  const val = r.value;
+
+  if (!val) return null;
+
+  // Case 1: already a Buffer / Uint8Array
+  if (Buffer.isBuffer(val)) return val.length > 0 ? val : null;
+  if (val instanceof Uint8Array) return val.length > 0 ? Buffer.from(val) : null;
+
+  // Case 3: { type: "Buffer", data: number[] }
+  if (typeof val === 'object' && (val as Record<string,unknown>).type === 'Buffer') {
+    const data = (val as Record<string,unknown>).data;
+    if (Array.isArray(data) && data.length > 0) return Buffer.from(data as number[]);
+    return null;
+  }
+
+  if (typeof val === 'string' && val.length > 0) {
+    // Case 4: base64 (Browserless often wraps binary as base64 in JSON)
+    if (/^[A-Za-z0-9+/]+=*$/.test(val.slice(0, 100))) {
+      try {
+        const buf = Buffer.from(val, 'base64');
+        if (buf.length > 100) return buf;
+      } catch { /* fall through to binary */ }
+    }
+    // Case 2: binary string
+    const buf = Buffer.from(val, 'binary');
+    return buf.length > 100 ? buf : null;
+  }
+
+  return null;
+}
+
 async function convertWebmToMp4(webmBuffer: Buffer, tag: string): Promise<Buffer | null> {
   let ffmpegPath: string;
   try {
@@ -136,12 +181,12 @@ async function mergeNarrationAudio(
       '-y',
       '-i',    tmpVideo,
       '-i',    tmpAudio,
-      '-c:v',  'copy',          // copy video stream — no re-encode
+      '-c:v',  'copy',
       '-c:a',  'aac',
       '-b:a',  '96k',
       '-map',  '0:v:0',
       '-map',  '1:a:0',
-      '-shortest',              // trim to video length
+      '-shortest',
       '-movflags', '+faststart',
       tmpOut,
     ], { timeout: 60_000, maxBuffer: 10 * 1024 * 1024 });
@@ -266,17 +311,15 @@ async function analyzeWebsite(baseUrl: string): Promise<AnalysisResult> {
   const browser = await connectBrowser();
 
   try {
-    const context = isBrowserlessMode()
-      ? browser.contexts()[0] ?? await browser.newContext()
-      : await browser.newContext({
-          userAgent:
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-            '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          viewport: { width: 1280, height: 720 },
-        });
+    const context = await browser.newContext({
+        userAgent:
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+          '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        viewport: { width: 1280, height: 720 },
+      });
 
     const page = await context.newPage();
-    page.setDefaultTimeout(15_000);
+    page.setDefaultTimeout(20_000);
 
     console.log(`[verifier:analyze] Navigating to ${baseUrl}`);
 
@@ -419,8 +462,8 @@ async function recordInteraction(
   let finalPageState: PageState = emptyPageState;
   const runApiCalls: string[] = [];
   let walletOnlyGateDetected = false;
-  // Hoisted so the return statement at the end of the function can reference it.
-  // Populated by the page.on('pageerror') listener once a page is opened.
+  let earlyRecordingBuffer: Buffer | null = null;
+  let earlyRecordingDurationMs = 0;
   const pageJsErrors: string[] = [];
 
   // ── Wallet setup ────────────────────────────────────────────────────────
@@ -457,8 +500,11 @@ async function recordInteraction(
     }
 
     // connectOverCDP gives us one default context that inherits the proxy and
-    // stealth settings from the connection URL.  Creating a new context would
+    // stealth settings from the connection URL. Creating a new context would
     // lose those settings, so we always reuse the default context in Browserless.
+    // IMPORTANT: We still call context.newPage() — we do NOT reuse the existing
+    // default page. Recording is tied to the context (not the page), so creating
+    // a fresh page within the default context is both safe and correct.
     context = useBrowserless
       ? browser.contexts()[0] ?? await browser.newContext()
       : await browser.newContext({
@@ -470,13 +516,13 @@ async function recordInteraction(
 
     // Install signing bridge FIRST so it's available when addInitScript runs.
     // Pass sessionId so this run's tx hashes are isolated from concurrent runs.
-    if (walletEnabled && walletAddress) {
+    if (walletEnabled && walletAddress && featureType !== 'DATA_DASHBOARD') {
       await exposeSigningBridge(context, sessionId);
       await injectWalletMockIntoContext(context, walletAddress);
     }
 
     const page = await context.newPage();
-    page.setDefaultTimeout(15_000);
+    page.setDefaultTimeout(20_000);
 
     // ── Run-level network listener ──────────────────────────────────────────
     page.on('response', (response) => {
@@ -513,7 +559,7 @@ async function recordInteraction(
     // wagmi v2 with ssr:true needs ~4-5 s to hydrate before the connected state
     // appears in the DOM. Use a longer wait so analyzePageState sees the correct
     // connected state and doesn't emit a false wallet_required blocker.
-    await page.waitForTimeout(walletEnabled ? 5_000 : 2_500);
+    await page.waitForTimeout(walletEnabled && featureType !== 'DATA_DASHBOARD' ? 5_000 : 2_500);
 
     // Start CDP recording AFTER the page has loaded and rendered so the video
     // begins with the actual site content instead of a blank white page.
@@ -537,7 +583,8 @@ async function recordInteraction(
     // ── Early wallet connect — before planning ────────────────────────────
     // Connect the investigation wallet as soon as the page loads so the
     // planner sees the post-connection DOM state (unlocked forms, hidden CTAs).
-    if (walletEnabled && walletAddress) {
+    // DATA_DASHBOARD claims are read-only — no wallet needed, skip entirely.
+    if (walletEnabled && walletAddress && featureType !== 'DATA_DASHBOARD') {
       const earlyWallet = await handleWalletPopups(
         page, walletAddress, walletPolicy, featureType, 'recon', spentEtherThisRun,
       );
@@ -557,12 +604,23 @@ async function recordInteraction(
     // Wait for the DOM to hydrate before snapshotting — prevents false empty
     // forms/buttons on SPAs that render after JS runs.
     await waitForPageStability(page);
-    // Pass the wallet address when connected so analyzePageState can suppress
-    // the wallet_required blocker when the address is already visible in the DOM.
-    const pageState = await analyzePageState(
-      page,
-      walletConnectedAny ? walletAddress ?? undefined : undefined,
-    );
+    // Set a short evaluation timeout so page.evaluate() calls in analyzePageState
+    // complete quickly on pages with busy JS threads (live polling, wallet init).
+    // Without this, each of the 16 evaluate() calls could hang indefinitely.
+    page.setDefaultTimeout(5_000);
+    const pageState = await Promise.race([
+      analyzePageState(
+        page,
+        walletConnectedAny ? walletAddress ?? undefined : undefined,
+      ),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('[verifier] analyzePageState timeout (15s)')), 15_000),
+      ),
+    ]).catch((err) => {
+      console.warn('[verifier:record] Phase 1 page analysis timed out — using empty state:', String(err).slice(0, 120));
+      return emptyPageState;
+    });
+    page.setDefaultTimeout(20_000);
     pageState.apiSignals = [...runApiCalls];
 
     console.log(
@@ -716,6 +774,38 @@ async function recordInteraction(
       }
     }
 
+    // ── Stop recording immediately — agent work is done ─────────────────────
+    // Capture the video buffer NOW so the video ends on the agent's final
+    // action, not 20-30s later during post-processing / evidence building.
+    if (cdpSession) {
+      try {
+        earlyRecordingDurationMs = Date.now() - recordingStartMs;
+        console.log(`[verifier:record] Stopping CDP recording early (${(earlyRecordingDurationMs / 1000).toFixed(1)}s — right after agent finished)`);
+        const response = await cdpSession.send('Browserless.stopRecording');
+        earlyRecordingBuffer = parseRecordingResponse(response);
+        if (earlyRecordingBuffer) {
+          console.log(`[verifier:record] Early recording captured: ${(earlyRecordingBuffer.length / 1024).toFixed(0)}KB`);
+        } else {
+          console.warn(`[verifier:record] stopRecording returned no usable data. Full response: ${JSON.stringify(response).slice(0, 300)}`);
+        }
+        cdpSession = null; // prevent double-stop in finally
+      } catch (e) {
+        console.warn('[verifier:record] Early recording stop failed (will retry in finally):', e);
+      }
+    }
+
+    // ── Generate closing narration segment ─────────────────────────────────
+    if (allNarrationSegments.length > 0 && earlyRecordingDurationMs > 0) {
+      const stepCount = allObservations.length;
+      const lastObs = allObservations[allObservations.length - 1];
+      const lastUrl = lastObs?.url ?? 'unknown page';
+      const closingText = `Verification complete. The agent performed ${stepCount} steps and finished on ${lastUrl.replace(/^https?:\/\//, '')}.`;
+      allNarrationSegments.push({
+        text: closingText,
+        timestampMs: Math.max(0, earlyRecordingDurationMs - 3000),
+      });
+    }
+
     // ── Phase 4: Final page state + evidence summary ────────────────────────
     finalPageState = await analyzePageState(
       page,
@@ -790,74 +880,74 @@ async function recordInteraction(
     }
 
   } finally {
-    // Stop CDP recording BEFORE closing page/browser — the CDP session
-    // is tied to the page and dies when the page closes.
-    if (cdpSession) {
+    // Use the early-captured recording buffer if available (stopped right
+    // after agent finished). Fall back to stopping now if early stop failed.
+    let rawBuffer: Buffer | null = earlyRecordingBuffer;
+    let durationMs = earlyRecordingDurationMs;
+
+    if (!rawBuffer && cdpSession) {
       try {
-        const durationMs = Date.now() - recordingStartMs;
-        console.log(`[verifier:record] Stopping CDP recording (${(durationMs / 1000).toFixed(1)}s)...`);
+        durationMs = Date.now() - recordingStartMs;
+        console.log(`[verifier:record] Stopping CDP recording (fallback, ${(durationMs / 1000).toFixed(1)}s)...`);
         const response = await cdpSession.send('Browserless.stopRecording');
-
-        if (response.error) {
-          console.warn(`[verifier:record] Recording error from Browserless: ${response.error}`);
-        } else if (response.value) {
-          const rawBuffer = Buffer.from(response.value);
-          console.log(`[verifier:record] Raw recording: ${(rawBuffer.length / 1024).toFixed(0)}KB`);
-
-          if (rawBuffer.length > 0) {
-            let uploadBuffer: Buffer = rawBuffer;
-            let fileName = `${claimId}.webm`;
-            let contentType = 'video/webm';
-
-            // Convert to MP4 (H.264) with frequent keyframes for instant seeking.
-            const mp4 = await convertWebmToMp4(rawBuffer, 'verifier:record');
-            if (mp4) {
-              // Merge AI voice narration if segments were collected and feature is enabled.
-              const narrationBuf = await generateNarration(allNarrationSegments, durationMs);
-              uploadBuffer = narrationBuf
-                ? await mergeNarrationAudio(mp4, narrationBuf, 'verifier:record')
-                : mp4;
-              fileName = `${claimId}.mp4`;
-              contentType = 'video/mp4';
-            } else {
-              // Fallback: patch WebM with duration + cues for basic metadata
-              try {
-                const rawBlob = new Blob([rawBuffer], { type: 'video/webm' });
-                const fixedBlob = await fixWebmDuration(rawBlob);
-                uploadBuffer = Buffer.from(await fixedBlob.arrayBuffer());
-                console.log('[verifier:record] WebM patched with duration + cues (fallback)');
-              } catch (fixErr) {
-                console.warn('[verifier:record] WebM patch failed (uploading raw):', fixErr);
-              }
-            }
-
-            await supabase.storage.createBucket('recordings', { public: true }).catch(() => {});
-
-            const { error: uploadErr } = await supabase.storage
-              .from('recordings')
-              .upload(fileName, uploadBuffer, {
-                contentType,
-                upsert: true,
-              });
-
-            if (uploadErr) {
-              console.warn(`[verifier:record] Supabase upload error: ${uploadErr.message}`);
-            } else {
-              const { data } = supabase.storage
-                .from('recordings')
-                .getPublicUrl(fileName);
-              videoUrl = data.publicUrl;
-              console.log(`[verifier:record] Video uploaded → ${videoUrl}`);
-            }
-          } else {
-            console.warn('[verifier:record] Recording buffer is empty (0 bytes)');
-          }
-        } else {
-          console.warn('[verifier:record] No recording data in response');
+        rawBuffer = parseRecordingResponse(response);
+        if (!rawBuffer) {
+          console.warn(`[verifier:record] Fallback stopRecording returned no usable data. Response: ${JSON.stringify(response).slice(0, 300)}`);
         }
       } catch (e) {
         console.warn('[verifier:record] Video save failed (non-fatal):', e);
       }
+    }
+
+    if (rawBuffer && rawBuffer.length > 0) {
+      try {
+        console.log(`[verifier:record] Processing recording: ${(rawBuffer.length / 1024).toFixed(0)}KB, ${(durationMs / 1000).toFixed(1)}s`);
+        let uploadBuffer: Buffer = rawBuffer;
+        let fileName = `${claimId}.webm`;
+        let contentType = 'video/webm';
+
+        const mp4 = await convertWebmToMp4(rawBuffer, 'verifier:record');
+        if (mp4) {
+          const narrationBuf = await generateNarration(allNarrationSegments, durationMs);
+          uploadBuffer = narrationBuf
+            ? await mergeNarrationAudio(mp4, narrationBuf, 'verifier:record')
+            : mp4;
+          fileName = `${claimId}.mp4`;
+          contentType = 'video/mp4';
+        } else {
+          try {
+            const rawBlob = new Blob([new Uint8Array(rawBuffer)], { type: 'video/webm' });
+            const fixedBlob = await fixWebmDuration(rawBlob);
+            uploadBuffer = Buffer.from(await fixedBlob.arrayBuffer());
+            console.log('[verifier:record] WebM patched with duration + cues (fallback)');
+          } catch (fixErr) {
+            console.warn('[verifier:record] WebM patch failed (uploading raw):', fixErr);
+          }
+        }
+
+        await supabase.storage.createBucket('recordings', { public: true }).catch(() => {});
+
+        const { error: uploadErr } = await supabase.storage
+          .from('recordings')
+          .upload(fileName, uploadBuffer, {
+            contentType,
+            upsert: true,
+          });
+
+        if (uploadErr) {
+          console.warn(`[verifier:record] Supabase upload error: ${uploadErr.message}`);
+        } else {
+          const { data } = supabase.storage
+            .from('recordings')
+            .getPublicUrl(fileName);
+          videoUrl = data.publicUrl;
+          console.log(`[verifier:record] Video uploaded → ${videoUrl}`);
+        }
+      } catch (e) {
+        console.warn('[verifier:record] Video processing failed (non-fatal):', e);
+      }
+    } else if (earlyRecordingBuffer === null && cdpSession) {
+      console.warn('[verifier:record] No recording data captured');
     }
 
     // connectOverCDP default context — do NOT close it explicitly or the
@@ -1000,6 +1090,7 @@ export async function verifyClaim(
     effectiveSurface,
     recording.walletOnlyGateDetected,
     recording.pageJsErrors,
+    analysis.pageText,  // recon page text — fallback for bot link detection when recording fails
   );
 
   console.log(

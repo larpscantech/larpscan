@@ -55,8 +55,25 @@ export async function connectBrowser(opts?: { record?: boolean }): Promise<Brows
 
   if (wsEndpoint) {
     console.log(`[browser] Connecting to Browserless (CDP, record=${opts?.record ?? false})`);
-    const browser = await playwrightChromium.connectOverCDP(wsEndpoint);
-    return browser;
+
+    // Retry up to 4 times on 429 (Browserless rate limit / capacity)
+    const MAX_RETRIES = 4;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const browser = await playwrightChromium.connectOverCDP(wsEndpoint);
+        return browser;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        const is429 = msg.includes('429') || msg.toLowerCase().includes('too many requests');
+        if (is429 && attempt < MAX_RETRIES) {
+          const waitMs = Math.min(5000 * Math.pow(2, attempt), 30_000); // 5s, 10s, 20s, 30s
+          console.warn(`[browser] Browserless 429 — retrying in ${waitMs / 1000}s (attempt ${attempt + 1}/${MAX_RETRIES})`);
+          await new Promise(r => setTimeout(r, waitMs));
+          continue;
+        }
+        throw e;
+      }
+    }
   }
 
   return launchLocal();

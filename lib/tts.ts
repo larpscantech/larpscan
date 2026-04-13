@@ -29,6 +29,10 @@ function getTtsClient(): OpenAI {
  * Generate a single narration audio track from thinking segments,
  * timed to match video timestamps using silence padding.
  *
+ * All intermediate clips are WAV (pcm_s16le, 24kHz, mono) to avoid
+ * format mismatches in the ffmpeg concat demuxer. The final output
+ * is encoded to MP3.
+ *
  * Returns an MP3 buffer or null if narration is disabled / fails.
  */
 export async function generateNarration(
@@ -54,8 +58,6 @@ export async function generateNarration(
   try {
     const sorted = [...segments].sort((a, b) => a.timestampMs - b.timestampMs);
 
-    // Merge segments that are close together (< 2s apart) into single TTS calls
-    // to reduce API calls and produce more natural speech flow.
     const merged: NarrationSegment[] = [];
     for (const seg of sorted) {
       const prev = merged[merged.length - 1];
@@ -76,14 +78,13 @@ export async function generateNarration(
       const gapMs = Math.max(0, seg.timestampMs - currentMs);
 
       if (gapMs > 300) {
-        // Cap silence at 8 s — large enough to stay in sync, small enough to not be annoying.
-        const silenceSec = Math.min(gapMs / 1000, 8).toFixed(3);
-        const silencePath = path.join(tmpDir, `silence_${i}.mp3`);
+        const silenceSec = Math.min(gapMs / 1000, 15).toFixed(3);
+        const silencePath = path.join(tmpDir, `silence_${i}.wav`);
         await execFileAsync(ffmpegPath, [
           '-y', '-f', 'lavfi',
-          '-i', `anullsrc=r=24000:cl=mono`,
+          '-i', 'anullsrc=r=24000:cl=mono',
           '-t', silenceSec,
-          '-c:a', 'libmp3lame', '-q:a', '9',
+          '-c:a', 'pcm_s16le',
           silencePath,
         ], { timeout: 10_000 });
         clipPaths.push(silencePath);
@@ -92,7 +93,8 @@ export async function generateNarration(
       const cleanText = seg.text.slice(0, 400).replace(/[^\w\s.,!?;:'"()-]/g, ' ').trim();
       if (!cleanText) continue;
 
-      const speechPath = path.join(tmpDir, `speech_${i}.mp3`);
+      const speechMp3 = path.join(tmpDir, `speech_${i}.mp3`);
+      const speechWav = path.join(tmpDir, `speech_${i}.wav`);
       try {
         const response = await client.audio.speech.create({
           model: 'tts-1',
@@ -103,11 +105,17 @@ export async function generateNarration(
         });
 
         const arrayBuf = await response.arrayBuffer();
-        await fs.writeFile(speechPath, Buffer.from(arrayBuf));
-        clipPaths.push(speechPath);
+        await fs.writeFile(speechMp3, Buffer.from(arrayBuf));
+
+        await execFileAsync(ffmpegPath, [
+          '-y', '-i', speechMp3,
+          '-ar', '24000', '-ac', '1', '-c:a', 'pcm_s16le',
+          speechWav,
+        ], { timeout: 10_000 });
+        clipPaths.push(speechWav);
 
         const probe = await execFileAsync(ffmpegPath, [
-          '-i', speechPath,
+          '-i', speechWav,
           '-f', 'null', '-',
         ], { timeout: 5_000 }).catch(() => null);
         const durationMatch = probe?.stderr?.match(/Duration: (\d+):(\d+):(\d+)\.(\d+)/);
@@ -128,18 +136,16 @@ export async function generateNarration(
 
     if (clipPaths.length === 0) return null;
 
-    // Pad the end so the last speech clip isn't truncated by the -shortest flag
-    // when merging with the video. Add enough silence to cover the last word.
     const trailingSec = Math.max(
       ((videoDurationMs - currentMs) / 1000),
-      1.5,  // at minimum 1.5s of trailing silence so the last sentence finishes
+      1.5,
     ).toFixed(3);
-    const trailingSilencePath = path.join(tmpDir, 'silence_trail.mp3');
+    const trailingSilencePath = path.join(tmpDir, 'silence_trail.wav');
     await execFileAsync(ffmpegPath, [
       '-y', '-f', 'lavfi',
       '-i', 'anullsrc=r=24000:cl=mono',
       '-t', trailingSec,
-      '-c:a', 'libmp3lame', '-q:a', '9',
+      '-c:a', 'pcm_s16le',
       trailingSilencePath,
     ], { timeout: 10_000 });
     clipPaths.push(trailingSilencePath);
