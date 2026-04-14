@@ -107,6 +107,8 @@ export interface VerdictSignals {
   tableHeaders: string[];
   /** Chart / data visualisation signals on the final page */
   chartSignals: string[];
+  /** True when a Telegram / Discord bot link was found on the page (BOT / WALLET_FLOW claims) */
+  botLinkFound: boolean;
   /** BlockerType values encountered across the run */
   blockersEncountered: string[];
   /** Number of steps that produced no observable change */
@@ -159,6 +161,16 @@ export interface VerdictSignals {
   rateLimitHit: boolean;
   /** The rate-limit message text shown by the page, if captured. */
   rateLimitMessage?: string;
+  /**
+   * Aggregate statistics visible on the page, e.g. "10K+ Agents", "100K+ Actions", "$2.5M TVL".
+   * Strong VERIFIED evidence for DATA_DASHBOARD claims — these are live counters.
+   */
+  aggregateStatsSnippets: string[];
+  /**
+   * Whether the page shows an empty/zero-count dashboard state, e.g. "Your Agents (0)",
+   * "No transactions found", "Empty wallet" — indicates asset-gating, not feature absence.
+   */
+  emptyAssetDashboard: boolean;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -188,6 +200,9 @@ export function buildSignals(
    *  the run. Used to detect when a feature page crashed (React render error)
    *  so Rule 1b can return FAILED instead of letting the LLM conclude LARP. */
   pageJsErrors:     string[] = [],
+  /** Page text from the recon/analysis phase (non-Browserless). Used as fallback
+   *  for bot link detection when the recording session fails entirely. */
+  reconPageText:    string = '',
 ): VerdictSignals {
   // Derive the site's own hostname for API call filtering
   let siteDomain = '';
@@ -217,6 +232,15 @@ export function buildSignals(
   // executor/planner hard-stops become reachable.
   if (walletOnlyGate) {
     allBlockers.push('wallet_only_gate');
+  }
+
+  // If the final URL is a browser error page (SSL error, network failure), treat as page_broken
+  if (finalPageState.url && (
+    finalPageState.url.startsWith('chrome-error://') ||
+    finalPageState.url.startsWith('about:error') ||
+    /ERR_SSL|ERR_CONNECTION|ERR_NAME_NOT_RESOLVED/i.test(finalPageState.url)
+  )) {
+    if (!allBlockers.includes('page_broken')) allBlockers.push('page_broken');
   }
 
   const blockersEncountered: string[] = [...new Set(allBlockers)];
@@ -252,6 +276,55 @@ export function buildSignals(
     /please\s+enter|required(\s+field)?|invalid\s+username|fee\s+sharing|must\s+provide|cannot\s+be\s+empty|field\s+is\s+required|this\s+field\s+is\s+required/i;
   const likelyFormValidationError = validationHintPattern.test(finalPageState.visibleText);
 
+  // ── Aggregate stats detection ───────────────────────────────────────────
+  // Extracts live counter patterns from the final page text, e.g. "10K+ Agents",
+  // "100K+ Actions", "$2.5M TVL", "1,234 users". These are strong VERIFIED evidence
+  // for DATA_DASHBOARD claims even when there are no table headers or API calls.
+  // Scan ALL observation page texts too — the agent may have visited the stats page
+  // mid-run (e.g. visited / with "381 Unique Wallets") but ended on a different URL.
+  const aggregateStatsSnippets = (() => {
+    const allPageTexts = [
+      finalPageState.visibleText,
+      ...observations.map((o) => o.pageText ?? ''),
+    ].join(' ');
+    const snippets: string[] = [];
+    // Match patterns like "10K+ Agents", "100K Actions", "$2.5M TVL", "1,234 users"
+    const patterns = [
+      /\d[\d,.]*[KMBTkmbt]?\+?\s+[A-Za-z][A-Za-z\s]{2,20}(?=\s|$|[,.])/g,
+      /\$[\d,.]+[KMBTkmbt]?\+?\s*[A-Za-z]{2,20}/g,
+      /[A-Za-z]{3,20}\s*:\s*[\d,.]+[KMBTkmbt]?\+?/g,
+    ];
+    for (const re of patterns) {
+      const matches = allPageTexts.match(re) ?? [];
+      for (const m of matches.slice(0, 5)) {
+        const cleaned = m.trim().replace(/\s+/g, ' ');
+        if (cleaned.length >= 4 && cleaned.length <= 40) snippets.push(cleaned);
+      }
+    }
+    return [...new Set(snippets)].slice(0, 8);
+  })();
+
+  // ── Empty asset-gated dashboard detection ────────────────────────────────
+  // Detects when the agent reached a real dashboard but the test wallet has no
+  // assets (NFTs, agents, tokens) to display — feature exists, just not testable.
+  const emptyAssetDashboard = (() => {
+    const text = finalPageState.visibleText.toLowerCase();
+    return /your agents? \(\s*0\s*\)|no agents? found|0 agents?|empty wallet|no nfts?|no items? found|no transactions? found|no history|nothing to show|you have no |you don't have any/i.test(text);
+  })();
+
+  // ── Bot link detection ──────────────────────────────────────────────────
+  // Detects Telegram/Discord bot links in the page text or links list.
+  // This is primary evidence for BOT and WALLET_FLOW claims where the feature
+  // is accessible via an external bot (e.g. build4.io Telegram deployment bot).
+  const botLinkFound = (() => {
+    const allLinks = (finalPageState.links ?? []).map((l: { href?: string; text?: string }) => `${l.href ?? ''} ${l.text ?? ''}`).join(' ');
+    // Also scan all observation page texts and the recon text as fallback
+    const obsText = observations.map((o) => o.pageText ?? '').join(' ');
+    const fullText = [finalPageState.visibleText, allLinks, obsText, reconPageText].join(' ');
+    return /t\.me\/[A-Za-z0-9_]{3,}|t\.me\/\+|discord(?:\.gg|app\.com\/channels)\//i.test(fullText) ||
+      /telegram\.me\/|@[A-Za-z0-9_]{3,}bot\b/i.test(fullText);
+  })();
+
   return {
     siteLoaded,
     blocked,
@@ -265,6 +338,7 @@ export function buildSignals(
     thirdPartyApiCalls: thirdParty,
     tableHeaders:       finalPageState.tableHeaders,
     chartSignals:       finalPageState.chartSignals,
+    botLinkFound,
     blockersEncountered,
     noopCount,
     totalSteps,
@@ -296,5 +370,7 @@ export function buildSignals(
       }
       return undefined;
     })(),
+    aggregateStatsSnippets,
+    emptyAssetDashboard,
   };
 }

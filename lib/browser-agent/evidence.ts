@@ -20,6 +20,7 @@ export async function dismissConsentBanner(page: Page): Promise<void> {
   const ACCEPT_RE = /^(accept all|accept cookies|accept|allow all|allow cookies|got it|i agree|ok|okay|agree|continue|close)\b/i;
   const REJECT_RE = /reject|decline|deny|necessary only|manage/i;
   try {
+    // ── Pass 1: Cookie/GDPR consent banners (selector-based) ──────────────────
     const hasBanner = await page.evaluate(() => {
       const bannerSelectors = [
         '[id*="cookie"]', '[id*="consent"]', '[id*="gdpr"]',
@@ -32,20 +33,58 @@ export async function dismissConsentBanner(page: Page): Promise<void> {
       });
     }).catch(() => false);
 
-    if (!hasBanner) return;
+    if (hasBanner) {
+      const btns = page.locator('button, [role="button"], a').filter({ hasText: ACCEPT_RE });
+      const count = await btns.count().catch(() => 0);
+      for (let i = 0; i < Math.min(count, 3); i++) {
+        const btn = btns.nth(i);
+        const txt = await btn.textContent().catch(() => '');
+        if (REJECT_RE.test(txt ?? '')) continue;
+        const vis = await btn.isVisible({ timeout: 1_000 }).catch(() => false);
+        if (!vis) continue;
+        await btn.click().catch(() => {});
+        console.log(`[evidence] Dismissed consent banner: "${(txt ?? '').trim()}"`);
+        await page.waitForTimeout(500);
+        return;
+      }
+    }
 
-    const btns = page.locator('button, [role="button"], a').filter({ hasText: ACCEPT_RE });
-    const count = await btns.count().catch(() => 0);
-    for (let i = 0; i < Math.min(count, 3); i++) {
-      const btn = btns.nth(i);
-      const txt = await btn.textContent().catch(() => '');
-      if (REJECT_RE.test(txt ?? '')) continue;
-      const vis = await btn.isVisible({ timeout: 1_000 }).catch(() => false);
-      if (!vis) continue;
-      await btn.click().catch(() => {});
-      console.log(`[evidence] Dismissed consent banner: "${(txt ?? '').trim()}"`);
-      await page.waitForTimeout(500);
-      return;
+    // ── Pass 2: Generic overlay modals / marketing popups ─────────────────────
+    // Catches patterns like "We have a new X!", notification prompts, etc.
+    // Look for any visible modal/overlay that has an OK/Close/Dismiss button.
+    const hasModal = await page.evaluate(() => {
+      const modalSelectors = [
+        '[role="dialog"]', '[role="alertdialog"]',
+        '[class*="modal" i]', '[class*="Modal" i]',
+        '[class*="popup" i]', '[class*="Popup" i]',
+        '[class*="overlay" i]', '[class*="Overlay" i]',
+        '[class*="notification" i]', '[class*="announcement" i]',
+        '[data-modal]', '[data-popup]',
+      ];
+      return modalSelectors.some((s) => {
+        try {
+          const el = document.querySelector(s);
+          if (!el) return false;
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        } catch { return false; }
+      });
+    }).catch(() => false);
+
+    if (hasModal) {
+      const DISMISS_RE = /^(ok|okay|got it|close|dismiss|no thanks|skip|continue|not now|maybe later|i understand)\b/i;
+      const dismissBtns = page.locator('button, [role="button"]').filter({ hasText: DISMISS_RE });
+      const dCount = await dismissBtns.count().catch(() => 0);
+      for (let i = 0; i < Math.min(dCount, 3); i++) {
+        const btn = dismissBtns.nth(i);
+        const txt = await btn.textContent().catch(() => '');
+        const vis = await btn.isVisible({ timeout: 1_000 }).catch(() => false);
+        if (!vis) continue;
+        await btn.click().catch(() => {});
+        console.log(`[evidence] Dismissed generic modal: "${(txt ?? '').trim()}"`);
+        await page.waitForTimeout(500);
+        return;
+      }
     }
   } catch { /* non-fatal */ }
 }

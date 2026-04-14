@@ -139,6 +139,9 @@ FEATURE TYPE CONTEXT
 DATA_DASHBOARD:
   tableHeaders visible + own-domain API calls → very strong VERIFIED signal.
   The data is live even if you cannot interact with it further.
+  Visible aggregate stats ("10K+ Agents", "100K+ Actions", "$2.5M TVL", etc.) on the page
+  are ALSO strong VERIFIED evidence — these are live counters, not static marketing copy.
+  If "Aggregate stats visible on page" is shown in the signal context → lean VERIFIED.
 
 TOKEN_CREATION / DEX_SWAP / UI_FEATURE:
   Form fields visible + enabled CTA + no wallet blocker → strong positive signal.
@@ -201,6 +204,7 @@ LARP
   - own-domain API calls were observed
   - a form was visible anywhere
   - the only failure was a no-op from a wallet/auth gate
+  - the dashboard exists but requires owning in-game assets (NFTs, tokens, etc.) to show data
 
 UNTESTABLE
   Cannot fully verify because:
@@ -208,12 +212,18 @@ UNTESTABLE
   - Login / auth wall prevents access
   - CAPTCHA or bot protection blocks the agent
   - Feature is confirmed wallet-only gate (all steps no-op)
+  - Feature requires owning specific in-game assets (e.g. NFTs, agent tokens) to demonstrate
+    (the test wallet may have 0 agents, 0 NFTs, etc. — the feature is real but not demonstrable)
+  - page_broken / site temporarily unavailable (try FAILED only if consistently broken, not once)
   UNTESTABLE is NOT a negative verdict — it means the feature appears real
   but cannot be fully automated.
 
-SITE_BROKEN
-  The website itself failed to load (DNS error, 5xx, timeout, blank page).
-  Use this when the site cannot be reached at all — not when a feature is gated.
+FAILED
+  The feature was reachable but clearly broken: the form submitted an error, the
+  transaction reverted, or the UI is present but non-functional on every attempt.
+  Do NOT use FAILED if:
+  - the page_broken occurred only once (transient load issue)
+  - the site was described as having the feature in page content but the browser had a rendering issue
 
 ==================================================
 CRITICAL RULES
@@ -221,6 +231,11 @@ CRITICAL RULES
 - If a form with inputs is visible, do NOT return LARP.
 - If wallet_required is the only blocker, return UNTESTABLE not LARP.
 - If own-domain API calls were observed, lean strongly toward VERIFIED or UNTESTABLE.
+- If the agent reached a relevant dashboard but shows "0 agents", "empty wallet", "no assets",
+  "no history" because the TEST WALLET has no in-game assets — return UNTESTABLE not LARP or FAILED.
+  The feature infrastructure exists; the test simply cannot demonstrate it without owned assets.
+- If page_broken was the blocker AND the site is described as having the feature in page metadata
+  OR in prior steps it showed the form/UI — return UNTESTABLE not FAILED (transient load issue).
 - A 404 on the surface path is not automatically LARP — check if the agent
   recovered via homepage or a fallback route.
 - check_text failures after navigation are not reliable LARP signals.
@@ -388,7 +403,7 @@ export async function determineVerdict(
     const client = getClient();
 
     const resp = await client.chat.completions.create({
-      model:            'gpt-4o',
+      model:            'gpt-4.1',
       temperature:      0,
       max_tokens:       500,
       response_format:  { type: 'json_object' },
@@ -406,11 +421,11 @@ export async function determineVerdict(
       reasoning?:  string;
     };
 
-    // If GPT-4o returned an empty/incomplete JSON, retry once with a simpler prompt
+    // If GPT-4.1 returned an empty/incomplete JSON, retry once with a simpler prompt
     if (!parsed.verdict && !parsed.reasoning) {
       console.warn('[verdict] LLM returned empty response — retrying with simplified prompt');
       const retry = await client.chat.completions.create({
-        model:           'gpt-4o-mini',
+        model:           'gpt-4.1',
         temperature:     0,
         max_tokens:      300,
         response_format: { type: 'json_object' },
@@ -433,21 +448,34 @@ export async function determineVerdict(
     }
 
     const verdict = VERDICT_MAP[parsed.verdict?.toUpperCase() ?? ''] ?? 'failed';
+    const rawConfidence = (parsed.confidence as VerdictResult['confidence']) ?? 'low';
 
     const rawReasoning = parsed.reasoning ?? 'No reasoning provided';
-    console.log(`[verdict] → ${verdict} (${parsed.confidence}) — ${rawReasoning}`);
+    console.log(`[verdict] → ${verdict} (${rawConfidence}) — ${rawReasoning}`);
+
+    // Low-confidence FAILED guard: if the LLM is unsure and returns FAILED,
+    // downgrade to UNTESTABLE — it's better to admit uncertainty than to
+    // incorrectly flag a real feature as broken.
+    if (verdict === 'failed' && rawConfidence === 'low') {
+      console.log('[verdict] Low-confidence FAILED → downgrading to UNTESTABLE');
+      return {
+        verdict: 'untestable',
+        confidence: 'low',
+        reasoning: sanitizeVerdictReasoning(rawReasoning) + ' (Result treated as untestable due to insufficient evidence to confirm a broken feature.)',
+      };
+    }
 
     if (shouldOverrideJsFailure(claim, passCondition, featureType, signals, verdict, rawReasoning)) {
       return {
         verdict: 'untestable',
-        confidence: (parsed.confidence as VerdictResult['confidence']) ?? 'medium',
+        confidence: rawConfidence,
         reasoning: 'The agent reached a leaderboard/data surface, but stable table evidence was not captured on this run. This result is treated as untestable rather than a broken implementation.',
       };
     }
 
     return {
       verdict,
-      confidence: (parsed.confidence as VerdictResult['confidence']) ?? 'low',
+      confidence: rawConfidence,
       reasoning:  sanitizeVerdictReasoning(rawReasoning),
     };
   } catch (e) {
@@ -494,6 +522,12 @@ function buildSignalContext(
   }
   if (signals.chartSignals.length > 0) {
     lines.push(`Chart signals: ${signals.chartSignals.join(', ')}`);
+  }
+  if (signals.visibleSignals.length > 0) {
+    lines.push(`Visible page signals (headings/sections that appeared): ${signals.visibleSignals.slice(0, 8).join(' | ')}`);
+  }
+  if (signals.aggregateStatsSnippets && signals.aggregateStatsSnippets.length > 0) {
+    lines.push(`Aggregate stats visible on page: ${signals.aggregateStatsSnippets.join(', ')} — these are live counters/statistics matching the claim`);
   }
   if (signals.blockersEncountered.length > 0) {
     lines.push(`Blockers encountered: ${signals.blockersEncountered.join(', ')}`);

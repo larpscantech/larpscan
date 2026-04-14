@@ -15,15 +15,17 @@
  *   Rule 0b  tx attempted but not broadcast (e.g. insuff BNB) → verified (feature is real)
  *   Rule 0c  rate-limited after submit (429/max per hour) → verified    (feature is real)
  *   Rule 0   on-chain tx succeeded (receipt status ok)    → verified    (highest)
- *   Rule 1   !siteLoaded                                  → failed      (high)
+ *   Rule 1   !siteLoaded                                  → untestable  (high, was failed)
  *   Rule 1b  pageJsCrash + reached surface + no positive  → failed      (medium)
  *   Rule 2   bot_protection / geo_blocked / rate_limited  → untestable  (high)
  *   Rule 2b  AGENT_LIFECYCLE / MULTI_AGENT + no UI evidence → untestable (high)
+ *   Rule 2c  wallet connected + empty asset dashboard       → untestable (high)
  *   Rule 3   wallet_only_gate + noop ratio ≥ 0.8          → untestable  (high)
  *   Rule 4   DATA_DASHBOARD + (tableHeaders OR ownApi≥5 OR leaderboard API) → verified (high)
  *   Rule 4b  wallet connected + form accessible (UI_FEATURE / DEX+API only) → verified (high)
  *   Rule 4c  WALLET_FLOW + form + CTA + own-domain API responded           → verified (medium)
  *   Rule 4a  wallet_required + formAppeared               → untestable  (high)
+ *   Rule 4d  DATA_DASHBOARD + aggregate stats visible (≥2) → verified   (high)
  *   Rule 5   auth_required + no form + no CTA             → untestable  (high)
  *   Rule 6   form + CTA + ownApi + surface (selective FT) → verified    (medium)
  *   Rule 7   route_missing everywhere + full noop run     → larp        (medium)
@@ -233,13 +235,17 @@ const rule1: Rule = {
   name: 'Rule 1: site_not_loaded',
   evaluate(signals) {
     if (!signals || signals.siteLoaded) return null;
+    // A site that fails to load is more likely a transient issue (DNS, timeout,
+    // rate-limiting, or bot-blocking) than a permanently broken feature.
+    // UNTESTABLE is more honest than FAILED here — we simply couldn't verify.
+    // Only use FAILED if we have clear evidence the feature itself is broken.
     return {
       resolved:      true,
-      verdict:       'failed',
+      verdict:       'untestable',
       confidence:    'high',
       matchedRule:   this.name,
-      blockerReason: 'Site failed to load (DNS error, timeout, or 5xx)',
-      reasons:       ['Site failed to load (DNS error, timeout, or 5xx)'],
+      blockerReason: 'Site could not be reached during this run (may be temporary)',
+      reasons:       ['Site failed to load — DNS error, timeout, bot block, or 5xx response', 'Result is UNTESTABLE rather than FAILED since a load failure is usually transient'],
     };
   },
 };
@@ -494,28 +500,40 @@ const rule4c: Rule = {
   // "Ineligible" or "Insufficient balance". That response IS strong evidence the
   // feature exists and functions. Without this rule every such claim falls through
   // to LLM verdict which returns UNTESTABLE.
+  //
+  // Many platforms (e.g. bnbshare.fun via Flap.sh) use external backend infra,
+  // so all API calls are third-party. Accept third-party calls as evidence when
+  // the wallet is connected, form is visible, and CTA was present.
   evaluate(signals, featureType) {
     if (!signals) return null;
     if (featureType !== 'WALLET_FLOW') return null;
-    if (signals.ownDomainApiCalls.length < 1) return null;
     if (!signals.formAppeared) return null;
     if (!signals.enabledCtaPresent) return null;
     if (!signals.reachedRelevantSurface) return null;
     if (signals.blockersEncountered.includes('wallet_only_gate')) return null;
     if (signals.totalSteps <= 0) return null;
 
+    const walletEv = signals.walletEvidence;
+    const hasOwnApi      = signals.ownDomainApiCalls.length >= 1;
+    const hasThirdPartyApi = signals.thirdPartyApiCalls.length >= 1 && walletEv?.walletConnected;
+    if (!hasOwnApi && !hasThirdPartyApi) return null;
+
     const reasons = [
       `WALLET_FLOW form visible on ${signals.finalUrl}`,
       `Enabled CTA present — agent attempted the action`,
-      `Own-domain API responded (${signals.ownDomainApiCalls.length} call(s)): ${signals.ownDomainApiCalls.slice(0, 2).join(', ')}`,
     ];
+    if (hasOwnApi) {
+      reasons.push(`Own-domain API responded (${signals.ownDomainApiCalls.length} call(s)): ${signals.ownDomainApiCalls.slice(0, 2).join(', ')}`);
+    } else {
+      reasons.push(`Third-party API responded (${signals.thirdPartyApiCalls.length} call(s)) — platform uses external backend infra`);
+    }
     if (signals.blockersEncountered.includes('wallet_required')) {
       reasons.push('Site responded (eligibility check or balance requirement) — feature is real');
     }
     return {
       resolved:      true,
       verdict:       'verified',
-      confidence:    'medium',
+      confidence:    hasOwnApi ? 'high' : 'medium',
       matchedRule:   this.name,
       blockerReason: 'WALLET_FLOW feature demonstrated: form filled, action attempted, backend responded',
       reasons,
@@ -718,12 +736,220 @@ const rule8: Rule = {
 // Ordered rule chain — evaluated top to bottom, first match wins
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Rule 4d: DATA_DASHBOARD with visible aggregate stats (e.g. "10K+ Agents") → VERIFIED
+// Fires when Rule 4 doesn't (no tableHeaders / leaderboard API) but the page
+// visibly shows live aggregate counters that directly match the claim.
+const rule4d: Rule = {
+  name: 'Rule 4d: dashboard_aggregate_stats_visible',
+  evaluate(signals, featureType) {
+    if (!signals) return null;
+    if (featureType !== 'DATA_DASHBOARD') return null;
+    const hasStats = (signals.aggregateStatsSnippets?.length ?? 0) >= 2;
+    const onSurface = signals.reachedRelevantSurface;
+    if (!hasStats || !onSurface || signals.totalSteps <= 0) {
+      if (featureType === 'DATA_DASHBOARD' && !hasStats) {
+        console.log('[verdict:l1] Rule 4d skipped: fewer than 2 aggregate stat snippets detected on page');
+      }
+      return null;
+    }
+    console.log(`[verdict:l1] Rule 4d MATCH — ${signals.aggregateStatsSnippets!.length} aggregate stat(s) visible`);
+    return {
+      resolved:      true,
+      verdict:       'verified',
+      confidence:    'high',
+      matchedRule:   this.name,
+      blockerReason: 'Live aggregate statistics visible on page',
+      reasons: [
+        `Aggregate statistics visible: ${signals.aggregateStatsSnippets!.slice(0, 4).join(', ')}`,
+        'These are live counters consistent with a real data dashboard',
+        `Surface reached: ${signals.finalUrl}`,
+      ],
+    };
+  },
+};
+
+// Rule 2c: wallet connected + empty asset-gated dashboard → UNTESTABLE
+// Fires when the agent navigated to a real dashboard but the test wallet has
+// no in-game assets (NFTs, agents, tokens) to show. Feature infrastructure is
+// real; the test wallet simply can't demonstrate it.
+// Does NOT fire for claims about platform-wide aggregate statistics (those are
+// always testable from the public page, regardless of wallet holdings).
+const rule2c: Rule = {
+  name: 'Rule 2c: empty_asset_gated_dashboard',
+  evaluate(signals, featureType) {
+    if (!signals) return null;
+    const assetGatedTypes = new Set(['DATA_DASHBOARD', 'AGENT_LIFECYCLE', 'MULTI_AGENT']);
+    if (!assetGatedTypes.has(featureType ?? '')) return null;
+    const walletConnected = signals.walletEvidence?.walletConnected === true;
+    const emptyDash = signals.emptyAssetDashboard === true;
+    const reached = signals.reachedRelevantSurface;
+    // Only fire if there's NO positive evidence (don't suppress when data IS visible)
+    const hasPositive =
+      signals.tableHeaders.length > 0 ||
+      (signals.aggregateStatsSnippets?.length ?? 0) >= 1 ||
+      hasDashboardViaApi(signals);
+    if (!walletConnected || !emptyDash || !reached || hasPositive) {
+      if (featureType && assetGatedTypes.has(featureType) && walletConnected && !emptyDash) {
+        console.log('[verdict:l1] Rule 2c skipped: emptyAssetDashboard not detected');
+      }
+      return null;
+    }
+    // Don't apply to claims about global/aggregate platform statistics — those
+    // are visible without owning assets (e.g. "10K+ total agents" on homepage).
+    // The claim text determines whether this is wallet-specific or platform-wide.
+    // We cannot access claim text here, so leave DATA_DASHBOARD-only claims to LLM.
+    if (featureType === 'DATA_DASHBOARD') {
+      console.log('[verdict:l1] Rule 2c skipped: DATA_DASHBOARD — deferring to LLM to distinguish global vs wallet-specific stats');
+      return null;
+    }
+    console.log('[verdict:l1] Rule 2c MATCH — empty asset-gated dashboard (test wallet has no assets)');
+    return {
+      resolved:      true,
+      verdict:       'untestable',
+      confidence:    'high',
+      matchedRule:   this.name,
+      blockerReason: 'Dashboard reached but test wallet has no assets to display',
+      reasons: [
+        'The agent reached the feature dashboard and connected the test wallet',
+        'Dashboard shows zero/empty state — test wallet has no in-game assets (NFTs, agents, etc.)',
+        'Feature infrastructure is confirmed real; full demonstration requires owned assets',
+      ],
+    };
+  },
+};
+
+// Rule 4e: DATA_DASHBOARD + empty wallet dashboard + live API activity → UNTESTABLE
+// Fires when the claim is about a data dashboard, the platform has live API
+// activity (backend is running), but the test wallet has no assets to display.
+// This is the DATA_DASHBOARD-specific complement to rule2c (which skips DATA_DASHBOARD).
+// Note: rule4d fires first if aggregateStatsSnippets >= 2 (VERIFIED); this rule
+// fires when the page is wallet-specific (no global stats) but the platform is live.
+const rule4e: Rule = {
+  name: 'Rule 4e: data_dashboard_empty_wallet_live_api',
+  evaluate(signals, featureType) {
+    if (!signals) return null;
+    if (featureType !== 'DATA_DASHBOARD') return null;
+    const emptyDash  = signals.emptyAssetDashboard === true;
+    const reached    = signals.reachedRelevantSurface;
+    const liveApi    = (signals.ownDomainApiCalls?.length ?? 0) >= 3;
+    const noGlobalStats = (signals.aggregateStatsSnippets?.length ?? 0) < 2;
+    const noTableData   = signals.tableHeaders.length === 0;
+    const totalSteps = signals.totalSteps ?? 0;
+    if (!emptyDash || !reached || !liveApi || !noGlobalStats || !noTableData || totalSteps < 1) {
+      return null;
+    }
+    console.log('[verdict:l1] Rule 4e MATCH — DATA_DASHBOARD with empty wallet, but platform has live API');
+    return {
+      resolved:      true,
+      verdict:       'untestable',
+      confidence:    'high',
+      matchedRule:   this.name,
+      blockerReason: 'Platform dashboard requires owned assets to display data; test wallet has none',
+      reasons: [
+        `Platform is live with ${signals.ownDomainApiCalls?.length ?? 0} own-domain API call(s) — backend is running`,
+        'Test wallet has no in-game assets (agents, NFTs, tokens) to display in the dashboard',
+        'Feature infrastructure is real; full demonstration requires assets owned by the wallet',
+      ],
+    };
+  },
+};
+
+// Rule 4f: DATA_DASHBOARD + surface reached + live platform + limited exploration → UNTESTABLE
+// When the agent reached the surface but made very few steps (< 6), the lack of
+// specific behavioral evidence (trading, learning events, etc.) cannot be treated
+// as proof the feature doesn't exist. The platform IS live; we simply ran out of
+// exploration budget. Return UNTESTABLE rather than FAILED.
+const rule4f: Rule = {
+  name: 'Rule 4f: data_dashboard_under_explored',
+  evaluate(signals, featureType) {
+    if (!signals) return null;
+    if (featureType !== 'DATA_DASHBOARD') return null;
+    if (!signals.reachedRelevantSurface) return null;
+    // Only fire when there are zero table headers (no positive data found)
+    if ((signals.tableHeaders ?? []).length > 0) return null;
+    // Only fire when there are no aggregate stats
+    if ((signals.aggregateStatsSnippets?.length ?? 0) > 0) return null;
+    // Only fire when blockers are absent (no auth gate, no bot block)
+    const blockers = signals.blockersEncountered ?? [];
+    if (blockers.includes('bot_protection') || blockers.includes('auth_required')) return null;
+    // Only fire on very limited exploration (≤ 6 total steps) OR low API activity
+    const totalSteps = signals.totalSteps ?? 0;
+    const ownApiCount = (signals.ownDomainApiCalls?.length ?? 0);
+    if (totalSteps > 6 && ownApiCount >= 3) return null; // well-explored, let LLM decide
+    // Platform needs at least 1 API call to be considered live
+    if (ownApiCount < 1) return null;
+    console.log('[verdict:l1] Rule 4f MATCH — DATA_DASHBOARD surface reached, low exploration, no blocking evidence');
+    return {
+      resolved:      true,
+      verdict:       'untestable',
+      confidence:    'medium',
+      matchedRule:   this.name,
+      blockerReason: 'Limited exploration — platform is live but feature behavior could not be verified within budget',
+      reasons: [
+        `Platform is reachable (surface confirmed) with ${ownApiCount} API call(s)`,
+        `Agent made only ${totalSteps} steps — insufficient to fully verify behavioral claim`,
+        'No negative evidence found — absence of data is not proof the feature is broken',
+        'Feature likely requires owned assets or deeper navigation to confirm',
+      ],
+    };
+  },
+};
+
+// Rule 9: page_broken / SSL error — site unreachable, definitely NOT a LARP verdict
+const rule9: Rule = {
+  name: 'Rule 9: site_unreachable',
+  evaluate(signals) {
+    if (!signals) return null;
+    const hasBroken = signals.blockersEncountered.includes('page_broken');
+    if (!hasBroken) return null;
+    // If there's ALSO a successful tx, the site recovered — let rule0 win
+    if (signals.transactionHash && signals.transactionReceiptStatus === 'success') return null;
+    console.log('[verdict] Rule 9 MATCH — site unreachable (page_broken/SSL error)');
+    return {
+      resolved:      true,
+      verdict:       'untestable',
+      confidence:    'medium',
+      matchedRule:   this.name,
+      blockerReason: 'Site unreachable — SSL error, network error, or browser crash during test session',
+      reasons: [
+        'The platform returned an SSL/network error during the automated test session',
+        'This is a transient infrastructure issue — the feature itself may work normally',
+        'Re-running the verification may produce different results',
+      ],
+    };
+  },
+};
+
+const rule10: Rule = {
+  name: 'Rule 10: bot_link_accessible',
+  evaluate(signals, featureType) {
+    if (!signals) return null;
+    if (!signals.botLinkFound) return null;
+    if (featureType !== 'BOT' && featureType !== 'WALLET_FLOW' && featureType !== 'UI_FEATURE') return null;
+    if (!signals.siteLoaded) return null;
+    console.log('[verdict] Rule 10 MATCH — Telegram/Discord bot link found on page');
+    return {
+      resolved:    true,
+      verdict:     'verified',
+      confidence:  'medium',
+      matchedRule: this.name,
+      reasons: [
+        'A Telegram or Discord bot link was found on the platform page',
+        'This confirms the feature (bot-based interaction) is accessible and deployed',
+        'The deployment mechanism exists and is reachable from the platform UI',
+      ],
+    };
+  },
+};
+
 const RULES: Rule[] = [
+  rule9,  // highest priority — SSL/network errors must not become FAILED
   rule0a, rule0b, rule0c, rule0,
   rule1, rule1b,
-  rule2, rule2b, rule3,
-  rule4, rule4b, rule4c, rule4a,
+  rule2, rule2b, rule2c, rule3,
+  rule4, rule4b, rule4c, rule4a, rule4d, rule4e, rule4f,
   rule5, rule6, rule7, rule8,
+  rule10, // bot link accessible
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────

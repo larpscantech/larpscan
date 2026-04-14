@@ -252,24 +252,39 @@ export async function exposeSigningBridge(context: BrowserContext, sessionId: st
         //
         // Algorithm:
         //   1. Replace vault factory address hex in calldata.
-        //   2. Find "testuser" handle hex to locate the length word position.
+        //   2. Find the handle in calldata (try known handles in order).
         //   3. Truncate calldata at the length word position.
         //   4. Append new simple-vault vaultData.
         const rawData = (txParams.data ?? '').toLowerCase();
         const SIGNED_VAULT_HEX = '3fca49851d6e6082630729f9dc4334a4eefe795d';
-        const HANDLE_HEX       = '7465737475736572'; // "testuser" as utf-8 hex
         const OUR_WALLET_HEX   = investigationWalletAddress?.slice(2).toLowerCase() ?? '';
 
-        if (rawData.includes(SIGNED_VAULT_HEX) && rawData.includes(HANDLE_HEX) && OUR_WALLET_HEX) {
-          const handlePos = rawData.indexOf(HANDLE_HEX);
-          // length word is 448 hex chars before the handle data word
-          const lengthWordStart = handlePos - 448;
+        // Known handles used by the agent (from HANDLE_FALLBACK_SEQUENCE in constants.ts).
+        // The handle hex appears in the ABI-encoded calldata exactly 448 hex chars after
+        // the vaultData length word. Try each in order — first match wins.
+        const KNOWN_HANDLES = [
+          'testuser', 'larpscanbnb', 'testuser2', 'testuser3', 'testuser4',
+          'lscantest01', 'lscantest02', 'lscantest03', 'lscantest04', 'lscantest05',
+          'verifybot01', 'verifybot02', 'verifybot03',
+          'agenttest01', 'agenttest02', 'agenttest03',
+          'scantest_x1', 'scantest_x2', 'scantest_x3', 'scantest_x4',
+        ];
 
-          // rawData starts with "0x" (2 chars). ABI words are 64 chars (32 bytes) aligned
-          // starting at char 10 (2 prefix + 8 selector). Valid word-boundary check:
-          // (lengthWordStart - 2) % 64 === 8  (selector-offset alignment)
-          const lwAligned = lengthWordStart > 0 && (lengthWordStart - 2) % 64 === 8;
-          if (lwAligned) {
+        let patchApplied = false;
+        if (rawData.includes(SIGNED_VAULT_HEX) && OUR_WALLET_HEX) {
+          for (const handle of KNOWN_HANDLES) {
+            const handleHex = Buffer.from(handle, 'utf8').toString('hex');
+            const handlePos = rawData.indexOf(handleHex);
+            if (handlePos < 0) continue;
+
+            // length word is 448 hex chars before the handle data word
+            const lengthWordStart = handlePos - 448;
+
+            // Validate alignment: ABI words are 64 hex chars (32 bytes), starting at char 10
+            // (2 "0x" prefix + 8 selector chars). Check word-boundary:
+            const lwAligned = lengthWordStart > 0 && (lengthWordStart - 2) % 64 === 8;
+            if (!lwAligned) continue;
+
             // Build simple vault vaultData:
             //   outer length = 0x80 (128 bytes)
             //   inner array offset = 0x20 (32)
@@ -288,14 +303,17 @@ export async function exposeSigningBridge(context: BrowserContext, sessionId: st
                      .slice(0, lengthWordStart) +
               simpleVaultData;
 
-            // patched already starts with "0x" (inherited from rawData) — no extra prefix
             txParams = { ...txParams, data: patched };
+            patchApplied = true;
             console.log(
-              '[wallet/signer] ⚡ Patched: SignedSocialVaultFactory → SimpleVaultFactory, ' +
-              `vaultData → wallet-based fee sharing (${investigationWalletAddress?.slice(0,10)}... 100%)`,
+              `[wallet/signer] ⚡ Patched: SignedSocialVaultFactory → SimpleVaultFactory, ` +
+              `handle="${handle}", vaultData → wallet-based fee sharing (${investigationWalletAddress?.slice(0,10)}... 100%)`,
             );
-          } else {
-            console.log('[wallet/signer] ⚠️  Vault patch: length word alignment check failed — sending original');
+            break;
+          }
+
+          if (!patchApplied) {
+            console.log('[wallet/signer] ⚠️  Vault patch: no known handle found in calldata — sending original');
           }
         }
         // ── end patch ──────────────────────────────────────────────────────
