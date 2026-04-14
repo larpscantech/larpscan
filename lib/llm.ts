@@ -98,13 +98,19 @@ FEATURE TYPES
 
 Classify each claim as one of:
 - UI_FEATURE      → generic interactive element (button, form, widget)
-- DEX_SWAP        → token swap / AMM
-- TOKEN_CREATION  → deploy or mint a token
+- DEX_SWAP        → token swap / AMM / on-chain trading action
+- TOKEN_CREATION  → deploy or mint a token / NFT / on-chain asset
 - API_FEATURE     → publicly accessible REST/JSON endpoint (no auth)
-- BOT             → Telegram or Discord bot
+- BOT             → Telegram or Discord bot interaction
 - CLI_TOOL        → command-line tool or script
-- WALLET_FLOW     → wallet-connect required on-chain action
-- DATA_DASHBOARD  → leaderboard, stats table, charts, live data feed
+- WALLET_FLOW     → any on-chain action requiring wallet connection (agent deployment, staking, competition entry, funding, creation flow via external link/bot)
+- DATA_DASHBOARD  → leaderboard, stats table, charts, live data feed (read-only, no transaction)
+
+CRITICAL classification rules:
+- If the claim involves DEPLOYING, CREATING, LAUNCHING, FUNDING, or STAKING anything on-chain → WALLET_FLOW (even if done via Telegram bot or CLI)
+- If the claim involves TRADING, SWAPPING, BUYING, SELLING on-chain → DEX_SWAP
+- If the claim involves VIEWING stats, leaderboard, or data (no wallet needed) → DATA_DASHBOARD
+- Do NOT classify claims as DATA_DASHBOARD just because they mention competition rankings — only if the data is publicly viewable without a transaction
 
 Verification strategy per type:
 - UI_FEATURE      → "ui+browser"
@@ -152,9 +158,9 @@ Return a single JSON object:
     {
       "claim": "Full description preserving the mechanism and workflow",
       "pass_condition": "What a tester observes if this claim is true",
-      "feature_type": "DATA_DASHBOARD",
+      "feature_type": "<pick the correct type from the list above>",
       "surface": "/",
-      "verification_strategy": "dashboard+browser"
+      "verification_strategy": "<matching strategy from the list above>"
     }
   ]
 }
@@ -218,7 +224,7 @@ export async function extractClaimsFromText(
   const userMessage = sections.join('\n\n');
 
   const response = await client.chat.completions.create({
-    model:           'gpt-4o',
+    model:           'gpt-4.1',
     temperature:     0.1,
     max_tokens:      2_200,
     response_format: { type: 'json_object' },

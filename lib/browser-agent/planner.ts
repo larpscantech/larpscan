@@ -188,7 +188,7 @@ function formatPageContext(ps: PageState): string {
     lines.push(`Accessibility tree (interactive elements — use names for click_text targets):\n${axLines}`);
   }
 
-  lines.push(`\nPage content (first 700 chars):\n${ps.visibleText.slice(0, 700)}`);
+  lines.push(`\nPage content (first 1500 chars):\n${ps.visibleText.slice(0, 1500)}`);
 
   return lines.join('\n');
 }
@@ -234,6 +234,33 @@ function parseSteps(raw: string, max: number): AgentStep[] {
 // planWorkflow — initial plan based on live page state + claim context
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+// extractPassConditionPaths — parse URL paths explicitly mentioned in the
+// pass condition string (e.g. "Navigate to /autonomous-economy and /agentic_bot").
+// These are authoritative navigation targets from the claim author.
+//
+// Rules to avoid false positives:
+//  - Only lowercase paths (real routes are lowercase; "URLs", "BNB" etc. are not)
+//  - Minimum 3 chars after the slash
+//  - Not a common English word fragment (to, on, in, at, etc.)
+// ─────────────────────────────────────────────────────────────────────────────
+const PASS_CONDITION_PATH_STOPLIST = new Set([
+  'a', 'an', 'the', 'to', 'of', 'in', 'on', 'at', 'by', 'for', 'or', 'and',
+  'its', 'api', 'app', 'web', 'new', 'use', 'all', 'via', 'bot', 'log',
+  'top', 'run', 'get', 'set', 'put', 'out', 'one', 'two', 'now', 'how',
+  'not', 'but', 'has', 'had', 'did', 'can', 'may', 'own', 'way', 'day',
+]);
+
+function extractPassConditionPaths(passCondition: string): string[] {
+  // Only match lowercase paths (real routes are lowercase)
+  const matches = passCondition.match(/\/[a-z][a-z0-9_-]{2,}/g) ?? [];
+  return [...new Set(matches)].filter((p) =>
+    p.length > 3 &&
+    p.length < 80 &&
+    !PASS_CONDITION_PATH_STOPLIST.has(p.slice(1)),
+  );
+}
+
 export async function planWorkflow(
   claim:         string,
   passCondition: string,
@@ -253,6 +280,21 @@ export async function planWorkflow(
   console.log('[planner] Planning workflow...');
   console.log('[planner] Blockers:', pageState.blockers);
   console.log('[planner] Route candidates:', pageState.routeCandidates);
+
+  // ── Inject pass-condition paths as high-priority candidate routes ──────────
+  // The pass condition often names specific URL paths that are authoritative
+  // navigation targets (e.g. "Navigate to /autonomous-economy and /agentic_bot").
+  // These are NOT "invented paths" — they come from the claim spec and must be
+  // tried even if they don't appear in the scraped nav links.
+  const passConditionPaths = extractPassConditionPaths(passCondition);
+  if (passConditionPaths.length > 0) {
+    console.log('[planner] Pass-condition paths:', passConditionPaths);
+    for (const p of passConditionPaths) {
+      if (!pageState.routeCandidates.includes(p)) {
+        pageState.routeCandidates.unshift(p); // high priority
+      }
+    }
+  }
 
   // Hard early-return conditions.
   // auth_required only hard-stops when there is truly NO interactive UI — if CTAs
@@ -277,7 +319,7 @@ export async function planWorkflow(
     return [];
   }
 
-  const featureGuidance = buildFeatureGuidance(featureType, strategy, connectedWalletAddress);
+  const featureGuidance = buildFeatureGuidance(featureType, strategy, connectedWalletAddress, passConditionPaths);
   const playbook = getFeaturePlaybook(featureType);
   const rankedRoutes = rankRouteCandidates(pageState, featureType, claim, undefined, surface);
   const rankedCtas = rankCtaCandidates(pageState, featureType, claim);
@@ -285,6 +327,24 @@ export async function planWorkflow(
 
   // Deterministic-first first action: route-first when a strong route exists.
   const deterministicFirstStep: AgentStep | undefined = (() => {
+    // Highest priority: paths explicitly named in the pass condition
+    // (e.g. "Navigate to /autonomous-economy and /agentic_bot").
+    // These are authoritative — navigate there even if not in nav links.
+    if (passConditionPaths.length > 0) {
+      const current = pageState.url;
+      // Find the first pass-condition path that doesn't match the current URL
+      const firstUnvisited = passConditionPaths.find((p) => {
+        try {
+          const pn = new URL(current).pathname;
+          return pn !== p && !pn.startsWith(p + '/');
+        } catch { return true; }
+      });
+      if (firstUnvisited) {
+        const navLabel = pageState.navLinks.find((n) => n.href === firstUnvisited)?.text;
+        if (navLabel?.trim()) return { action: 'open_link_text', text: navLabel.trim() };
+        return { action: 'navigate', path: firstUnvisited };
+      }
+    }
     if (surface && surface !== '/' && pageState.routeCandidates.includes(surface)) {
       const navLabel = pageState.navLinks.find((n) => n.href === surface)?.text;
       if (navLabel && navLabel.trim().length > 0) return { action: 'open_link_text', text: navLabel.trim() };
@@ -316,6 +376,10 @@ export async function planWorkflow(
 
   const runMemoryNote = runMemory ? formatRunMemoryContext(runMemory) : '';
 
+  const passConditionNote = passConditionPaths.length > 0
+    ? `\nPASS-CONDITION PATHS (authoritative — navigate these even if not in nav links): ${passConditionPaths.join(', ')}`
+    : '';
+
   const systemPrompt = `${BASE_SYSTEM}
 
 FEATURE CONTEXT:
@@ -325,19 +389,14 @@ Configured surface: ${surface}
 ${walletConnectedNote}
 ${runMemoryNote ? `${runMemoryNote}\n` : ''}${featureGuidance}
 
-PLANNING RULES:
-1. Treat this claim as a complete workflow: navigate → interact → observe result
-2. Maximum 10 steps total
-3. Deterministic-first policy: prefer the ranked routes and ranked CTAs provided in context. Use LLM judgment only to pick among top-ranked candidates or when ranked options fail.
-4. If Configured surface is non-root and Nav links contain a matching route, your FIRST step must navigate there using open_link_text (preferred — works in any language) or navigate with the href. If Configured surface is "/" and the claim is homepage workflow (e.g. mining/hash/start), prefer local CTA/form actions first. Use ONLY routes from Nav links or Available routes — NEVER invent paths
-5. Prefer ctaCandidates and non-disabled buttons for click targets
-6. check_text is supporting evidence only — maximum 1 step, only at the very end
-7. If blockers include wallet_required but form/dashboard UI is visible — still plan steps to demonstrate it
-8. For DATA_DASHBOARD / dashboard+browser: use navigate → scroll → inspect table/chart content
-9. For TOKEN_CREATION / form+browser: navigate → fill ALL visible form fields using selectors from "Form fields" → scroll down → fill remaining fields → click the Create/Launch/Deploy/Mint submit button → check_text for the outcome. You ARE allowed to click the submit button for TOKEN_CREATION. NEVER invent input selectors — only use what is listed in "Form fields".
-10. For DEX_SWAP / WALLET_FLOW: navigate to feature surface → click "Connect Wallet" if it blocks access → show form is interactive → stop before wallet signature (Sign/Approve)
-11. Only return {"steps":[]} if the page is broken, auth-gated with no visible UI, or wallet_only_gate confirmed
-12. RESPONSE FORMAT: Return JSON {"steps":[...]} — no text outside the JSON object.${pageScreenshotDataUrl ? '\n13. A screenshot of the page is attached. Study it carefully before planning — look for visible forms, buttons, and loaded content.' : ''}`;
+PLANNING RULES (surface-finder mode — the ReAct loop handles interaction):
+1. Your ONLY job is to navigate to the correct feature surface. Return 1-3 navigation steps MAX.
+2. After navigation, an adaptive ReAct loop takes over — do NOT plan form fills, clicks, or checks.
+3. Prefer open_link_text for nav links (works in any language), navigate for direct paths.
+4. Use ONLY routes from Nav links, Available routes, or paths listed in PASS-CONDITION PATHS — NEVER invent other paths.
+5. If the feature is on the current page (homepage workflow), return 0-1 steps.
+6. Only return {"steps":[]} if the page is broken, auth-gated with no visible UI, or wallet_only_gate confirmed.
+7. RESPONSE FORMAT: Return JSON {"steps":[...]} — no text outside the JSON object.${pageScreenshotDataUrl ? '\n8. A screenshot of the page is attached. Study it to identify the right navigation target.' : ''}${passConditionNote}`;
 
   const userText = [
     `Claim: ${claim}`,
@@ -365,7 +424,7 @@ PLANNING RULES:
 
   try {
     const resp = await getOpenAI().chat.completions.create({
-      model:           'gpt-4o',
+      model:           'gpt-4.1',
       temperature:     0,
       max_tokens:      900,
       response_format: { type: 'json_object' },
@@ -392,6 +451,22 @@ PLANNING RULES:
       steps = [deterministicFirstStep];
     }
 
+    // Inject remaining pass-condition paths as navigate steps after the first,
+    // so the agent visits ALL explicitly-mentioned paths (e.g. /autonomous-economy AND /agentic_bot).
+    if (passConditionPaths.length > 1) {
+      const current = pageState.url;
+      const alreadyPlanned = new Set(steps.flatMap((s) => 'path' in s ? [s.path] : []));
+      for (const p of passConditionPaths.slice(1)) {
+        if (alreadyPlanned.has(p)) continue;
+        try {
+          const pn = new URL(current).pathname;
+          if (pn === p || pn.startsWith(p + '/')) continue;
+        } catch { /* ok */ }
+        steps.push({ action: 'navigate', path: p });
+        if (steps.length >= 5) break; // keep plan concise
+      }
+    }
+
     console.log(`[planner] Plan A: ${steps.length} step(s)`, JSON.stringify(steps, null, 2));
     return steps;
   } catch (e) {
@@ -406,183 +481,25 @@ PLANNING RULES:
 
 export async function replanWorkflow(
   claim:            string,
-  passCondition:    string,
-  featureType:      string,
+  _passCondition:    string,
+  _featureType:      string,
   surface:          string,
-  strategy:         string,
-  updatedPageState: PageState,
-  priorObservations: AgentObservation[],
-  memory?:          AttemptMemory,
-  connectedWalletAddress?: string,
-  /** Knowledge accumulated from Plan A — avoids replanning dead routes */
-  runMemory?: RunMemory,
-  /** JPEG screenshot of the current page for visual grounding of the recovery plan */
-  pageScreenshotDataUrl?: string,
+  _strategy:         string,
+  _updatedPageState: PageState,
+  _priorObservations: AgentObservation[],
+  _memory?:          AttemptMemory,
+  _connectedWalletAddress?: string,
+  _runMemory?: RunMemory,
+  _pageScreenshotDataUrl?: string,
 ): Promise<AgentStep[]> {
-  console.log('[planner] Replanning — generating recovery plan...');
-
-  // Split prior observations into effective steps (produced observable change)
-  // and true no-ops (produced no change). Previously everything was labeled
-  // "NO-OP" which confused the model about what was actually attempted.
-  const effectiveSteps = priorObservations
-    .filter((o) => !o.isNoop)
-    .map((o, i) => `  ${i + 1}. ${o.step} → ${o.result ?? 'ok'}`)
-    .join('\n') || '  (none)';
-
-  const noopSteps = priorObservations
-    .filter((o) => o.isNoop)
-    .map((o) => `  • ${o.step}`)
-    .join('\n') || '  (none)';
-
-  const noopSummary = `Steps that had observable effect:\n${effectiveSteps}\n\nSteps that were no-ops (try something different):\n${noopSteps}`;
-
-  const tokenVaultRecovery =
-    featureType === 'TOKEN_CREATION'
-      ? `
-TOKEN_CREATION / FEE SHARING RECOVERY:
-- If you see "Please enter a username for fee sharing" (or similar validation error), fill the X/Twitter username field using EXACT selector from Form fields and value exactly: ${SOCIAL_HANDLE_FILL_TOKEN}
-- Do NOT disable the fee-sharing toggle — keep it enabled and fill the username.
-${connectedWalletAddress ? `Connected wallet: ${connectedWalletAddress}. For explicit 0x recipient fields use: ${INVESTIGATION_WALLET_FILL_TOKEN}` : ''}
-`
-      : '';
-
-  const walletConnectedNoteReplan = connectedWalletAddress
-    ? `\nWALLET STATUS: ALREADY CONNECTED (address: ${connectedWalletAddress}). DO NOT plan wallet-connection steps — skip directly to the feature workflow.\n`
-    : '';
-
-  const runMemoryNoteReplan = runMemory ? formatRunMemoryContext(runMemory) : '';
-
-  const systemPrompt = `${BASE_SYSTEM}
-
-FEATURE CONTEXT:
-Feature type: ${featureType}
-Verification strategy: ${strategy}
-Configured surface: ${surface}
-${walletConnectedNoteReplan}${runMemoryNoteReplan ? `${runMemoryNoteReplan}\n` : ''}${tokenVaultRecovery}
-RECOVERY PLANNING RULES:
-1. The previous steps produced no meaningful progress — try a DIFFERENT approach
-2. Maximum 5 steps
-3. Suggested recovery strategies:
-   - Navigate to a different route from the available routes list
-   - Scroll down to reveal hidden content or lazy-loaded UI
-   - Look for an alternative CTA or entry point
-   - Try open_link_text for a nav link related to the claim
-   - Navigate to homepage and approach from a different angle
-4. Do NOT repeat attempted routes, attempted CTAs, or steps already known as no-op
-5. check_text max 1 at the end only
-6. Use ONLY routes from available routes — never invent paths
-7. Deterministic-first: choose next highest-ranked unattempted route/CTA before free-form exploration
-8. RESPONSE FORMAT: Return JSON {"steps":[...]} — no text outside the JSON object`;
-
-  const rankedRoutes = rankRouteCandidates(updatedPageState, featureType, claim, {
-    attemptedRoutes: memory?.attemptedRoutes,
-    attemptedCtas: memory?.attemptedCtas,
-    noopActions: memory?.noopActions,
-  }, surface);
-  const rankedCtas = rankCtaCandidates(updatedPageState, featureType, claim, {
-    attemptedRoutes: memory?.attemptedRoutes,
-    attemptedCtas: memory?.attemptedCtas,
-    noopActions: memory?.noopActions,
-  });
-  const dashboardNoops = countSemanticNoops(memory, 'route_class:dashboard') + countSemanticNoops(memory, 'cta_class:dashboard');
-  const creationNoops = countSemanticNoops(memory, 'route_class:creation') + countSemanticNoops(memory, 'cta_class:creation');
-  const walletFlowNoops = countSemanticNoops(memory, 'route_class:wallet_flow') + countSemanticNoops(memory, 'cta_class:wallet_flow');
-  const untriedRoute = rankedRoutes.find((r) => !memory?.attemptedRoutes.includes(r.path));
-  const untriedCta = rankedCtas.find((c) => !memory?.attemptedCtas.includes(c.text));
-  let deterministicRecoveryStep: AgentStep | undefined;
-  // Semantic pivot: avoid repeating the same failing action class cluster.
-  if (
-    (featureType === 'DATA_DASHBOARD' && dashboardNoops >= 2) ||
-    (featureType === 'TOKEN_CREATION' && creationNoops >= 2) ||
-    ((featureType === 'WALLET_FLOW' || featureType === 'DEX_SWAP') && walletFlowNoops >= 2)
-  ) {
-    deterministicRecoveryStep = updatedPageState.forms.length > 0
-      ? { action: 'scroll', direction: 'down', amount: 700 }
-      : (untriedCta ? { action: 'click_text', text: untriedCta.text } : undefined);
-  } else {
-    deterministicRecoveryStep = untriedRoute
-      ? { action: 'navigate', path: untriedRoute.path }
-      : (untriedCta ? { action: 'click_text', text: untriedCta.text } : undefined);
+  // In the ReAct architecture, replanning is unnecessary — the ReAct loop
+  // handles recovery adaptively. Return a minimal navigation to the surface
+  // so the ReAct loop can take over from there.
+  console.log('[planner] replanWorkflow called — returning minimal surface navigation for ReAct loop');
+  if (surface && surface !== '/') {
+    return [{ action: 'navigate', path: surface }];
   }
-
-  const userMessageText = [
-    `Claim: ${claim}`,
-    `Pass condition: ${passCondition}`,
-    '',
-    'STEPS ALREADY ATTEMPTED:',
-    noopSummary,
-    '',
-    `Attempted routes: ${(memory?.attemptedRoutes ?? []).join(', ') || 'none'}`,
-    `Attempted CTAs: ${(memory?.attemptedCtas ?? []).join(', ') || 'none'}`,
-    `No-op actions: ${(memory?.noopActions ?? []).join(' | ') || 'none'}`,
-    `No-op class counts: dashboard=${dashboardNoops}, creation=${creationNoops}, wallet_flow=${walletFlowNoops}`,
-    `Top ranked untried route: ${untriedRoute ? `${untriedRoute.path}(${untriedRoute.score})` : 'none'}`,
-    `Top ranked untried CTA: ${untriedCta ? `${untriedCta.text}(${untriedCta.score})` : 'none'}`,
-    '',
-    'UPDATED PAGE STATE:',
-    formatPageContext(updatedPageState),
-    pageScreenshotDataUrl ? '\nA screenshot of the current page is attached. Study it before choosing a recovery approach.' : '',
-  ].join('\n');
-
-  type ReplanContentPart =
-    | { type: 'text'; text: string }
-    | { type: 'image_url'; image_url: { url: string; detail: 'low' } };
-
-  const userContent: ReplanContentPart[] | string = pageScreenshotDataUrl
-    ? [
-        { type: 'text', text: userMessageText },
-        { type: 'image_url', image_url: { url: pageScreenshotDataUrl, detail: 'low' } },
-      ]
-    : userMessageText;
-
-  try {
-    const resp = await getOpenAI().chat.completions.create({
-      model:           'gpt-4o',
-      temperature:     0.1,   // slight variation to encourage different approach
-      max_tokens:      600,
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: systemPrompt },
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        { role: 'user',   content: userContent as any },
-      ],
-    });
-
-    const raw   = resp.choices[0]?.message?.content ?? '{"steps":[]}';
-    let steps = parseSteps(raw, 5);
-    if (deterministicRecoveryStep) {
-      const first = steps[0];
-      const sameAsDeterministic = first && JSON.stringify(first) === JSON.stringify(deterministicRecoveryStep);
-      if (!sameAsDeterministic) {
-        steps = [deterministicRecoveryStep, ...steps].slice(0, 5);
-      }
-    }
-    // Avoid repeating known no-op steps from memory.
-    if (memory && memory.noopActions.length > 0) {
-      const normalizedNoops = new Set(memory.noopActions);
-      steps = steps.filter((s) => !normalizedNoops.has(stepToSignature(s)));
-    }
-    console.log(`[planner] Plan B (recovery): ${steps.length} step(s)`, JSON.stringify(steps, null, 2));
-    return steps;
-  } catch (e) {
-    console.error('[planner] replanWorkflow failed:', e);
-    return [];
-  }
-}
-
-function stepToSignature(step: AgentStep): string {
-  switch (step.action) {
-    case 'navigate':          return `navigate("${step.path}")`;
-    case 'open_link_text':    return `open_link_text("${step.text}")`;
-    case 'click_text':        return `click_text("${step.text}")`;
-    case 'click_selector':    return `click_selector("${step.selector}")`;
-    case 'fill_input':        return `fill_input("${step.selector}", "${step.value}")`;
-    case 'wait_for_selector': return `wait_for_selector("${step.selector}")`;
-    case 'wait_for_text':     return `wait_for_text("${step.text}")`;
-    case 'scroll':            return `scroll(${step.direction}, ${step.amount ?? 600}px)`;
-    case 'back':              return 'back()';
-    case 'check_text':        return `check_text("${step.text}")`;
-  }
+  return [];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -593,49 +510,79 @@ function buildFeatureGuidance(
   featureType: string,
   strategy: string,
   connectedWallet?: string,
+  passConditionPaths: string[] = [],
 ): string {
+  const hasPassPaths = passConditionPaths.length > 0;
+  const passPathsList = passConditionPaths.join(', ');
+
   switch (featureType) {
     case 'DATA_DASHBOARD':
     case 'dashboard+browser':
+      // One consolidated case — never use passConditionPaths from the dead
+      // duplicate that appeared below (that code was unreachable).
+      if (hasPassPaths) {
+        return `PRIORITY:
+1. Navigate to EACH of these pass-condition paths in order: ${passPathsList}
+   These are authoritative targets — navigate even if they are not in the nav links.
+   Do NOT stop after the first path — visit ALL of them.
+2. At each page, scroll down to reveal table rows, charts, stats, and data sections.
+3. Verify that live data is visible: stats, counters, table rows, or chart data.`;
+      }
       return `PRIORITY:
 1. Your FIRST step must navigate to the leaderboard/dashboard route.
    — Use open_link_text with the exact nav link label visible in Nav links (e.g. "排行榜", "Leaderboard", "排名", "Stats", "Rankings").
    — OR use navigate with the href path shown in Nav links (e.g. navigate("/leaderboard")).
-   — Do NOT scroll the homepage — the table is on a dedicated sub-page.
-2. After arriving on the leaderboard/dashboard page, scroll down to reveal the full table or chart content.
-3. Verify that table column headers and data rows are visible on screen.`;
+   — If no dedicated route exists, stay on the homepage and scroll to find counters/stats.
+2. After arriving, scroll down to reveal the full table or chart content.
+3. Verify that table column headers, data rows, or aggregate stats are visible on screen.`;
+
     case 'TOKEN_CREATION':
     case 'form+browser':
-      return `PRIORITY — demonstrate token creation with fee sharing enabled.
+      return `PRIORITY — demonstrate token/agent creation.
 
-Social handles (Ensoul, BNBshare, Flap-style launchpads, etc.):
-- When a field is labeled X/Twitter/GitHub/TikTok/Twitch Username, social handle, or similar, fill it using value EXACTLY: ${SOCIAL_HANDLE_FILL_TOKEN} (executor substitutes a hardcoded handle).
+Social handles and username fields:
+- When a field is labeled X/Twitter/GitHub/TikTok/Twitch Username, social handle, or similar,
+  fill it with a short alphanumeric test handle (e.g. "testbot01", max 15 chars, no spaces).
 - If "Enable Fee Sharing" is on, keep it enabled and fill the username field.
-- Do NOT leave social/username fields empty — that will cause a validation error and the form will not submit.
+- Do NOT leave social/username fields empty — that will cause a validation error.
+- Read the field's placeholder text as a FORMAT HINT only — never copy it verbatim.
+- If a name/handle is "already taken", append a digit and try again.
 
-Workflow:
-1. Navigate to the token creation form.
-2. Fill name "TestToken", symbol "TST", description, optional website/telegram — EXACT selectors from "Form fields".
-3. Fill every visible social / username field with ${SOCIAL_HANDLE_FILL_TOKEN}.
-4. Scroll down 600px; fill any newly revealed fields the same way.
-5. Image uploads are automatic — do not click upload.
-6. Click "Create Token" / "Launch" / "Deploy" submit; use check_text for the outcome.
-${connectedWallet ? `
-CONNECTED VERIFICATION WALLET: ${connectedWallet}
-If a field explicitly expects a 0x wallet address as fee recipient (not @username), use fill_input value exactly: ${INVESTIGATION_WALLET_FILL_TOKEN}` : ''}`;
+Workflow:${hasPassPaths ? `\n0. Navigate to: ${passPathsList}` : ''}
+1. Navigate to the token/agent creation form.
+2. Fill ALL visible fields top-to-bottom: name (short, max 15 chars), symbol, description.
+   For URL fields: use "https://docs.example.com" unless placeholder says "ipfs" — then use
+   "ipfs://QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG".
+3. Scroll down 600px; fill any newly revealed fields the same way.
+4. Image uploads are automatic — do not click upload.
+5. Click the final submit button ("Create", "Launch", "Deploy", "Mint", "Create Agent").
+${connectedWallet ? `\nCONNECTED WALLET: ${connectedWallet}
+If a field explicitly expects a 0x wallet address as fee recipient, use fill_input value exactly: ${INVESTIGATION_WALLET_FILL_TOKEN}` : ''}`;
+
     case 'DEX_SWAP':
     case 'ui+rpc':
       return 'PRIORITY: Navigate to the swap/exchange surface → show the swap form is present and interactive → identify token selectors and amount inputs (stop before executing any swap).';
+
     case 'WALLET_FLOW':
     case 'wallet+rpc':
       return 'PRIORITY: Navigate to the feature surface → click "Connect Wallet" if it blocks progress → demonstrate the UI and form structure → record available inputs (stop before Sign/Approve).';
+
     case 'API_FEATURE':
     case 'api+fetch':
       return 'PRIORITY: Navigate to the feature surface → look for API endpoint documentation, interactive demos, or direct endpoint responses.';
+
     case 'AGENT_LIFECYCLE':
     case 'MULTI_AGENT':
-      return 'PRIORITY: Navigate to the agents/dashboard/activity surface → look for a list of active agents, lifecycle logs, activity feeds, or agent status indicators. If a "Deploy Agent" or "Create Agent" button is visible, click it to show the deployment form exists. Stop before any transaction submission.';
+      if (hasPassPaths) {
+        return `PRIORITY: Navigate to EACH of these paths in order: ${passPathsList}
+At each page, look for agent lifecycle data: list of active agents, models, inference providers,
+status indicators, activity feeds, or competition rankings.
+If you see a "Deploy Agent" or "Create Agent" button, click it to show the deployment form.
+Stop before any transaction submission.`;
+      }
+      return 'PRIORITY: Navigate to the agent management surface. Look for agent lifecycle data: list of active agents, models, inference providers, status indicators, activity feeds, or competition rankings. If you see a "Deploy Agent" or "Create Agent" button, click it to show the deployment form. Stop before any transaction submission.';
+
     default:
-      return 'PRIORITY: Navigate to the most relevant page for this claim → interact with primary CTAs → observe state changes.';
+      return `PRIORITY: Navigate to the most relevant page for this claim → interact with primary CTAs → observe state changes.${hasPassPaths ? ` Visit ALL pass-condition paths: ${passPathsList}` : ''}`;
   }
 }
