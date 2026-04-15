@@ -4,10 +4,11 @@ import { log } from '@/lib/logger';
 import { determineVerdict } from '@/lib/verdict';
 import { routeVerification, type StructuredClaim } from '@/lib/verification-graph';
 import { ok, err, withErrorHandler } from '@/lib/api-helpers';
+import { getFastTrackVerdict, recordClaimResult } from '@/lib/platform-context';
 import type { DbClaim, DbProject, DbVerificationRun } from '@/lib/db-types';
 
 export const runtime = 'nodejs';
-export const maxDuration = 300;
+export const maxDuration = 540; // Must exceed STUCK_CHECKING_MS (8 min = 480s) with overhead
 
 function summarizeBrowserFailure(error: unknown): string {
   const msg = error instanceof Error ? error.message : 'Unknown Playwright error';
@@ -48,6 +49,20 @@ export const POST = withErrorHandler(async (req: Request) => {
   await supabase.from('claims').update({ status: 'checking' }).eq('id', claimId).eq('status', 'pending');
   await log(runId, `claim-start:${claimId}`);
 
+  // ── Platform-level fast-track check ──────────────────────────────────────
+  // If a previous claim in this run already discovered a platform-wide blocker
+  // (bot protection, full auth-gate), skip the browser session entirely.
+  const fastTrack = getFastTrackVerdict(runId);
+  if (fastTrack) {
+    console.log(`[verify/claim] Fast-track → ${fastTrack.verdict}: ${fastTrack.reason}`);
+    await supabase.from('claims').update({ status: fastTrack.verdict }).eq('id', claimId);
+    await saveEvidence(claimId, fastTrack.reason, fastTrack.verdict, fastTrack.reason, 'high');
+    await log(runId, `verdict → ${fastTrack.verdict.toUpperCase()} (platform context fast-track)`);
+    await log(runId, fastTrack.reason);
+    await maybeCompleteRun(runId, new URL((req as NextRequest).url).origin);
+    return ok({ claimId, verdict: fastTrack.verdict, confidence: 'high' });
+  }
+
   let evidenceSummary   = 'No evidence collected';
   let screenshotDataUrl: string | undefined;
   let videoUrl:          string | undefined;
@@ -80,9 +95,12 @@ export const POST = withErrorHandler(async (req: Request) => {
     }
 
     if (!verifyResult.siteLoaded) {
-      const fastVerdict = verifyResult.blocked ? 'untestable' : 'failed';
+      // Network failures (timeout, DNS, SSL, chrome-error) are UNTESTABLE, not FAILED.
+      // The site being unreachable doesn't prove the feature doesn't exist — it's a
+      // transient infra issue. Only use FAILED when we're certain the feature is broken.
+      const fastVerdict = 'untestable';
       await supabase.from('claims').update({ status: fastVerdict }).eq('id', claimId);
-      await saveEvidence(claimId, evidenceSummary, fastVerdict, 'Site unreachable or bot-blocked', 'high', screenshotDataUrl);
+      await saveEvidence(claimId, evidenceSummary, fastVerdict, verifyResult.blocked ? 'Platform is bot-blocked or auth-gated' : 'Site unreachable — network or SSL error during test session', 'high', screenshotDataUrl);
       await log(runId, `verdict → ${fastVerdict.toUpperCase()} (high confidence)`);
       await maybeCompleteRun(runId, new URL((req as NextRequest).url).origin);
       return ok({ claimId, verdict: fastVerdict, confidence: 'high' });
@@ -124,6 +142,9 @@ export const POST = withErrorHandler(async (req: Request) => {
   await supabase.from('claims').update({ status: verdict.verdict }).eq('id', claimId);
   await log(runId, `verdict → ${verdict.verdict.toUpperCase()} (${verdict.confidence} confidence)`);
   await log(runId, verdict.reasoning);
+
+  // Record platform-level blockers so subsequent claims can fast-track
+  recordClaimResult(runId, verifyResult?.signals?.blockersEncountered ?? [], verdict.verdict);
 
   if (verifyResult?.signals?.transactionHash) {
     await log(runId, `On-chain tx: https://bscscan.com/tx/${verifyResult.signals.transactionHash}`);

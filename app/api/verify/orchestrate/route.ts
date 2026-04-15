@@ -135,7 +135,7 @@ export const POST = withErrorHandler(async (req: Request) => {
       .from('verification_runs')
       .select('*')
       .eq('project_id', project.id)
-      .in('status', ['pending', 'verifying', 'extracting', 'analyzing'])
+      .in('status', ['pending', 'queued', 'verifying', 'extracting', 'analyzing'])
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle<DbVerificationRun>();
@@ -197,6 +197,55 @@ export const POST = withErrorHandler(async (req: Request) => {
     `Project: ${project.name}`,
     project.website ? `Website: ${project.website}` : 'No website found for this project',
   ]);
+
+  // ── 4b. On Force Re-verify: reuse existing claims instead of re-extracting ─
+  // Re-extracting claims via LLM on every run causes LLM non-determinism to leak
+  // into claim definitions (different surface URLs, feature types, pass conditions)
+  // which produces inconsistent verdicts across runs for the same platform.
+  // Fix: copy claims from the most recent completed run, reset status to pending.
+  // Only fall through to LLM extraction when no prior claims exist (first scan).
+  if (forceReverify) {
+    const { data: prevRun } = await supabase
+      .from('verification_runs')
+      .select('id')
+      .eq('project_id', project.id)
+      .eq('status', 'complete')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle<DbVerificationRun>();
+
+    if (prevRun) {
+      const { data: prevClaims } = await supabase
+        .from('claims')
+        .select('claim, pass_condition, feature_type, surface, verification_strategy')
+        .eq('verification_run_id', prevRun.id);
+
+      if (prevClaims && prevClaims.length > 0) {
+        const rows = prevClaims.map((c) => ({
+          ...c,
+          project_id:            project.id,
+          verification_run_id:   runId,
+          status:                'pending' as const,
+        }));
+
+        const { error: copyErr } = await supabase.from('claims').insert(rows);
+        if (copyErr) {
+          console.error('[orchestrate] Failed to copy claims from previous run:', copyErr.message);
+        } else {
+          await supabase
+            .from('verification_runs')
+            .update({ claims_extracted: rows.length })
+            .eq('id', runId);
+
+          await log(runId, `Re-verify: reusing ${rows.length} claim(s) from previous run — skipping LLM re-extraction`);
+          console.log(`[orchestrate] Force re-verify: copied ${rows.length} claims from run ${prevRun.id}`);
+          return ok({ runId, project, status: 'started' as const });
+        }
+      }
+    }
+    // No prior completed run found — fall through to full extraction below
+    await log(runId, 'Re-verify: no previous claims found — performing fresh extraction');
+  }
 
   // ── 5. Scrape website ─────────────────────────────────────────────────────
   if (!project.website) {

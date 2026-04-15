@@ -2,7 +2,7 @@ import { NextRequest } from 'next/server';
 import { supabase } from '@/lib/supabase';
 import { log } from '@/lib/logger';
 import { ok, err, withErrorHandler } from '@/lib/api-helpers';
-import type { DbClaim, DbProject, DbVerificationRun } from '@/lib/db-types';
+import type { DbProject, DbVerificationRun } from '@/lib/db-types';
 
 export const runtime = 'nodejs';
 
@@ -39,101 +39,47 @@ export const POST = withErrorHandler(async (req: Request) => {
     return ok({ runId, results: [], message: 'No website to verify' });
   }
 
+  // ── Check for already-dispatched claims (idempotency) ────────────────────
   const { data: checkingClaims } = await supabase
     .from('claims')
-    .select('*')
+    .select('id')
     .eq('verification_run_id', runId)
-    .eq('status', 'checking')
-    .order('created_at', { ascending: true })
-    .returns<DbClaim[]>();
+    .eq('status', 'checking');
 
-  // ── Fetch all pending claims ──────────────────────────────────────────────
-  const { data: allPending } = await supabase
+  const { data: pendingClaims } = await supabase
     .from('claims')
-    .select('*')
+    .select('id')
     .eq('verification_run_id', runId)
-    .eq('status', 'pending')
-    .order('created_at', { ascending: true })
-    .returns<DbClaim[]>();
+    .eq('status', 'pending');
 
-  // Already-checking claims count as "dispatched" — no duplicate runs needed.
-  const alreadyRunning = checkingClaims?.length ?? 0;
-  const pendingClaims  = allPending ?? [];
+  const alreadyRunning = (checkingClaims?.length ?? 0) > 0;
+  const hasPending     = (pendingClaims?.length ?? 0) > 0;
 
-  if (!pendingClaims.length && !alreadyRunning) {
+  if (!hasPending && !alreadyRunning) {
     await supabase.from('verification_runs').update({ status: 'complete' }).eq('id', runId);
     return ok({ runId, results: [], message: 'No pending claims' });
   }
 
-  if (!pendingClaims.length) {
-    // All claims already dispatched and running — nothing to do.
+  if (!hasPending) {
     return ok({ runId, results: [], message: 'All claims already running' });
   }
 
-  // ── Mark run as verifying ─────────────────────────────────────────────────
-  await supabase.from('verification_runs').update({ status: 'verifying' }).eq('id', runId);
-  await log(runId, `Browser verification starting — ${pendingClaims.length} claim(s) in parallel`);
-  await log(runId, `Target: ${project.website}`);
+  // ── Always queue — status route is the sole promoter ─────────────────────
+  // /run never dispatches directly. This avoids the TOCTOU race where /run
+  // and /status both see 0 active runs and both try to dispatch.
+  // The status poller (which fires every ~15s) will promote this run to
+  // `verifying` as soon as a slot is free. For the first run ever, that
+  // happens on the very first status poll (usually within 1-2 seconds).
+  await log(runId, 'Run queued — waiting for verification slot');
 
-  // ── Atomically claim + dispatch ALL pending claims in parallel ────────────
-  // Each claim row is atomically flipped to "checking" via a conditional
-  // UPDATE (.eq('status','pending')) before firing the fetch, preventing
-  // duplicate workers if this endpoint is called more than once.
-  // Claims are staggered by 1.5s each to avoid saturating the local dev
-  // HTTP connection pool (a Vercel serverless environment doesn't have this
-  // problem — each claim is its own isolated function invocation).
-  const origin = new URL((req as NextRequest).url).origin;
+  // Calculate queue position
+  const { count: aheadCount } = await supabase
+    .from('verification_runs')
+    .select('id', { count: 'exact', head: true })
+    .eq('status', 'pending')
+    .lt('created_at', run.created_at);
 
-  const dispatched: string[] = [];
-  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-
-  const stakeAndDispatch = async (claim: DbClaim, idx: number) => {
-    const { data: claimed } = await supabase
-      .from('claims')
-      .update({ status: 'checking' })
-      .eq('id', claim.id)
-      .eq('status', 'pending')
-      .select('id')
-      .single<{ id: string }>();
-
-    if (!claimed) {
-      console.log(`[verify/run] Claim ${claim.id} already taken — skipping`);
-      return;
-    }
-
-    dispatched.push(claim.id);
-    await log(runId, `Dispatching claim: ${claim.claim}`);
-
-    // Stagger each claim by 1.5s × index so the local dev Node.js HTTP server
-    // isn't flooded with simultaneous connections before it's ready.
-    if (idx > 0) await sleep(1500 * idx);
-
-    const dispatchWithRetry = async (attempt = 0): Promise<void> => {
-      try {
-        fetch(`${origin}/api/verify/claim`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ runId, claimId: claim.id }),
-        }).catch((e) => {
-          console.error(`[verify/run] Fire-and-forget claim ${claim.id} ended with error:`, e);
-        });
-      } catch (e) {
-        if (attempt < 2) {
-          console.warn(`[verify/run] Dispatch attempt ${attempt + 1} failed for claim ${claim.id} — retrying in ${(attempt + 1) * 2}s`);
-          await sleep((attempt + 1) * 2000);
-          return dispatchWithRetry(attempt + 1);
-        }
-        console.error(`[verify/run] Failed to dispatch claim ${claim.id} after retries:`, e);
-      }
-    };
-
-    await dispatchWithRetry();
-  };
-
-  await Promise.all(pendingClaims.map((claim, idx) => stakeAndDispatch(claim, idx)));
-
-  console.log(`[verify/run] Dispatched ${dispatched.length} claim(s) in parallel for run ${runId}`);
-
-  // Return immediately — the frontend polls /api/verify/status for progress.
-  return ok({ runId, results: [], dispatched });
+  const queuePosition = (aheadCount ?? 0) + 1;
+  console.log(`[verify/run] Run ${runId} queued (position ${queuePosition})`);
+  return ok({ runId, results: [], status: 'queued', queuePosition });
 });

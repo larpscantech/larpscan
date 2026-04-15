@@ -2,9 +2,10 @@ import { NextRequest } from 'next/server';
 import { supabase } from '@/lib/supabase';
 import { log } from '@/lib/logger';
 import { ok, err, withErrorHandler } from '@/lib/api-helpers';
+import { countActiveVerifyingRuns, dispatchClaimsForRun, MAX_CONCURRENT_RUNS } from '@/lib/claim-dispatcher';
 import type { DbVerificationRun, DbAgentLog, DbClaimWithEvidence, DbProject } from '@/lib/db-types';
 
-const STUCK_CHECKING_MS = 5.5 * 60 * 1000; // 5.5 min — just above Vercel's 300s hard kill
+const STUCK_CHECKING_MS = 8 * 60 * 1000; // 8 min — 8 LLM steps × 25s + 60s overhead = ~260s, 8 min is a generous safety margin
 
 function claimStartTimes(logs: DbAgentLog[]): Map<string, number> {
   const map = new Map<string, number>();
@@ -62,9 +63,11 @@ export const GET = withErrorHandler(async (req: Request) => {
     .eq('id', run.project_id)
     .maybeSingle<DbProject>();
 
-  // Auto-heal claims stuck in "checking" (Vercel killed the worker at the
-  // 300s hard limit). Then close the run whenever ALL claims are terminal,
-  // regardless of whether healing happened this cycle or a previous one.
+  const origin = new URL((req as NextRequest).url).origin;
+
+  // ── Auto-heal stuck claims ────────────────────────────────────────────────
+  // Claims stuck in "checking" beyond the threshold get marked untestable so
+  // the run can complete and the queue can advance.
   if (run.status !== 'complete' && run.status !== 'failed') {
     const now = Date.now();
     let healed = false;
@@ -84,10 +87,9 @@ export const GET = withErrorHandler(async (req: Request) => {
       }
     }
 
-    // Close the run whenever every claim is in a terminal state — regardless
-    // of whether healing happened this cycle or was done in a previous poll.
+    // Close the run when every claim is in a terminal state
     const allDone = claims.every((c) => c.status !== 'pending' && c.status !== 'checking');
-    if (allDone) {
+    if (allDone && run.status !== 'queued') {
       await supabase.from('verification_runs').update({ status: 'complete' }).eq('id', runId);
       await log(runId, 'Verification complete');
       run.status = 'complete';
@@ -99,10 +101,117 @@ export const GET = withErrorHandler(async (req: Request) => {
     }
   }
 
+  // ── Queue advancement: dispatch next pending run when a slot is free ─────
+  // Strategy: only the OLDEST LIVE pending run self-promotes when it polls.
+  // Dead pending runs (no pending claims — stale from crashed/re-run sessions)
+  // are auto-completed first so they don't block the queue.
+  if (run.status === 'pending') {
+    // Find the oldest pending run that actually has pending claims (live run)
+    const { data: pendingRuns } = await supabase
+      .from('verification_runs')
+      .select('id, created_at')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: true })
+      .limit(20)
+      .returns<{ id: string; created_at: string }[]>();
+
+    // Clean up dead pending runs ahead in queue:
+    // 1. Runs with no active claims (pending/checking), OR
+    // 2. Runs stuck in pending for >15 min (abandoned — never dispatched)
+    const ABANDONED_PENDING_MS = 5 * 60 * 1000; // 5 min — runs get promoted within ~30s; stuck longer = abandoned
+    for (const candidate of (pendingRuns ?? [])) {
+      if (candidate.id === runId) break;
+
+      const { count: activeClaimCount } = await supabase
+        .from('claims')
+        .select('id', { count: 'exact', head: true })
+        .eq('verification_run_id', candidate.id)
+        .in('status', ['pending', 'checking']);
+
+      const candidateAge = Date.now() - new Date(candidate.created_at ?? 0).getTime();
+      const isAbandoned = activeClaimCount === 0 || candidateAge > ABANDONED_PENDING_MS;
+
+      if (isAbandoned) {
+        await supabase
+          .from('verification_runs')
+          .update({ status: 'complete' })
+          .eq('id', candidate.id)
+          .eq('status', 'pending');
+        console.log(`[verify/status] Cleaned up stale pending run ${candidate.id} (age ${Math.round(candidateAge / 1000)}s, activeClaims=${activeClaimCount})`);
+      }
+    }
+
+    // Re-query to find the true oldest live pending run
+    const { data: oldestLive } = await supabase
+      .from('verification_runs')
+      .select('id')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: true })
+      .limit(1)
+      .maybeSingle<{ id: string }>();
+
+    const isOldest = oldestLive?.id === runId;
+
+    if (isOldest) {
+      const freshActiveCount = await countActiveVerifyingRuns();
+
+      if (freshActiveCount < MAX_CONCURRENT_RUNS) {
+        const { count: ownPendingClaims } = await supabase
+          .from('claims')
+          .select('id', { count: 'exact', head: true })
+          .eq('verification_run_id', runId)
+          .eq('status', 'pending');
+
+        if ((ownPendingClaims ?? 0) > 0) {
+          const { data: selfPromoted } = await supabase
+            .from('verification_runs')
+            .update({ status: 'verifying' })
+            .eq('id', runId)
+            .eq('status', 'pending')
+            .select('id')
+            .maybeSingle<{ id: string }>();
+
+          if (selfPromoted) {
+            console.log(`[verify/status] Promoting run ${runId} → verifying`);
+            run.status = 'verifying';
+            await log(runId, 'Queue slot available — browser verification starting');
+            dispatchClaimsForRun(runId, origin).catch((e) =>
+              console.error('[verify/status] Failed to dispatch run:', e),
+            );
+          }
+        }
+      }
+    }
+  }
+
+  // ── Queue position ────────────────────────────────────────────────────────
+  let queuePosition: number | null = null;
+  if (run.status === 'pending') {
+    // Count only live pending runs created before this one
+    const { data: olderRuns } = await supabase
+      .from('verification_runs')
+      .select('id')
+      .eq('status', 'pending')
+      .lt('created_at', run.created_at)
+      .returns<{ id: string }[]>();
+
+    let liveAhead = 0;
+    for (const older of (olderRuns ?? [])) {
+      const { count } = await supabase
+        .from('claims')
+        .select('id', { count: 'exact', head: true })
+        .eq('verification_run_id', older.id)
+        .in('status', ['pending', 'checking']);
+      if ((count ?? 0) > 0) liveAhead++;
+    }
+    queuePosition = liveAhead + 1;
+  }
+
   return ok({
     run,
     claims,
     logs,
     project: project ?? null,
+    queuePosition,
   });
 });
