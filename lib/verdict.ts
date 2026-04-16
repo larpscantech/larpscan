@@ -147,6 +147,18 @@ TOKEN_CREATION / DEX_SWAP / UI_FEATURE:
   Form fields visible + enabled CTA + no wallet blocker → strong positive signal.
   If wallet_required is the only blocker and the form is fully visible → UNTESTABLE.
 
+TOKEN_CREATION — STRICT ON-CHAIN REQUIREMENT:
+  "Form visible + CTA + API calls" is NOT sufficient for VERIFIED.
+  Token creation is only real if a BSC transaction was actually executed.
+  Check the signal context for transaction evidence:
+    - "On-chain tx hash: ... receipt: success"              → Rule 0 already resolved (VERIFIED)
+    - "Transaction was attempted but not broadcast"         → UNTESTABLE (feature exists, gas issue)
+    - "On-chain tx hash: ... receipt: reverted"            → Rule 0a already resolved (FAILED/UNTESTABLE)
+  If the signal context shows NO tx hash and transactionAttempted = false:
+    → The test agent saw the form but did NOT complete a BSC transaction.
+    → Return UNTESTABLE — the feature UI may be real but cannot be verified without on-chain proof.
+  NEVER return VERIFIED for TOKEN_CREATION based solely on form/CTA/API visibility.
+
 On-chain transactions:
   A transaction HASH alone does NOT prove success. The receipt must show status success.
   If receipt is reverted, the dApp may correctly show "Transaction failed" — verdict should
@@ -547,6 +559,26 @@ function buildSignalContext(
       `On-chain tx hash: ${signals.transactionHash} — receipt: ${signals.transactionReceiptStatus ?? 'unknown (not polled or pending)'}`,
     );
   }
+
+  // Always emit tx status for TOKEN_CREATION — the LLM must see this signal clearly
+  if (featureType === 'TOKEN_CREATION' || featureType === 'form+browser') {
+    if (!signals.transactionHash && !signals.transactionAttempted && !signals.transactionSubmitted) {
+      lines.push(
+        '⚠ TOKEN_CREATION: NO BSC transaction was executed this run (transactionAttempted=false, transactionSubmitted=false, no tx hash). ' +
+        'Form-visible evidence alone does NOT prove token creation works. Return UNTESTABLE.',
+      );
+    } else if (signals.transactionSubmitted && signals.transactionHash) {
+      lines.push(
+        `TOKEN_CREATION: BSC transaction submitted — hash: ${signals.transactionHash}, receipt: ${signals.transactionReceiptStatus ?? 'pending'}`,
+      );
+    } else if (signals.transactionAttempted && !signals.transactionSubmitted) {
+      lines.push(
+        'TOKEN_CREATION: BSC transaction was attempted but not broadcast (likely insufficient BNB for gas fees). ' +
+        'Feature is functional — return UNTESTABLE (wallet funding issue, not a broken feature).',
+      );
+    }
+  }
+
   lines.push(`Likely form validation error visible: ${signals.likelyFormValidationError}`);
 
   if (signals.walletEvidence) {

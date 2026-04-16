@@ -65,8 +65,8 @@ export function RecentVerificationsTable({ verifications, onSelect }: RecentVeri
           </p>
           <p className="text-xs text-zinc-700 mt-1">
             {isZh
-              ? '過去 24 小時內的執行中與已完成驗證'
-              : 'Active jobs and completed verifications from the past 24 hours'}
+              ? '最近 10 次執行中與已完成驗證'
+              : 'Most recent 10 active and completed verifications'}
           </p>
         </div>
         <span className="text-[10px] font-mono font-bold text-zinc-700 bg-[#101015] border border-[#1f1f27] rounded-sm px-3 py-1.5">

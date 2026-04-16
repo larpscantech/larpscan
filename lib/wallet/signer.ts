@@ -239,29 +239,37 @@ export async function exposeSigningBridge(context: BrowserContext, sessionId: st
         let txParams = params[0] as Record<string, string | undefined>;
 
         // ── Signed social vault factory patch ─────────────────────────────
-        // The SignedSocialVaultFactory (0x3fca498...) always reverts on BSC —
-        // 0 out of 105+ recent token creations used it successfully.
-        // When detected, we replace it with the SimpleVaultFactory (0xfab75Dc...)
-        // and rebuild vaultData to route 100% of trading fees to the creator's wallet.
+        // bnbshare.fun requires a SignedSocialVaultFactory that verifies a Twitter/GitHub
+        // handle via ECDSA. Our test wallet has no verified social handle.
+        // When any known vault factory is detected in the calldata, we swap it for
+        // SimpleVaultFactory (0xfab75Dc...) and rebuild vaultData to route 100% of
+        // trading fees to the creator's wallet, bypassing the social-signature check.
         //
-        // Calldata structure (measured from the failing tx):
-        //   The vaultData `bytes` parameter is always the last ABI word group.
-        //   Its content starts with the signed vault's recipient address (word 0),
-        //   offsets (words 1-4), and the handle string at word 6 (offset 192 bytes
-        //   from content start = 224 bytes from the length word = 448 hex chars).
+        // Calldata structure (measured from real "Share back" tx, value=0):
+        //   vaultData is the last ABI `bytes` parameter.
+        //   Its length word is exactly 448 hex chars (224 bytes) before the handle string.
+        //   Handle position in full calldata: handlePos in rawData (including 0x prefix).
+        //   lengthWordStart = handlePos - 448 (must land on an ABI word boundary).
         //
         // Algorithm:
-        //   1. Replace vault factory address hex in calldata.
-        //   2. Find the handle in calldata (try known handles in order).
-        //   3. Truncate calldata at the length word position.
-        //   4. Append new simple-vault vaultData.
+        //   1. Detect any known vault factory address in rawData.
+        //   2. Find the agent's handle in rawData (try qa{N} dynamic scan first, then list).
+        //   3. Truncate rawData at lengthWordStart.
+        //   4. Append simpleVaultData (wallet-based fee routing, no social auth).
         const rawData = (txParams.data ?? '').toLowerCase();
-        const SIGNED_VAULT_HEX = '3fca49851d6e6082630729f9dc4334a4eefe795d';
-        const OUR_WALLET_HEX   = investigationWalletAddress?.slice(2).toLowerCase() ?? '';
+        const OUR_WALLET_HEX = investigationWalletAddress?.slice(2).toLowerCase() ?? '';
 
-        // Known handles used by the agent (from HANDLE_FALLBACK_SEQUENCE in constants.ts).
-        // The handle hex appears in the ABI-encoded calldata exactly 448 hex chars after
-        // the vaultData length word. Try each in order — first match wins.
+        // All known bnbshare.fun vault factory addresses (newest first for faster detection).
+        // The patch triggers on the first match, replaces it with SimpleVaultFactory.
+        const KNOWN_VAULT_FACTORIES = [
+          'f359cebb8f8b4ad249e5b1fcdf8288efaf5de089', // current (observed 2026-04+)
+          '86c525c0d347b197f0021830b64d9855d491a905', // variant (same code, different deploy)
+          '3fca49851d6e6082630729f9dc4334a4eefe795d', // legacy (pre-April 2026)
+        ];
+        const SIMPLE_VAULT_HEX = 'fab75dc774cb9b38b91749b8833360b46a52345f';
+
+        // Handles the agent uses in injected calldata.
+        // Also dynamically scans for qa{4-digit} handles embedded by the direct-tx injection.
         const KNOWN_HANDLES = [
           'testuser', 'larpscanbnb', 'testuser2', 'testuser3', 'testuser4',
           'lscantest01', 'lscantest02', 'lscantest03', 'lscantest04', 'lscantest05',
@@ -269,51 +277,83 @@ export async function exposeSigningBridge(context: BrowserContext, sessionId: st
           'agenttest01', 'agenttest02', 'agenttest03',
           'scantest_x1', 'scantest_x2', 'scantest_x3', 'scantest_x4',
         ];
+        // Detect dynamically generated qa{4-digit} handle embedded by the injection.
+        // "qa" = 0x7161; each digit 0x30-0x39. The regex captures 13 hex chars (odd),
+        // Buffer.from drops the last char → gives 6 bytes = "qa" + 4 digits.
+        const qaMatch = rawData.match(/71613[0-9a-f]{8}/);
+        if (qaMatch) {
+          const decodedHandle = Buffer.from(qaMatch[0], 'hex').toString('utf8');
+          if (/^qa\d{4}$/.test(decodedHandle)) KNOWN_HANDLES.unshift(decodedHandle);
+        }
 
         let patchApplied = false;
-        if (rawData.includes(SIGNED_VAULT_HEX) && OUR_WALLET_HEX) {
-          for (const handle of KNOWN_HANDLES) {
-            const handleHex = Buffer.from(handle, 'utf8').toString('hex');
-            const handlePos = rawData.indexOf(handleHex);
-            if (handlePos < 0) continue;
+        if (OUR_WALLET_HEX) {
+          for (const VAULT_HEX of KNOWN_VAULT_FACTORIES) {
+            if (!rawData.includes(VAULT_HEX)) continue;
 
-            // length word is 448 hex chars before the handle data word
-            const lengthWordStart = handlePos - 448;
+            for (const handle of KNOWN_HANDLES) {
+              const handleHex = Buffer.from(handle, 'utf8').toString('hex');
 
-            // Validate alignment: ABI words are 64 hex chars (32 bytes), starting at char 10
-            // (2 "0x" prefix + 8 selector chars). Check word-boundary:
-            const lwAligned = lengthWordStart > 0 && (lengthWordStart - 2) % 64 === 8;
-            if (!lwAligned) continue;
+              // Scan ALL occurrences of the handle in rawData.
+              // The first occurrence might be in a different ABI parameter (e.g. the
+              // token name contains "qa????" as a substring) at a misaligned position.
+              // Try each occurrence until one passes the ABI word-alignment check.
+              let handlePos = -1;
+              let searchFrom = 0;
+              while (true) {
+                const idx = rawData.indexOf(handleHex, searchFrom);
+                if (idx < 0) break;
 
-            // Build simple vault vaultData:
-            //   outer length = 0x80 (128 bytes)
-            //   inner array offset = 0x20 (32)
-            //   count = 1
-            //   wallet address (our investigation wallet)
-            //   fee share = 10000 bps (100%)
-            const simpleVaultData =
-              '0000000000000000000000000000000000000000000000000000000000000080' + // length=128
-              '0000000000000000000000000000000000000000000000000000000000000020' + // array offset
-              '0000000000000000000000000000000000000000000000000000000000000001' + // count=1
-              '000000000000000000000000' + OUR_WALLET_HEX +                       // recipient
-              '0000000000000000000000000000000000000000000000000000000000002710'; // 10000 bps
+                const lwStart = idx - 448;
+                const aligned = lwStart > 0 && (lwStart - 2) % 64 === 8;
+                if (aligned) {
+                  handlePos = idx;
+                  break;
+                }
+                searchFrom = idx + 1;
+              }
+              if (handlePos < 0) continue;
 
-            const patched =
-              rawData.replace(SIGNED_VAULT_HEX, 'fab75dc774cb9b38b91749b8833360b46a52345f')
-                     .slice(0, lengthWordStart) +
-              simpleVaultData;
+              // length word is 448 hex chars before the handle data word
+              const lengthWordStart = handlePos - 448;
+              // alignment already validated in the scan loop above
 
-            txParams = { ...txParams, data: patched };
-            patchApplied = true;
-            console.log(
-              `[wallet/signer] ⚡ Patched: SignedSocialVaultFactory → SimpleVaultFactory, ` +
-              `handle="${handle}", vaultData → wallet-based fee sharing (${investigationWalletAddress?.slice(0,10)}... 100%)`,
-            );
-            break;
+              // Build simple vault vaultData (128 bytes / 0x80):
+              //   outer length = 0x80
+              //   inner array offset = 0x20
+              //   count = 1
+              //   recipient = our investigation wallet
+              //   fee share = 10000 bps (100%)
+              const simpleVaultData =
+                '0000000000000000000000000000000000000000000000000000000000000080' +
+                '0000000000000000000000000000000000000000000000000000000000000020' +
+                '0000000000000000000000000000000000000000000000000000000000000001' +
+                '000000000000000000000000' + OUR_WALLET_HEX +
+                '0000000000000000000000000000000000000000000000000000000000002710';
+
+              const patched =
+                rawData.replace(VAULT_HEX, SIMPLE_VAULT_HEX)
+                       .slice(0, lengthWordStart) +
+                simpleVaultData;
+
+              txParams = { ...txParams, data: patched };
+              patchApplied = true;
+              console.log(
+                `[wallet/signer] ⚡ Patched: VaultFactory(${VAULT_HEX.slice(0, 8)}...) → SimpleVaultFactory, ` +
+                `handle="${handle}", vaultData → wallet fee routing (${investigationWalletAddress?.slice(0, 10)}... 100%)`,
+              );
+              break;
+            }
+
+            if (patchApplied) break;
+
+            if (!patchApplied) {
+              console.log(`[wallet/signer] ⚠️  Vault patch: vault factory ${VAULT_HEX.slice(0, 8)}... found but no matching handle in calldata`);
+            }
           }
 
-          if (!patchApplied) {
-            console.log('[wallet/signer] ⚠️  Vault patch: no known handle found in calldata — sending original');
+          if (!patchApplied && KNOWN_VAULT_FACTORIES.some(v => rawData.includes(v))) {
+            console.log('[wallet/signer] ⚠️  Vault patch: known vault factory found but handle scan failed — sending original tx');
           }
         }
         // ── end patch ──────────────────────────────────────────────────────

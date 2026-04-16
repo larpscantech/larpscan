@@ -80,11 +80,22 @@ export async function dismissConsentBanner(page: Page): Promise<void> {
         const txt = await btn.textContent().catch(() => '');
         const vis = await btn.isVisible({ timeout: 1_000 }).catch(() => false);
         if (!vis) continue;
-        await btn.click().catch(() => {});
+        await btn.evaluate((el) => (el as HTMLElement).click()).catch(() => {});
         console.log(`[evidence] Dismissed generic modal: "${(txt ?? '').trim()}"`);
         await page.waitForTimeout(500);
         return;
       }
+    }
+
+    // ── Pass 3: Standalone OK buttons (non-standard popup containers) ──────────
+    // Catches web3 dapp welcome/alert popups that don't use standard modal selectors
+    // (e.g. bnbshare.fun uses a custom class "bubble-press" with no dialog role).
+    const okBtn = page.locator('button, [role="button"]').filter({ hasText: /^\s*(ok|okay)\s*$/i }).first();
+    const okVis = await okBtn.isVisible({ timeout: 1_000 }).catch(() => false);
+    if (okVis) {
+      await okBtn.evaluate((el) => (el as HTMLElement).click()).catch(() => {});
+      console.log('[evidence] Dismissed standalone OK popup');
+      await page.waitForTimeout(500);
     }
   } catch { /* non-fatal */ }
 }

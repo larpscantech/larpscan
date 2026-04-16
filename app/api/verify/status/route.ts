@@ -5,7 +5,7 @@ import { ok, err, withErrorHandler } from '@/lib/api-helpers';
 import { countActiveVerifyingRuns, dispatchClaimsForRun, MAX_CONCURRENT_RUNS } from '@/lib/claim-dispatcher';
 import type { DbVerificationRun, DbAgentLog, DbClaimWithEvidence, DbProject } from '@/lib/db-types';
 
-const STUCK_CHECKING_MS = 8 * 60 * 1000; // 8 min — 8 LLM steps × 25s + 60s overhead = ~260s, 8 min is a generous safety margin
+const STUCK_CHECKING_MS = 10 * 60 * 1000; // 10 min — generous for slow pages like bnbshare.fun
 
 function claimStartTimes(logs: DbAgentLog[]): Map<string, number> {
   const map = new Map<string, number>();
@@ -89,7 +89,7 @@ export const GET = withErrorHandler(async (req: Request) => {
 
     // Close the run when every claim is in a terminal state
     const allDone = claims.every((c) => c.status !== 'pending' && c.status !== 'checking');
-    if (allDone && run.status !== 'queued') {
+    if (allDone && run.status !== 'pending') {
       await supabase.from('verification_runs').update({ status: 'complete' }).eq('id', runId);
       await log(runId, 'Verification complete');
       run.status = 'complete';

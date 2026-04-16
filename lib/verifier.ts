@@ -62,34 +62,66 @@ import type { WalletRequestContext } from './wallet/request-classifier';
 function parseRecordingResponse(response: unknown): Buffer | null {
   if (!response || typeof response !== 'object') return null;
   const r = response as Record<string, unknown>;
-  const val = r.value;
 
-  if (!val) return null;
+  // Browserless has returned data under different keys across versions.
+  // Try 'value' first (CDP standard), then 'data' (some Browserless builds).
+  const val = r.value ?? r.data ?? r.buffer ?? r.result;
+
+  if (!val) {
+    console.warn('[verifier:record] parseRecordingResponse: no data key found in response. Keys:', Object.keys(r).join(', '));
+    return null;
+  }
 
   // Case 1: already a Buffer / Uint8Array
-  if (Buffer.isBuffer(val)) return val.length > 0 ? val : null;
-  if (val instanceof Uint8Array) return val.length > 0 ? Buffer.from(val) : null;
+  if (Buffer.isBuffer(val)) {
+    if (val.length > 0) { console.log(`[verifier:record] parseRecordingResponse: Buffer (${val.length} bytes)`); return val; }
+    return null;
+  }
+  if (val instanceof Uint8Array) {
+    if (val.length > 0) { console.log(`[verifier:record] parseRecordingResponse: Uint8Array (${val.length} bytes)`); return Buffer.from(val); }
+    return null;
+  }
 
   // Case 3: { type: "Buffer", data: number[] }
   if (typeof val === 'object' && (val as Record<string,unknown>).type === 'Buffer') {
     const data = (val as Record<string,unknown>).data;
-    if (Array.isArray(data) && data.length > 0) return Buffer.from(data as number[]);
+    if (Array.isArray(data) && data.length > 0) {
+      console.log(`[verifier:record] parseRecordingResponse: {type:"Buffer"} (${data.length} bytes)`);
+      return Buffer.from(data as number[]);
+    }
     return null;
   }
 
   if (typeof val === 'string' && val.length > 0) {
-    // Case 4: base64 (Browserless often wraps binary as base64 in JSON)
-    if (/^[A-Za-z0-9+/]+=*$/.test(val.slice(0, 100))) {
+    // Case 4: base64 — check that the FIRST 200 chars only contain base64 characters.
+    // The old check tested val.slice(0,100) against /=*$/ which always fails in the
+    // middle of a base64 string (padding only appears at the very end), causing real
+    // recordings to be silently dropped. The correct check is just: are the chars valid?
+    const sample = val.slice(0, 200);
+    const isBase64Like = /^[A-Za-z0-9+/=]+$/.test(sample);
+    if (isBase64Like && val.length > 100) {
       try {
         const buf = Buffer.from(val, 'base64');
-        if (buf.length > 100) return buf;
+        if (buf.length > 100) {
+          // Quick sanity check: WebM starts with EBML header 0x1A45DFA3
+          const isWebM = buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3;
+          console.log(`[verifier:record] parseRecordingResponse: base64 string → ${buf.length} bytes (WebM magic: ${isWebM})`);
+          return buf;
+        }
       } catch { /* fall through to binary */ }
     }
     // Case 2: binary string
     const buf = Buffer.from(val, 'binary');
-    return buf.length > 100 ? buf : null;
+    if (buf.length > 100) {
+      const isWebM = buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3;
+      console.log(`[verifier:record] parseRecordingResponse: binary string → ${buf.length} bytes (WebM magic: ${isWebM})`);
+      return buf;
+    }
+    console.warn(`[verifier:record] parseRecordingResponse: string value too short (${val.length} chars, isBase64Like=${isBase64Like})`);
+    return null;
   }
 
+  console.warn('[verifier:record] parseRecordingResponse: unrecognised value type:', typeof val);
   return null;
 }
 
@@ -628,6 +660,30 @@ async function recordInteraction(
       `routes: [${pageState.routeCandidates.join(', ')}], buttons: ${pageState.buttons.length}`,
     );
 
+    // ── Change A: Pre-planner fast exit for hard blockers ──────────────────
+    // Skip planWorkflow when the page is genuinely unreachable.
+    // NOTE: auth_required and wallet_required are intentionally excluded here —
+    // on web3 creation/wallet pages these often just mean "wallet not connected yet",
+    // and the early wallet connect + agent interaction can navigate past them.
+    const HARD_BLOCKERS = ['bot_protection', 'page_broken', 'coming_soon', 'geo_blocked'];
+    const hasHardBlocker = pageState.blockers.some((b) => HARD_BLOCKERS.includes(b));
+
+    if (hasHardBlocker) {
+      console.log(`[verifier:record] Pre-planner skip — hard blocker detected: [${pageState.blockers.join(', ')}]`);
+    }
+
+    // dataAlreadyVisible kept as a signal but not used to skip planWorkflow —
+    // skipping planWorkflow for DATA_DASHBOARD caused the agent to navigate away
+    // from the correct page before JS had time to render table data.
+    const dataAlreadyVisible =
+      (featureType === 'DATA_DASHBOARD' || featureType === 'dashboard+browser') &&
+      pageState.tableHeaders.length > 0 &&
+      pageState.blockers.length === 0;
+
+    if (dataAlreadyVisible) {
+      console.log('[verifier:record] DATA_DASHBOARD: table data visible at page load');
+    }
+
     // ── Phase 1.5: Workflow hypothesis (recon → hypothesis) ─────────────────
     const hypothesis = buildWorkflowHypothesis(claim, featureType, pageState);
     console.log(
@@ -651,12 +707,14 @@ async function recordInteraction(
       noopActions: [],
     };
 
-    const planA = await planWorkflow(
-      claim, passCondition, featureType, surface, strategy, pageState,
-      walletAddress ?? undefined,
-      planningScreenshotDataUrl,
-      runMemory,
-    );
+    const planA = hasHardBlocker
+      ? []
+      : await planWorkflow(
+          claim, passCondition, featureType, surface, strategy, pageState,
+          walletAddress ?? undefined,
+          planningScreenshotDataUrl,
+          runMemory,
+        );
     console.log(`[verifier:record] Plan A: ${planA.length} step(s)`);
 
     // ── Pre-execution wallet snapshot ────────────────────────────────────────
@@ -785,10 +843,11 @@ async function recordInteraction(
         earlyRecordingBuffer = parseRecordingResponse(response);
         if (earlyRecordingBuffer) {
           console.log(`[verifier:record] Early recording captured: ${(earlyRecordingBuffer.length / 1024).toFixed(0)}KB`);
+          cdpSession = null; // successfully captured — prevent double-stop in finally
         } else {
-          console.warn(`[verifier:record] stopRecording returned no usable data. Full response: ${JSON.stringify(response).slice(0, 300)}`);
+          console.warn(`[verifier:record] stopRecording returned no usable data. Full response: ${JSON.stringify(response).slice(0, 500)}`);
+          // Do NOT null cdpSession here — let the finally block retry with a fresh stop call
         }
-        cdpSession = null; // prevent double-stop in finally
       } catch (e) {
         console.warn('[verifier:record] Early recording stop failed (will retry in finally):', e);
       }
@@ -892,7 +951,11 @@ async function recordInteraction(
         const response = await cdpSession.send('Browserless.stopRecording');
         rawBuffer = parseRecordingResponse(response);
         if (!rawBuffer) {
-          console.warn(`[verifier:record] Fallback stopRecording returned no usable data. Response: ${JSON.stringify(response).slice(0, 300)}`);
+          // Log the full response so we can see exactly what Browserless returned
+          const responseStr = JSON.stringify(response);
+          console.warn(`[verifier:record] Fallback stopRecording returned no usable data.`);
+          console.warn(`[verifier:record] Response type: ${typeof response}, keys: ${response && typeof response === 'object' ? Object.keys(response as object).join(', ') : 'n/a'}`);
+          console.warn(`[verifier:record] Response (first 600): ${responseStr.slice(0, 600)}`);
         }
       } catch (e) {
         console.warn('[verifier:record] Video save failed (non-fatal):', e);

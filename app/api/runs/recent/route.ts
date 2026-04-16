@@ -3,7 +3,8 @@ import { ok, withErrorHandler } from '@/lib/api-helpers';
 import type { DbProject, DbVerificationRun, DbClaim } from '@/lib/db-types';
 import type { RecentVerification, JobStatus } from '@/lib/types';
 
-const LIMIT = 30;
+const FETCH_LIMIT  = 100; // fetch a wide pool to ensure dedup gives us enough unique projects
+const DISPLAY_LIMIT = 10; // show only the 10 most recent unique projects
 
 function runStatusToJobStatus(status: DbVerificationRun['status']): JobStatus {
   if (status === 'complete') return 'complete';
@@ -26,7 +27,7 @@ export const GET = withErrorHandler(async () => {
     .from('verification_runs')
     .select('*, projects(*)')
     .order('created_at', { ascending: false })
-    .limit(LIMIT);
+    .limit(FETCH_LIMIT);
 
   if (runsErr) {
     console.error('[runs/recent] Query error:', runsErr.message);
@@ -37,16 +38,18 @@ export const GET = withErrorHandler(async () => {
     return ok({ runs: [] });
   }
 
-  // Deduplicate: keep only the most recent run per project_id.
+  // Deduplicate: keep only the most recent run per project_id, then cap at DISPLAY_LIMIT.
   // Since runs are already sorted by created_at DESC, the first occurrence
   // of each project_id is the most recent one.
   const seenProjects = new Set<string>();
-  const dedupedRuns = runs.filter((r) => {
-    const pid = (r as DbVerificationRun).project_id;
-    if (seenProjects.has(pid)) return false;
-    seenProjects.add(pid);
-    return true;
-  });
+  const dedupedRuns = runs
+    .filter((r) => {
+      const pid = (r as DbVerificationRun).project_id;
+      if (seenProjects.has(pid)) return false;
+      seenProjects.add(pid);
+      return true;
+    })
+    .slice(0, DISPLAY_LIMIT);
 
   const runIds = dedupedRuns.map((r) => r.id as string);
 
