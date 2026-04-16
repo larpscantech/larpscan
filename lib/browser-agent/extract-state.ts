@@ -52,6 +52,7 @@ export interface StructuredPageState {
   modals: ModalInfo[];
   toasts: ToastInfo[];
   headings: string[];
+  visibleText: string;
   loadingVisible: boolean;
   walletState: 'connected' | 'disconnected' | 'connecting';
 }
@@ -83,7 +84,7 @@ export async function extractStructuredState(page: Page): Promise<StructuredPage
       errors: string[];
     }> = [];
 
-    const allInputs = Array.from(document.querySelectorAll(
+      const allInputs = Array.from(document.querySelectorAll(
       'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]), textarea, select',
     )).filter(isVisible) as HTMLInputElement[];
 
@@ -92,7 +93,51 @@ export async function extractStructuredState(page: Page): Promise<StructuredPage
         const ph = inp.placeholder ?? '';
         const nm = inp.name ?? '';
         const id = inp.id ?? '';
-        const label = ph || nm || id || inp.type || 'input';
+
+        // Resolve the human-readable label using multiple strategies:
+        // 1. aria-label attribute
+        // 2. <label for="id"> element text
+        // 3. aria-labelledby referenced element text
+        // 4. Closest wrapping element's first text-only child (React pattern)
+        // 5. Previous sibling text node
+        // 6. Fall back to placeholder / name / id
+        let resolvedLabel = inp.getAttribute('aria-label') ?? '';
+        if (!resolvedLabel && id) {
+          const lbl = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+          if (lbl) resolvedLabel = (lbl as HTMLElement).innerText.replace(/\s+/g, ' ').trim();
+        }
+        if (!resolvedLabel) {
+          const labelledBy = inp.getAttribute('aria-labelledby');
+          if (labelledBy) {
+            const lbl = document.getElementById(labelledBy);
+            if (lbl) resolvedLabel = (lbl as HTMLElement).innerText.replace(/\s+/g, ' ').trim();
+          }
+        }
+        if (!resolvedLabel) {
+          // Walk up to find a wrapping group, look for the first visible text child
+          let el: Element | null = inp.parentElement;
+          for (let i = 0; i < 4 && el; i++) {
+            const textNodes = Array.from(el.childNodes).filter(
+              (n) => n.nodeType === Node.TEXT_NODE && (n.textContent ?? '').trim().length > 1,
+            );
+            if (textNodes.length > 0) {
+              resolvedLabel = (textNodes[0].textContent ?? '').trim();
+              break;
+            }
+            // Also check span/div/label children that contain only text (no inputs)
+            const textEls = Array.from(el.children).filter(
+              (c) => !['INPUT','TEXTAREA','SELECT','BUTTON'].includes(c.tagName) && (c as HTMLElement).innerText.trim().length > 1 && (c as HTMLElement).innerText.trim().length < 60,
+            );
+            if (textEls.length > 0) {
+              resolvedLabel = (textEls[0] as HTMLElement).innerText.replace(/\s+/g, ' ').trim();
+              break;
+            }
+            el = el.parentElement;
+          }
+        }
+        // Final fallback to placeholder / name / id / type
+        const label = resolvedLabel || ph || nm || id || inp.type || 'input';
+
         const selector = id
           ? `#${CSS.escape(id)}`
           : ph
@@ -102,7 +147,7 @@ export async function extractStructuredState(page: Page): Promise<StructuredPage
               : 'input';
         const value = (inp.value ?? '').trim();
         return {
-          label: label.slice(0, 60),
+          label: label.slice(0, 80),
           selector,
           value: value.slice(0, 100),
           filled: value.length > 0,
@@ -217,12 +262,21 @@ export async function extractStructuredState(page: Page): Promise<StructuredPage
       walletState = 'disconnected';
     }
 
+    // ── Visible page text (first 1200 chars) ──────────────────────────
+    // Gives the LLM context it can't always see in the screenshot:
+    // field labels in surrounding divs, instructions, inline errors, etc.
+    const visibleText = ((document.body as HTMLElement).innerText ?? '')
+      .replace(/\s{3,}/g, '\n')
+      .trim()
+      .slice(0, 1200);
+
     return {
       forms,
       buttons,
       modals,
       toasts: toasts.slice(0, 6) as Array<{ type: 'error' | 'success' | 'warning' | 'info'; text: string }>,
       headings,
+      visibleText,
       loadingVisible,
       walletState: walletState as 'connected' | 'disconnected' | 'connecting',
     };
@@ -232,6 +286,7 @@ export async function extractStructuredState(page: Page): Promise<StructuredPage
     modals: [] as ModalInfo[],
     toasts: [] as ToastInfo[],
     headings: [] as string[],
+    visibleText: '',
     loadingVisible: false,
     walletState: 'disconnected' as const,
   }));
@@ -294,6 +349,11 @@ export function formatStateForLLM(state: StructuredPageState): string {
     if (relevant.length > 0) {
       lines.push(`Buttons: ${relevant.map((b) => `"${b.text}"${b.enabled ? '' : ' (disabled)'}`).join(', ')}`);
     }
+  }
+
+  if (state.visibleText) {
+    lines.push('── Page text (raw) ──');
+    lines.push(state.visibleText);
   }
 
   return lines.join('\n');
