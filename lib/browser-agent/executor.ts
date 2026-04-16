@@ -1856,14 +1856,12 @@ export async function executeSteps(
     }
     if (agentMemory.isComplete) { console.log(`[executor] ReAct: memory says complete — ${agentMemory.completionReason}`); return { observations, stopReason: 'completed', consecutiveNoops, narrationSegments }; }
   }
-  // Allow bnbshare.fun creation claims to exceed budget so the direct injection fires.
-  if (observations.length >= STEP_BUDGET && !(isCreationClaim && page.url().includes('bnbshare'))) { return { observations, stopReason: 'budget', consecutiveNoops, narrationSegments }; }
+  if (observations.length >= STEP_BUDGET) { return { observations, stopReason: 'budget', consecutiveNoops, narrationSegments }; }
 
   // ── Last-chance submit (creation claims only) ─────────────────────────────
-  // If we exhausted the ReAct budget while filling a creation form, make one
-  // final deterministic click on the submit button. This is needed for platforms
-  // (e.g. bnbshare.fun) where extra fields unlock AFTER wallet connects, forcing
-  // the agent to spend budget on fills instead of the submit click.
+  // If the agent exhausted the ReAct budget without submitting, run a final
+  // post-ReAct batch fill (in case wallet just connected) then attempt a
+  // deterministic submit click so the dApp can dispatch its own transaction.
   if (isCreationClaim && agentMemory.currentPhase !== 'confirmation') {
     // ── Post-ReAct batch fill ──────────────────────────────────────────────
     // If batch fill was skipped earlier (wallet connect UI was visible), run it
@@ -1915,127 +1913,29 @@ export async function executeSteps(
       await page.waitForTimeout(2_000);
     }
 
-    // ── Direct tx injection (creation claims) ────────────────────────────────
-    // For TOKEN_CREATION claims we inject our own calldata FIRST, BEFORE any
-    // last-chance button click.  This avoids the race where the UI's submit fires
-    // a transaction with an unknown handle (e.g. "qatest2436") that the vault-factory
-    // patch cannot recognise, causing a revert before our injection even fires.
-    //
-    // Template: real bnbshare.fun "Share back" createToken tx (value=0, selector
-    // 0x1b806220).  The vault factory (f359cebb...) and a unique qa-handle are
-    // injected so signer.ts vault patch fires: it replaces the vault factory with
-    // SimpleVaultFactory and rebuilds vaultData to route 100 % of fees to the
-    // investigation wallet without any social-signature check.
-    //
-    // Template positions (rawData = "0x" + hex, so index 0 = '0', 1 = 'x'):
-    //   T_NAME_LEN / T_NAME_BYTES  → token name  (unique per run, fits 1 word)
-    //   T_SYM_LEN  / T_SYM_BYTES  → token symbol (unique per run, fits 1 word)
-    //   T_LEN      / T_BYTES       → bnbshare handle (length + bytes)
-    //   vault factory at fixed pos 1700 — signer scans for it
-    const currentUrl = page.url();
-    const isBnbShare = currentUrl.includes('bnbshare.fun') || currentUrl.includes('bnbshare');
-    if (isCreationClaim && isBnbShare) {
-      await page.waitForTimeout(1_000);
-
-      // Real "Share back" bnbshare.fun createToken calldata (value=0, feeSharing=true).
-      // Positions are absolute in rawData (includes "0x" prefix at positions 0-1).
-      // prettier-ignore
-      const BNBSHARE_TEMPLATE = '1b8062200000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000036000000000000000000000000000000000000000000000000000000000000003a000000000000000000000000000000000000000000000000000000000000003e000000000000000000000000000000000000000000000000000000000000000019cd08ee49b41d9a36007f1ad083845f4ae369e7022e5d3c573b8423209663b560000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000440000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c800000000000000000000000000000000000000000000000000000000000000c800000000000000000000000000000000000000000000000000000000bbf81e00000000000000000000000000000000000000000000000000000000000003f480000000000000000000000000000000000000000000000000000000000000271000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000021e19e0c9bab2400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006000000000000000000000000f359cebb8f8b4ad249e5b1fcdf8288efaf5de0890000000000000000000000000000000000000000000000000000000000000480000000000000000000000000000000000000000000000000000000000000000a5368617265206261636b0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000055348415245000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003b6261666b726569667461747734717934366135786b363672367034716a716862666c366f776766336472757a336a7076357974726c79616d626f7900000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001a00000000000000000000000009801ca4214669fdbe636bb3a23e4af95e8e3df3b00000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000000000000000000000000000000000e00000000000000000000000000000000000000000000000000000000069df528f0000000000000000000000000000000000000000000000000000000000000120000000000000000000000000000000000000000000000000000000000000000d626e6273686172655f5f66756e000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007747769747465720000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000417ad42e0d83612a20efa695388003d54fa238a5c3853720d1f7ff68519ea89e41177cb22fa6c5b14634dd58a132fa10a215812b8cbc6c7eb3a0284866a9f1bb991c00000000000000000000000000000000000000000000000000000000000000';
-
-      // Build handle hex padded to 32 bytes (64 hex chars)
-      const handleLenHex = uniqueHandle.length.toString(16).padStart(64, '0');
-      const handleBytesHex = Array.from(new TextEncoder().encode(uniqueHandle))
-        .map((b) => b.toString(16).padStart(2, '0')).join('').padEnd(64, '0');
-
-      // Unique token name/symbol per run to avoid "token already exists" reverts.
-      // IMPORTANT: token name must NOT contain the handle string ('qa????') as a
-      // substring — otherwise signer.ts indexOf finds it in the name bytes (wrong
-      // ABI position, fails alignment) before finding it at the real handle slot.
-      const tokenName   = `QToken${runSuffix.slice(-4)}`;  // e.g., "QToken7605" (no 'qa' prefix)
-      const tokenSymbol = `Q${uniqueHandle.slice(-4)}`;     // e.g., "Q7605" (same length as "SHARE")
-      const nameLenHex   = tokenName.length.toString(16).padStart(64, '0');
-      const nameBytesHex = Array.from(new TextEncoder().encode(tokenName))
-        .map((b) => b.toString(16).padStart(2, '0')).join('').padEnd(64, '0');
-      const symLenHex    = tokenSymbol.length.toString(16).padStart(64, '0');
-      const symBytesHex  = Array.from(new TextEncoder().encode(tokenSymbol))
-        .map((b) => b.toString(16).padStart(2, '0')).join('').padEnd(64, '0');
-
-      // Template positions (rawData positions - 2 to strip "0x" prefix):
-      // All replacements are exactly 64 hex chars (one 32-byte ABI word).
-      const T_NAME_LEN   = 1802 - 2;  // token name length word
-      const T_NAME_BYTES = 1866 - 2;  // token name bytes (padded to 32 bytes)
-      const T_SYM_LEN    = 1930 - 2;  // token symbol length word
-      const T_SYM_BYTES  = 1994 - 2;  // token symbol bytes (padded to 32 bytes)
-      const T_LEN        = 2762 - 2;  // handle length word
-      const T_BYTES      = 2826 - 2;  // handle bytes (padded to 32 bytes)
-
-      // Splice all replacements (ordered from lowest to highest position)
-      const injData = '0x' +
-        BNBSHARE_TEMPLATE.slice(0, T_NAME_LEN) +
-        nameLenHex +
-        BNBSHARE_TEMPLATE.slice(T_NAME_LEN + 64, T_NAME_BYTES) +
-        nameBytesHex +
-        BNBSHARE_TEMPLATE.slice(T_NAME_BYTES + 64, T_SYM_LEN) +
-        symLenHex +
-        BNBSHARE_TEMPLATE.slice(T_SYM_LEN + 64, T_SYM_BYTES) +
-        symBytesHex +
-        BNBSHARE_TEMPLATE.slice(T_SYM_BYTES + 64, T_LEN) +
-        handleLenHex +
-        BNBSHARE_TEMPLATE.slice(T_LEN + 64, T_BYTES) +
-        handleBytesHex +
-        BNBSHARE_TEMPLATE.slice(T_BYTES + 64);
-
-      console.log(`[executor] Firing direct tx injection — name="${tokenName}" symbol="${tokenSymbol}" handle="${uniqueHandle}"`);
-      const injResult = await page.evaluate(
-        async (args: { injData: string; walletAddr: string }) => {
-          // Call larpscanSign directly (same as mock.eth_sendTransaction does internally)
-          // so we bypass any dApp-side state that might block eth.request after a revert.
-          const fn = (window as unknown as Record<string, unknown>)['larpscanSign'] as
-            | ((method: string, paramsJson: string) => Promise<string>)
-            | undefined;
-          if (typeof fn !== 'function') return 'no-bridge';
-          try {
-            const hash = await fn('eth_sendTransaction', JSON.stringify([{
-              from: args.walletAddr,
-              to:   '0x90497450f2a706f1951b5bdda52b4e5d16f34c06',
-              value: '0x0',
-              data: args.injData,
-              gas:  '0x630000',
-            }]));
-            return hash ?? 'null-hash';
-          } catch (e: unknown) {
-            return 'error:' + ((e instanceof Error ? e.message : String(e)) ?? '?').slice(0, 80);
-          }
-        },
-        { injData, walletAddr: options?.investigationWalletAddress ?? '' },
-      ).catch((e: unknown) => 'eval-error:' + String(e).slice(0, 80));
-
-      await page.waitForTimeout(3_000);
-      console.log(`[executor] Direct tx injection result: ${injResult}`);
-    } else {
-      // ── Last-chance submit (non-creation wallet-flow claims only) ────────────
-      // For pure WALLET_FLOW claims (no direct injection), make a final deterministic
-      // click on the submit button if the agent exhausted its budget without submitting.
-      const lastChanceCta = await findFormSubmitButton(page);
-      if (lastChanceCta) {
-        console.log(`[executor] Last-chance submit: clicking "${lastChanceCta}" after budget exhaustion`);
-        try {
-          await page.evaluate((text: string) => {
-            const submitRe = /^(create|launch|deploy|mint|submit|build|publish|confirm|proceed|start)\b/i;
-            const btns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'));
-            const btn = btns.find((el) => {
-              const t = (el.textContent ?? '').trim();
-              const s = window.getComputedStyle(el as HTMLElement);
-              const r = (el as HTMLElement).getBoundingClientRect();
-              return submitRe.test(t) && s.display !== 'none' && r.width > 0 && r.height > 0;
-            });
-            if (btn) (btn as HTMLElement).click();
-          }, lastChanceCta);
-          await page.waitForTimeout(5_000);
-          console.log('[executor] Last-chance submit: button clicked — wallet tx dispatch pending (check signer logs)');
-        } catch (e) {
-          console.warn('[executor] Last-chance submit click failed:', e);
-        }
+    // ── Last-chance submit ────────────────────────────────────────────────────
+    // If the agent exhausted its budget without submitting, make one final
+    // deterministic click on the visible submit/action button. The dApp will
+    // dispatch its own transaction naturally — no platform-specific calldata.
+    const lastChanceCta = await findFormSubmitButton(page);
+    if (lastChanceCta) {
+      console.log(`[executor] Last-chance submit: clicking "${lastChanceCta}" after budget exhaustion`);
+      try {
+        await page.evaluate((text: string) => {
+          const submitRe = /^(create|launch|deploy|mint|submit|build|publish|confirm|proceed|start)\b/i;
+          const btns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'));
+          const btn = btns.find((el) => {
+            const t = (el.textContent ?? '').trim();
+            const s = window.getComputedStyle(el as HTMLElement);
+            const r = (el as HTMLElement).getBoundingClientRect();
+            return submitRe.test(t) && s.display !== 'none' && r.width > 0 && r.height > 0;
+          });
+          if (btn) (btn as HTMLElement).click();
+        }, lastChanceCta);
+        await page.waitForTimeout(5_000);
+        console.log('[executor] Last-chance submit: button clicked — wallet tx dispatch pending (check signer logs)');
+      } catch (e) {
+        console.warn('[executor] Last-chance submit click failed:', e);
       }
     }
   }
