@@ -314,6 +314,9 @@ interface RecordingResult {
   /** Unhandled JS errors captured by page.on('pageerror') during the run.
    *  Distinguishes "feature page crashed" (FAILED) from "feature absent" (LARP). */
   pageJsErrors:        string[];
+  /** Inline analysis flags (formerly Session 1). False means site unreachable/blocked. */
+  siteLoaded:          boolean;
+  blocked:             boolean;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -460,6 +463,7 @@ async function waitForPageStability(page: Page): Promise<void> {
 
 async function recordInteraction(
   baseUrl:       string,
+  homepageUrl:   string,
   claimId:       string,
   claim:         string,
   passCondition: string,
@@ -473,6 +477,8 @@ async function recordInteraction(
   const probes: string[] = [];
   let videoUrl: string | undefined;
   let finalScreenshotDataUrl: string | undefined;
+  let siteLoaded = false;
+  let blocked    = false;
 
   // Fallback empty page state returned if Session 2 fails entirely
   const emptyPageState: PageState = {
@@ -584,9 +590,63 @@ async function recordInteraction(
     // never produce double-paths like /create/create.
     const baseDomain = new URL(baseUrl).origin;
 
-    // ── Navigate ────────────────────────────────────────────────────────────
+    // ── Inline analysis (formerly Session 1) ────────────────────────────────
+    // Check HTTP status + Cloudflare BEFORE starting the recording so we never
+    // waste a recording session on a blocked or unreachable page.
     console.log(`[verifier:record] Navigating to ${baseUrl} (baseDomain: ${baseDomain})`);
-    await page.goto(baseUrl, { waitUntil: 'load', timeout: 15_000 }).catch(() => null);
+    let navResp = await page.goto(baseUrl, { waitUntil: 'load', timeout: 15_000 }).catch(() => null);
+    if (!navResp) {
+      navResp = await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 10_000 }).catch(() => null);
+    }
+
+    if (!navResp) {
+      probes.push(`GET ${baseUrl} → TIMEOUT / DNS_ERROR`);
+      return { probes, siteLoaded: false, blocked: false, observations: [], finalPageState: emptyPageState, runApiCalls, walletEvidence, pageJsErrors };
+    }
+
+    const navStatus = navResp.status();
+    siteLoaded = navStatus < 400;
+    probes.push(`GET ${baseUrl} → ${navStatus}`);
+
+    if (navStatus >= 500) {
+      return { probes, siteLoaded, blocked: false, observations: [], finalPageState: emptyPageState, runApiCalls, walletEvidence, pageJsErrors };
+    }
+
+    // Cloudflare / bot protection check — bail out before recording starts
+    const bodyRaw = await page.textContent('body').catch(() => '') ?? '';
+    if (
+      bodyRaw.includes('Just a moment') ||
+      bodyRaw.includes('Checking your browser') ||
+      bodyRaw.includes('cf-browser-verification')
+    ) {
+      blocked = true;
+      probes.push('BLOCKED: Cloudflare / bot protection');
+      return { probes, siteLoaded: true, blocked: true, observations: [], finalPageState: emptyPageState, runApiCalls, walletEvidence, pageJsErrors };
+    }
+
+    // ── Surface fallback (inline — no second connection needed) ─────────────
+    // If the specific surface path is unreachable, retry from the homepage
+    // within the same browser session instead of opening a new connection.
+    let effectiveBaseUrl = baseUrl;
+    if (surface && surface !== '/' && baseUrl !== homepageUrl) {
+      const pageText = await page.evaluate(() => (document.body as HTMLElement).innerText ?? '').catch(() => '');
+      const isLoginWall = /sign in|log in|connect wallet|wallet required/i.test(pageText);
+      const isUnreachable =
+        !isLoginWall &&
+        (navStatus === 404 || navStatus === 410 || navStatus >= 500 || pageText.trim().length < 20);
+
+      if (isUnreachable) {
+        console.warn(`[verifier:record] Surface "${surface}" unreachable (status=${navStatus}) — navigating to homepage`);
+        probes.push(`Surface "${surface}" unreachable (HTTP ${navStatus}) — retried from homepage`);
+        const fallbackResp = await page.goto(homepageUrl, { waitUntil: 'load', timeout: 15_000 }).catch(() => null);
+        if (fallbackResp && fallbackResp.status() < 400) {
+          effectiveBaseUrl = homepageUrl;
+          siteLoaded = true;
+        }
+      }
+    }
+
+    // ── Hydration wait + recording start ────────────────────────────────────
     // When a wallet mock is active the page uses wagmi localStorage pre-connect;
     // wagmi v2 with ssr:true needs ~4-5 s to hydrate before the connected state
     // appears in the DOM. Use a longer wait so analyzePageState sees the correct
@@ -606,6 +666,8 @@ async function recordInteraction(
         cdpSession = null;
       }
     }
+    // Update baseDomain if surface fallback navigated to homepage
+    const effectiveBaseDomain = new URL(effectiveBaseUrl).origin;
 
     // ── Dismiss cookie / GDPR consent banners ────────────────────────────────
     // Many sites show a consent overlay that blocks all interaction until
@@ -672,18 +734,36 @@ async function recordInteraction(
       console.log(`[verifier:record] Pre-planner skip — hard blocker detected: [${pageState.blockers.join(', ')}]`);
     }
 
-    // dataAlreadyVisible kept as a signal but not used to skip planWorkflow —
-    // skipping planWorkflow for DATA_DASHBOARD caused the agent to navigate away
-    // from the correct page before JS had time to render table data.
+    // ── DATA_DASHBOARD fast path ─────────────────────────────────────────────
+    // If dashboard data (table headers or chart signals) is already visible at
+    // page load with no blockers, skip the full agent loop entirely.
+    // The old approach (skip planWorkflow but keep executeSteps) caused the agent
+    // to navigate away before JS rendered the data. Skipping executeSteps too
+    // prevents that and saves the full LLM plan + up to 12 agent steps.
     const dataAlreadyVisible =
       (featureType === 'DATA_DASHBOARD' || featureType === 'dashboard+browser') &&
-      pageState.tableHeaders.length > 0 &&
+      (pageState.tableHeaders.length >= 2 || pageState.chartSignals.length >= 3) &&
       pageState.blockers.length === 0;
 
     if (dataAlreadyVisible) {
-      console.log('[verifier:record] DATA_DASHBOARD: table data visible at page load');
+      console.log('[verifier:record] DATA_DASHBOARD fast path — data visible, skipping agent loop');
+      // Capture a final screenshot as proof
+      try {
+        const buf = await page.screenshot({ type: 'jpeg', quality: 65, fullPage: false });
+        finalScreenshotDataUrl = `data:image/jpeg;base64,${buf.toString('base64')}`;
+      } catch { /* non-fatal */ }
+      // Synthetic observation so VerdictSignals sees at least one step
+      allObservations.push({
+        step: 'observe: Dashboard data visible at page load — fast path',
+        result: `Dashboard confirmed: headers=[${pageState.tableHeaders.slice(0, 4).join(', ')}]`,
+        isNoop: false,
+        visibleSignals: ['data_visible', 'table_loaded'],
+        newInputs: [],
+      });
+      finalPageState = pageState;
     }
 
+    if (!dataAlreadyVisible) {
     // ── Phase 1.5: Workflow hypothesis (recon → hypothesis) ─────────────────
     const hypothesis = buildWorkflowHypothesis(claim, featureType, pageState);
     console.log(
@@ -725,7 +805,7 @@ async function recordInteraction(
 
     // ── Phase 2: Execute Plan A ─────────────────────────────────────────────
     if (planA.length > 0) {
-      const planAResult = await executeSteps(page, planA, baseDomain, runApiCalls, {
+      const planAResult = await executeSteps(page, planA, effectiveBaseDomain, runApiCalls, {
         stage:                      'execution',
         hypothesis,
         investigationWalletAddress: walletAddress ?? undefined,
@@ -795,7 +875,7 @@ async function recordInteraction(
         const planBCapped     = planB.slice(0, remainingBudget);
 
         console.log(`[verifier:record] Plan B: ${planBCapped.length} step(s) (budget remaining: ${remainingBudget})`);
-        const planBResult = await executeSteps(page, planBCapped, baseDomain, runApiCalls, {
+        const planBResult = await executeSteps(page, planBCapped, effectiveBaseDomain, runApiCalls, {
           stage:                      'recovery',
           hypothesis,
           investigationWalletAddress: walletAddress ?? undefined,
@@ -936,7 +1016,16 @@ async function recordInteraction(
           `Wallet requests rejected by policy: ${allRejectedRequests.map((r) => r.description).join(' | ')}`,
         );
       }
+    } // closes if (walletEnabled)
+    } // end if (!dataAlreadyVisible)
+
+    // ── Evidence summary (both fast-path and full-path) ──────────────────────
+    if (allObservations.length > 0 && !probes.some((p) => p.includes('Step'))) {
+      const evidenceBlock = buildEvidenceSummary(allObservations, finalPageState, runApiCalls, baseUrl);
+      probes.push(evidenceBlock);
     }
+    console.log(`[verifier:record] Final URL: ${finalPageState.url}`);
+    console.log(`[verifier:record] Total steps: ${allObservations.length}, API calls: ${runApiCalls.length}`);
 
   } finally {
     // Use the early-captured recording buffer if available (stopped right
@@ -1022,7 +1111,7 @@ async function recordInteraction(
     console.log('[verifier:record] Browser closed');
   }
 
-  return { probes, videoUrl, observations: allObservations, finalPageState, runApiCalls, walletEvidence, finalScreenshotDataUrl, walletOnlyGateDetected, pageJsErrors };
+  return { probes, videoUrl, observations: allObservations, finalPageState, runApiCalls, walletEvidence, finalScreenshotDataUrl, walletOnlyGateDetected, pageJsErrors, siteLoaded, blocked };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1057,61 +1146,17 @@ export async function verifyClaim(
     console.log(`[verifier] Surface override: ${startUrl}`);
   }
 
-  // ── Session 1: Analyse ────────────────────────────────────────────────────
-  let analysis = await analyzeWebsite(startUrl);
-  let effectiveStartUrl = startUrl;
-  let routeFallbackUsed = false;
-
-  // ── Conditional surface fallback ──────────────────────────────────────────
-  // Retry from baseUrl only when the surface is genuinely unreachable.
-  // Do NOT fall back for login/wallet-gated pages — those are valid UNTESTABLE outcomes.
-  if (surface && surface !== '/' && startUrl !== baseUrl) {
-    const isLoginWall = analysis.pageText.match(
-      /sign in|log in|connect wallet|wallet required/i,
-    );
-    const isUnreachable =
-      !analysis.blocked &&
-      !isLoginWall &&
-      (analysis.surfaceStatus === null ||
-        analysis.surfaceStatus === 404 ||
-        analysis.surfaceStatus === 410 ||
-        analysis.surfaceStatus >= 500 ||
-        analysis.pageText.trim().length < 20);
-
-    if (isUnreachable) {
-      console.warn(
-        `[verifier] Surface "${surface}" unreachable (status=${analysis.surfaceStatus}) — retrying from homepage`,
-      );
-      const fallbackProbe = `Surface "${surface}" unreachable (HTTP ${analysis.surfaceStatus ?? 'TIMEOUT'}) — retried from homepage`;
-      const retryAnalysis = await analyzeWebsite(baseUrl);
-      retryAnalysis.probes.unshift(fallbackProbe);
-      analysis          = retryAnalysis;
-      effectiveStartUrl = baseUrl;
-      routeFallbackUsed = true;
-    }
-  }
-
-  if (!analysis.siteLoaded || analysis.blocked) {
-    return {
-      evidenceSummary:   analysis.probes.join('\n'),
-      siteLoaded:        analysis.siteLoaded,
-      blocked:           analysis.blocked,
-      screenshotDataUrl: analysis.screenshotDataUrl,
-      // No signals — short-circuited before Session 2
-    };
-  }
-
-  // ── Session 2: Record + plan + execute ────────────────────────────────────
-  // process.cwd() is /var/task (read-only) on Vercel — use /tmp for the
-  // intermediate recording file.  After recording completes the webm is
-  // uploaded to Supabase Storage and deleted from /tmp.
+  // ── Single session: analyse + record + execute ───────────────────────────
+  // Session 1 (analyzeWebsite) is now inlined at the start of recordInteraction.
+  // This halves the number of Browserless connections per claim.
   const recordingsDir = isServerlessRuntime()
     ? path.join('/tmp', 'recordings')
     : path.join(process.cwd(), 'public', 'recordings');
   await fs.mkdir(recordingsDir, { recursive: true });
 
   const recording = await recordInteraction(
-    effectiveStartUrl,
+    startUrl,
+    baseUrl,
     claimId,
     claim,
     passCondition,
@@ -1122,6 +1167,16 @@ export async function verifyClaim(
     sessionId,
     createRunMemory(),
   );
+
+  // Early exit if the inline analysis found the site unreachable or blocked
+  if (!recording.siteLoaded || recording.blocked) {
+    return {
+      evidenceSummary:   recording.probes.join('\n'),
+      siteLoaded:        recording.siteLoaded,
+      blocked:           recording.blocked,
+      screenshotDataUrl: recording.finalScreenshotDataUrl,
+    };
+  }
 
   // Collect any on-chain transaction hashes submitted during verification
   const submittedTxHashes  = drainTransactionHashes(sessionId);
@@ -1142,10 +1197,10 @@ export async function verifyClaim(
     recording.observations,
     recording.finalPageState,
     recording.runApiCalls,
-    effectiveStartUrl,
-    analysis.siteLoaded,
-    analysis.blocked,
-    routeFallbackUsed,
+    startUrl,
+    recording.siteLoaded,
+    recording.blocked,
+    recording.probes.some((p) => p.includes('retried from homepage')),
     recording.walletEvidence,
     submittedTxHashes,
     txReceiptStatus,
@@ -1153,7 +1208,7 @@ export async function verifyClaim(
     effectiveSurface,
     recording.walletOnlyGateDetected,
     recording.pageJsErrors,
-    analysis.pageText,  // recon page text — fallback for bot link detection when recording fails
+    '',  // recon page text no longer needed — inline analysis covers it
   );
 
   console.log(
@@ -1179,11 +1234,11 @@ export async function verifyClaim(
 
   return {
     evidenceSummary:
-      [...analysis.probes, ...recording.probes].join('\n') +
+      recording.probes.join('\n') +
       (receiptNote ? `\n${receiptNote}` : ''),
-    siteLoaded:        analysis.siteLoaded,
-    blocked:           analysis.blocked,
-    screenshotDataUrl:      analysis.screenshotDataUrl,
+    siteLoaded:        recording.siteLoaded,
+    blocked:           recording.blocked,
+    screenshotDataUrl:      recording.finalScreenshotDataUrl,
     videoUrl:               recording.videoUrl,
     finalScreenshotDataUrl: recording.finalScreenshotDataUrl,
     signals,
