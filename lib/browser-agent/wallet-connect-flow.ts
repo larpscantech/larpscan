@@ -49,11 +49,18 @@ export async function detectWalletStack(page: Page): Promise<{ stack: WalletStac
     const html = document.documentElement.outerHTML;
     const text = document.body?.innerText?.toLowerCase() ?? '';
 
-    // Privy — data-privy-dialog, privy SDK globals, "Log in or sign up" copy
+    // Privy — data-privy-dialog, privy SDK globals, "Log in or sign up" copy,
+    // or an active privy:token in localStorage (pre-populated by wallet mock).
     if (document.querySelector('[data-privy-dialog]') || (window as any).__PRIVY_CONFIG__) {
       signals.push('privy-dialog');
       return { stack: 'privy' as const, signals };
     }
+    try {
+      if (localStorage.getItem('privy:token') || localStorage.getItem('privy:session')) {
+        signals.push('privy-localstorage');
+        return { stack: 'privy' as const, signals };
+      }
+    } catch {}
     if (/privy/i.test(html) && /log in or sign up|continue with a wallet/i.test(text)) {
       signals.push('privy-text');
       return { stack: 'privy' as const, signals };
@@ -1025,6 +1032,30 @@ function buildWalletMockScript(addr: string): string {
 
     // Dynamic.xyz
     localStorage.setItem('dynamic_authenticated_user', JSON.stringify({ address: addr }));
+
+    // Privy — pre-populate session so sites using Privy skip the "Log in or sign up"
+    // modal entirely and treat the wallet as already authenticated on page load.
+    // Privy reads privy:token on init; a structurally valid (but unsigned) JWT is
+    // enough to pass the client-side guard and let the UI render the connected state.
+    var privyHeader  = btoa(JSON.stringify({ alg: 'ES256', typ: 'JWT' })).replace(/=+$/, '');
+    var privyPayload = btoa(JSON.stringify({
+      sub:           'did:privy:larpscan-investigation',
+      iss:           'privy.io',
+      iat:           Math.floor(Date.now() / 1000) - 30,
+      exp:           Math.floor(Date.now() / 1000) + 86400,
+      'privy:appId': 'larpscan',
+      'privy:user':  { wallet: { address: addr, chain_type: 'ethereum', wallet_client: 'metamask' } }
+    })).replace(/=+$/, '');
+    var privyToken = privyHeader + '.' + privyPayload + '.larpscan-sig';
+    localStorage.setItem('privy:token',   privyToken);
+    localStorage.setItem('privy:session', JSON.stringify({
+      user: {
+        id: 'did:privy:larpscan-investigation',
+        linked_accounts: [{ type: 'wallet', address: addr, chain_type: 'ethereum', wallet_client: 'metamask', verified_at: Math.floor(Date.now() / 1000) }]
+      },
+      token: privyToken
+    }));
+    console.log('[mock] Privy session pre-populated for', addr);
 
     // ethers.js v5 legacy
     localStorage.setItem('WEB3_CONNECT_CACHED_PROVIDER', '"injected"');
