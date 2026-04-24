@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { ArrowRight, RotateCcw, AlertCircle } from 'lucide-react';
+import { ArrowRight, RotateCcw, AlertCircle, Globe } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Navbar } from '@/components/navbar';
 import { PipelineStepper } from '@/components/pipeline-stepper';
@@ -182,31 +182,73 @@ function ScanSelector({ value, onChange }: { value: ScanType; onChange: (v: Scan
   );
 }
 
+// ─── Input mode toggle ────────────────────────────────────────────────────────
+
+type InputMode = 'contract' | 'website';
+
+function InputModeToggle({ value, onChange }: { value: InputMode; onChange: (v: InputMode) => void }) {
+  return (
+    <div className="flex gap-0.5 p-1 rounded-sm bg-[#0a0a0d] border border-[#1c1c22]">
+      {(['contract', 'website'] as const).map((mode) => (
+        <button
+          key={mode}
+          onClick={() => onChange(mode)}
+          className={cn(
+            'px-3 py-2 text-[10px] font-semibold uppercase tracking-[0.18em] rounded-sm transition-all duration-150 whitespace-nowrap flex items-center gap-1.5',
+            value === mode
+              ? 'bg-[#1a0707] text-[#f87171] border border-[#b91c1c]/30'
+              : 'text-zinc-600 hover:text-zinc-400',
+          )}
+        >
+          {mode === 'contract' ? (
+            <><span className="font-mono text-[9px]">0x</span> CA</>
+          ) : (
+            <><Globe className="w-2.5 h-2.5" /> URL</>
+          )}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 // ─── Contract input row ───────────────────────────────────────────────────────
 
 function ContractRow({
   value, onChange, onSubmit, isLoading,
   scanType, onScanTypeChange, forceReverify, onForceReverifyChange,
+  inputMode, onInputModeChange,
 }: {
   value: string; onChange: (v: string) => void; onSubmit: () => void; isLoading: boolean;
   scanType: ScanType; onScanTypeChange: (v: ScanType) => void;
   forceReverify: boolean; onForceReverifyChange: (v: boolean) => void;
+  inputMode: InputMode; onInputModeChange: (v: InputMode) => void;
 }) {
   const { locale } = useLocale();
   const isZh = locale === 'zh-TW';
+  const isUrl = inputMode === 'website';
+
+  const placeholder = isUrl
+    ? 'https://yourproject.io'
+    : isZh ? '輸入代幣合約地址...' : 'Enter token contract address...';
+
   return (
-      <div className="mb-12">
+    <div className="mb-12">
       <div className="flex items-center gap-3 mb-3">
+        <InputModeToggle value={inputMode} onChange={onInputModeChange} />
         <ScanSelector value={scanType} onChange={onScanTypeChange} />
         <div className="flex-1 relative">
-          <span className="absolute left-4 top-1/2 -translate-y-1/2 font-mono text-xs text-zinc-700 pointer-events-none select-none">$</span>
+          {isUrl ? (
+            <Globe className="absolute left-3.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-700 pointer-events-none" />
+          ) : (
+            <span className="absolute left-4 top-1/2 -translate-y-1/2 font-mono text-xs text-zinc-700 pointer-events-none select-none">$</span>
+          )}
           <input
             type="text"
             value={value}
             onChange={(e) => onChange(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && !isLoading && onSubmit()}
             disabled={isLoading}
-            placeholder={isZh ? '輸入代幣合約地址...' : 'Enter token contract address...'}
+            placeholder={placeholder}
             className={cn(
               'w-full h-12 pl-9 pr-4 rounded-sm text-sm font-mono',
               'bg-[#09090d] border border-[#1c1c22]',
@@ -240,7 +282,7 @@ function ContractRow({
       </div>
 
       <label
-          onClick={() => onForceReverifyChange(!forceReverify)}
+        onClick={() => onForceReverifyChange(!forceReverify)}
         className="flex items-center gap-2.5 cursor-pointer w-fit group ml-1 select-none"
       >
         <div
@@ -427,6 +469,7 @@ export default function DashboardPage() {
   const [input, setInput]               = useState('');
   const [scanType, setScanType]         = useState<ScanType>('full');
   const [forceReverify, setForceReverify] = useState(false);
+  const [inputMode, setInputMode]       = useState<InputMode>('contract');
 
   // ── Pipeline state ──────────────────────────────────────────────────────────
   const [phase, setPhase]               = useState<Phase>('idle');
@@ -485,6 +528,13 @@ export default function DashboardPage() {
     const urlCa = new URLSearchParams(window.location.search).get('ca')?.trim();
     if (urlCa && /^0x[0-9a-fA-F]{40,}$/i.test(urlCa)) {
       setInput(urlCa);
+    }
+
+    // ── Restore website URL from ?url= on refresh / direct link ──────────────
+    const urlWebsite = new URLSearchParams(window.location.search).get('url')?.trim();
+    if (urlWebsite && /^https?:\/\//i.test(urlWebsite)) {
+      setInputMode('website');
+      setInput(urlWebsite);
     }
 
     // ── Instantly restore run from ?runId= on refresh / direct link ──────────
@@ -552,20 +602,25 @@ export default function DashboardPage() {
   }, []);
 
   // ── Debounced active-run check ────────────────────────────────────────────
-  // When the user types a valid-looking CA (or one is restored from the URL),
+  // When the user types a valid-looking CA or URL (or one is restored from the URL),
   // we wait 600 ms then ask the server if there's already an active run for it.
   // Active run  → auto-teleport (join via startVerification → orchestrate join path).
   // Completed   → load result directly from /api/verify/status (skip orchestrate).
   // Idle phases only to avoid interrupting an in-progress scan.
   useEffect(() => {
     const trimmed = input.trim();
-    if (!trimmed || !/^0x[0-9a-fA-F]{40,}$/i.test(trimmed)) return;
+    const isCA  = /^0x[0-9a-fA-F]{40,}$/i.test(trimmed);
+    const isURL = /^https?:\/\/.+/i.test(trimmed);
+    if (!trimmed || (!isCA && !isURL)) return;
     if (phaseRef.current !== 'idle') return;
 
     const timer = window.setTimeout(async () => {
       if (phaseRef.current !== 'idle') return;
       try {
-        const res = await fetch(`/api/verify/active?ca=${encodeURIComponent(trimmed)}`);
+        const param = isCA
+          ? `ca=${encodeURIComponent(trimmed)}`
+          : `url=${encodeURIComponent(trimmed)}`;
+        const res = await fetch(`/api/verify/active?${param}`);
         if (!res.ok) return;
         const data = await res.json() as {
           hasActiveRun:    boolean;
@@ -577,14 +632,14 @@ export default function DashboardPage() {
 
         if (data.hasActiveRun && data.runId) {
           // In-flight run — join through the normal pipeline
-          console.log(`[dashboard] Auto-teleporting to active run ${data.runId} for CA ${trimmed}`);
+          console.log(`[dashboard] Auto-teleporting to active run ${data.runId} for ${isCA ? 'CA' : 'URL'} ${trimmed}`);
           void startVerification(trimmed);
           return;
         }
 
         if (data.hasCompletedRun && data.runId) {
           // Completed run — load directly from status, bypassing orchestrate
-          console.log(`[dashboard] Auto-loading completed run ${data.runId} for CA ${trimmed}`);
+          console.log(`[dashboard] Auto-loading completed run ${data.runId} for ${isCA ? 'CA' : 'URL'} ${trimmed}`);
           try {
             const statusRes = await fetch(`/api/verify/status?runId=${data.runId}`);
             if (!statusRes.ok || phaseRef.current !== 'idle') return;
@@ -606,10 +661,16 @@ export default function DashboardPage() {
             setPhase('complete');
             setDisplayedLogs(['Restored from previous run ✓']);
 
-            // Push CA to URL
+            // Push to URL
             if (typeof window !== 'undefined') {
               const url = new URL(window.location.href);
-              url.searchParams.set('ca', trimmed);
+              if (isCA) {
+                url.searchParams.set('ca', trimmed);
+                url.searchParams.delete('url');
+              } else {
+                url.searchParams.set('url', trimmed);
+                url.searchParams.delete('ca');
+              }
               window.history.replaceState({}, '', url.toString());
             }
           } catch {
@@ -780,10 +841,16 @@ export default function DashboardPage() {
     console.log('  contract :', address);
     console.log('  timestamp:', new Date().toISOString());
 
+    const isUrlInput = /^https?:\/\//i.test(address);
+
     // ── PHASE 1 — Call orchestrate (server does discover + scrape + extract + dispatch)
     setPhase('extracting');
     addLog('Initializing verification job...');
-    addLog(`Resolving contract: ${address.slice(0, 10)}...`);
+    if (isUrlInput) {
+      addLog(`Scanning website: ${address}`);
+    } else {
+      addLog(`Resolving contract: ${address.slice(0, 10)}...`);
+    }
 
     let orchResult: { runId: string; project: DbProject; status: 'started' | 'joined' | 'complete' };
     try {
@@ -794,7 +861,9 @@ export default function DashboardPage() {
       }>(
         '/api/verify/orchestrate',
         '/api/verify/orchestrate',
-        { contractAddress: address, forceReverify },
+        isUrlInput
+          ? { websiteUrl: address, forceReverify }
+          : { contractAddress: address, forceReverify },
       );
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Verification failed';
@@ -815,12 +884,16 @@ export default function DashboardPage() {
     setProjectLoaded(true);
     setCurrentRunId(runId);
 
-    // ── Push CA + runId to URL so a refresh auto-reconnects instantly ────────
-    // With ?runId= in the URL, a refresh can directly load the run status
-    // without calling orchestrate again (avoids the 20-60s re-scrape delay).
+    // ── Push CA/URL + runId to URL so a refresh auto-reconnects instantly ────
     if (typeof window !== 'undefined') {
       const url = new URL(window.location.href);
-      url.searchParams.set('ca', address);
+      if (isUrlInput) {
+        url.searchParams.set('url', address);
+        url.searchParams.delete('ca');
+      } else {
+        url.searchParams.set('ca', address);
+        url.searchParams.delete('url');
+      }
       url.searchParams.set('runId', runId);
       window.history.replaceState({}, '', url.toString());
     }
@@ -966,7 +1039,17 @@ export default function DashboardPage() {
     const alive   = () => runIdRef.current === myRunId;
     const sleep   = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-    setInput(v.project.contractAddress);
+    // URL-mode projects use a synthetic contract_address like "url:hostname".
+    // Restore the actual website URL in that case and switch to URL mode.
+    const isUrlProject = v.project.contractAddress.startsWith('url:');
+    if (isUrlProject) {
+      const websiteToRestore = v.project.website || `https://${v.project.contractAddress.slice(4)}`;
+      setInputMode('website');
+      setInput(websiteToRestore);
+    } else {
+      setInputMode('contract');
+      setInput(v.project.contractAddress);
+    }
 
     // ── Hard reset ──────────────────────────────────────────────────────────
     setDisplayedLogs([]);
@@ -1189,6 +1272,8 @@ export default function DashboardPage() {
               onScanTypeChange={setScanType}
               forceReverify={forceReverify}
               onForceReverifyChange={setForceReverify}
+              inputMode={inputMode}
+              onInputModeChange={setInputMode}
             />
           </motion.div>
 

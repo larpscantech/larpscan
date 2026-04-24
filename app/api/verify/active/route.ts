@@ -25,9 +25,25 @@ const STALE_RUN_MS = 8 * 60 * 1000;
 const ACTIVE_STATUSES = ['pending', 'verifying', 'extracting', 'analyzing'];
 
 export const GET = withErrorHandler(async (req: Request) => {
-  const ca = new URL((req as NextRequest).url).searchParams.get('ca')?.trim() ?? '';
+  const params = new URL((req as NextRequest).url).searchParams;
+  const ca     = params.get('ca')?.trim()  ?? '';
+  const urlParam = params.get('url')?.trim() ?? '';
 
-  if (!ca || !/^0x[0-9a-fA-F]{40,}$/i.test(ca)) {
+  // Resolve a synthetic contract_address key from whichever param was supplied.
+  // CA mode:  look up by the actual 0x address.
+  // URL mode: normalise to "url:<hostname>" — the key used by orchestrate.
+  let lookupKey: string;
+
+  if (ca && /^0x[0-9a-fA-F]{40,}$/i.test(ca)) {
+    lookupKey = ca.toLowerCase();
+  } else if (urlParam && /^https?:\/\/.+/i.test(urlParam)) {
+    try {
+      const hostname = new URL(urlParam).hostname.replace(/^www\./, '');
+      lookupKey = `url:${hostname}`;
+    } catch {
+      return ok({ hasActiveRun: false, hasCompletedRun: false, runId: null, runStatus: null });
+    }
+  } else {
     return ok({ hasActiveRun: false, hasCompletedRun: false, runId: null, runStatus: null });
   }
 
@@ -35,7 +51,7 @@ export const GET = withErrorHandler(async (req: Request) => {
   const { data: project } = await supabase
     .from('projects')
     .select('id')
-    .eq('contract_address', ca.toLowerCase())
+    .eq('contract_address', lookupKey)
     .maybeSingle<Pick<DbProject, 'id'>>();
 
   if (!project) {

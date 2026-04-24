@@ -1,4 +1,4 @@
-import { NextRequest } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import { supabase } from '@/lib/supabase';
 import { log, logBatch } from '@/lib/logger';
 import { ok, err, withErrorHandler } from '@/lib/api-helpers';
@@ -28,107 +28,18 @@ function hasInfrastructureFailure(claims: DbClaimWithEvidence[]): boolean {
 }
 
 /**
- * Server-side orchestrator: discover → dedup → scrape → extract → create claims.
- *
- * IMPORTANT: This route does NOT dispatch claim workers (fire-and-forget fetch).
- * On Vercel, fire-and-forget fetches are killed when the Lambda returns its response.
- * Instead, the dashboard calls /api/verify/run after this route returns to dispatch
- * claims in a separate Lambda that properly fires off claim workers.
+ * Shared run-creation and claim-extraction logic.
+ * Called by both the CA path and the URL-only path once a project is resolved.
  *
  * Returns:
  *   status: 'complete'  → cached completed run, load instantly
  *   status: 'joined'    → existing in-progress run, poll for results
  *   status: 'started'   → new run created with claims, dashboard must call /api/verify/run
  */
-export const POST = withErrorHandler(async (req: Request) => {
-  const body = await (req as NextRequest).json().catch(() => ({}));
-  const contractAddress = (body?.contractAddress ?? '').trim();
-  const forceReverify = Boolean(body?.forceReverify);
-
-  if (!contractAddress) return err('contractAddress is required');
-
-  // ── 1. Discover project ────────────────────────────────────────────────────
-  // Never self-fetch on Vercel (Lambda calling itself deadlocks).
-  // Use the discover route's logic directly via internal imports.
-  const { validateContract, getTokenMetadata } = await import('@/lib/rpc');
-
-  await validateContract(contractAddress);
-  const { name: tokenName, symbol: tokenSymbol } = await getTokenMetadata(contractAddress);
-
-  // Check if project already exists in DB with enriched data
-  const { data: existingProject } = await supabase
-    .from('projects')
-    .select('*')
-    .eq('contract_address', contractAddress.toLowerCase())
-    .maybeSingle<DbProject>();
-
-  let project: DbProject;
-
-  if (existingProject && existingProject.website && !forceReverify) {
-    // Already enriched — use cached data
-    project = existingProject;
-    console.log(`[orchestrate] Using cached project: ${project.name} (${project.website})`);
-  } else {
-    // Need enrichment — call discover route. This works because discover is a
-    // separate Lambda on Vercel (different function, not self-calling).
-    const origin = new URL((req as NextRequest).url).origin;
-    try {
-      const discoverRes = await fetch(`${origin}/api/project/discover`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contractAddress }),
-      });
-      if (discoverRes.ok) {
-        const discoverData = await discoverRes.json() as { project: DbProject };
-        project = discoverData.project;
-      } else {
-        // Enrichment failed — fall back to basic upsert
-        const { data: upserted, error: upsertErr } = await supabase
-          .from('projects')
-          .upsert(
-            {
-              contract_address: contractAddress.toLowerCase(),
-              name: tokenName,
-              symbol: tokenSymbol,
-              website: existingProject?.website ?? null,
-              twitter: existingProject?.twitter ?? null,
-              logo_url: existingProject?.logo_url ?? null,
-              description: existingProject?.description ?? null,
-              chain: 'bsc',
-            },
-            { onConflict: 'contract_address' },
-          )
-          .select()
-          .single<DbProject>();
-
-        if (upsertErr || !upserted) return err('Failed to save project', 500);
-        project = upserted;
-      }
-    } catch (e) {
-      console.warn('[orchestrate] Discover fetch failed, using basic upsert:', e);
-      const { data: upserted, error: upsertErr } = await supabase
-        .from('projects')
-        .upsert(
-          {
-            contract_address: contractAddress.toLowerCase(),
-            name: tokenName,
-            symbol: tokenSymbol,
-            website: existingProject?.website ?? null,
-            twitter: existingProject?.twitter ?? null,
-            logo_url: existingProject?.logo_url ?? null,
-            description: existingProject?.description ?? null,
-            chain: 'bsc',
-          },
-          { onConflict: 'contract_address' },
-        )
-        .select()
-        .single<DbProject>();
-
-      if (upsertErr || !upserted) return err('Failed to save project', 500);
-      project = upserted;
-    }
-  }
-
+async function handleRunCreation(
+  project: DbProject,
+  forceReverify: boolean,
+): Promise<NextResponse> {
   // ── 2. Check for existing in-progress run ─────────────────────────────────
   if (!forceReverify) {
     const { data: activeRun } = await supabase
@@ -273,8 +184,7 @@ export const POST = withErrorHandler(async (req: Request) => {
 
   if (!websiteText) {
     // Scraping failed — try to extract claims from project metadata (description,
-    // name, Twitter) if we have enough to work with. Projects like bortagent.xyz
-    // block headless browsers but have rich descriptions via CoinGecko / DexScreener.
+    // name, Twitter) if we have enough to work with.
     const syntheticContent = [
       project.description ?? '',
       project.twitter ? `Twitter: ${project.twitter}` : '',
@@ -348,4 +258,145 @@ export const POST = withErrorHandler(async (req: Request) => {
   // /api/verify/run in a separate request to dispatch claims properly.
 
   return ok({ runId, project, status: 'started' as const });
+}
+
+/**
+ * Server-side orchestrator: discover → dedup → scrape → extract → create claims.
+ *
+ * Accepts either:
+ *   { contractAddress: "0x..." }  — BNB Chain contract address (full on-chain discovery)
+ *   { websiteUrl: "https://..." } — Website URL only (skip on-chain, scrape directly)
+ *
+ * IMPORTANT: This route does NOT dispatch claim workers (fire-and-forget fetch).
+ * On Vercel, fire-and-forget fetches are killed when the Lambda returns its response.
+ * Instead, the dashboard calls /api/verify/run after this route returns to dispatch
+ * claims in a separate Lambda that properly fires off claim workers.
+ */
+export const POST = withErrorHandler(async (req: Request) => {
+  const body            = await (req as NextRequest).json().catch(() => ({}));
+  const contractAddress = (body?.contractAddress ?? '').trim();
+  const websiteUrl      = (body?.websiteUrl      ?? '').trim();
+  const forceReverify   = Boolean(body?.forceReverify);
+
+  if (!contractAddress && !websiteUrl) {
+    return err('contractAddress or websiteUrl is required');
+  }
+
+  // ── URL-only mode ──────────────────────────────────────────────────────────
+  // Skip on-chain validation entirely. Build a synthetic project keyed on
+  // "url:<hostname>" and jump straight to scraping + claim extraction.
+  if (websiteUrl && !contractAddress) {
+    let hostname: string;
+    try {
+      hostname = new URL(websiteUrl).hostname.replace(/^www\./, '');
+    } catch {
+      return err('Invalid website URL — must start with https://');
+    }
+
+    const syntheticCa = `url:${hostname}`;
+
+    const { data: urlProject, error: urlUpsertErr } = await supabase
+      .from('projects')
+      .upsert(
+        {
+          contract_address: syntheticCa,
+          name:             hostname,
+          symbol:           '',
+          website:          websiteUrl,
+          chain:            'web',
+        },
+        { onConflict: 'contract_address' },
+      )
+      .select()
+      .single<DbProject>();
+
+    if (urlUpsertErr || !urlProject) {
+      return err('Failed to save project', 500);
+    }
+
+    console.log(`[orchestrate] URL-only mode: ${websiteUrl} → project ${urlProject.id}`);
+    return handleRunCreation(urlProject, forceReverify);
+  }
+
+  // ── CA mode: discover project via on-chain + aggregators ──────────────────
+  const { validateContract, getTokenMetadata } = await import('@/lib/rpc');
+
+  await validateContract(contractAddress);
+  const { name: tokenName, symbol: tokenSymbol } = await getTokenMetadata(contractAddress);
+
+  // Check if project already exists in DB with enriched data
+  const { data: existingProject } = await supabase
+    .from('projects')
+    .select('*')
+    .eq('contract_address', contractAddress.toLowerCase())
+    .maybeSingle<DbProject>();
+
+  let project: DbProject;
+
+  if (existingProject && existingProject.website && !forceReverify) {
+    // Already enriched — use cached data
+    project = existingProject;
+    console.log(`[orchestrate] Using cached project: ${project.name} (${project.website})`);
+  } else {
+    // Need enrichment — call discover route. This works because discover is a
+    // separate Lambda on Vercel (different function, not self-calling).
+    const origin = new URL((req as NextRequest).url).origin;
+    try {
+      const discoverRes = await fetch(`${origin}/api/project/discover`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contractAddress }),
+      });
+      if (discoverRes.ok) {
+        const discoverData = await discoverRes.json() as { project: DbProject };
+        project = discoverData.project;
+      } else {
+        // Enrichment failed — fall back to basic upsert
+        const { data: upserted, error: upsertErr } = await supabase
+          .from('projects')
+          .upsert(
+            {
+              contract_address: contractAddress.toLowerCase(),
+              name:        tokenName,
+              symbol:      tokenSymbol,
+              website:     existingProject?.website ?? null,
+              twitter:     existingProject?.twitter ?? null,
+              logo_url:    existingProject?.logo_url ?? null,
+              description: existingProject?.description ?? null,
+              chain:       'bsc',
+            },
+            { onConflict: 'contract_address' },
+          )
+          .select()
+          .single<DbProject>();
+
+        if (upsertErr || !upserted) return err('Failed to save project', 500);
+        project = upserted;
+      }
+    } catch (e) {
+      console.warn('[orchestrate] Discover fetch failed, using basic upsert:', e);
+      const { data: upserted, error: upsertErr } = await supabase
+        .from('projects')
+        .upsert(
+          {
+            contract_address: contractAddress.toLowerCase(),
+            name:        tokenName,
+            symbol:      tokenSymbol,
+            website:     existingProject?.website ?? null,
+            twitter:     existingProject?.twitter ?? null,
+            logo_url:    existingProject?.logo_url ?? null,
+            description: existingProject?.description ?? null,
+            chain:       'bsc',
+          },
+          { onConflict: 'contract_address' },
+        )
+        .select()
+        .single<DbProject>();
+
+      if (upsertErr || !upserted) return err('Failed to save project', 500);
+      project = upserted;
+    }
+  }
+
+  return handleRunCreation(project, forceReverify);
 });
