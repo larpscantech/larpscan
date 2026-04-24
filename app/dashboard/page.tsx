@@ -11,7 +11,7 @@ import { InlineLogs } from '@/components/inline-logs';
 import { RecentVerificationsTable } from '@/components/recent-verifications-table';
 import { useLocale } from '@/components/locale-provider';
 import { cn } from '@/lib/utils';
-import type { Phase, ScanType, TokenProject, Claim, Verdict, RecentVerification } from '@/lib/types';
+import type { Phase, TokenProject, Claim, Verdict, RecentVerification } from '@/lib/types';
 import type { DbProject, DbClaim, DbClaimWithEvidence, DbVerificationRun } from '@/lib/db-types';
 
 // ─── Type converters: DB rows → frontend display types ────────────────────────
@@ -155,33 +155,6 @@ function SectionDivider({ label }: { label: string }) {
   );
 }
 
-// ─── Scan selector ────────────────────────────────────────────────────────────
-
-function ScanSelector({ value, onChange }: { value: ScanType; onChange: (v: ScanType) => void }) {
-  const { locale } = useLocale();
-  const isZh = locale === 'zh-TW';
-  return (
-    <div className="flex gap-0.5 p-1 rounded-sm bg-[#0a0a0d] border border-[#1c1c22]">
-      {(['full', 'quick'] as const).map((type) => (
-        <button
-          key={type}
-          onClick={() => onChange(type)}
-          className={cn(
-            'px-3.5 py-2 text-[10px] font-semibold uppercase tracking-[0.18em] rounded-sm transition-all duration-150 whitespace-nowrap',
-            value === type
-              ? 'bg-[#1a0707] text-[#f87171] border border-[#b91c1c]/30'
-              : 'text-zinc-600 hover:text-zinc-400',
-          )}
-        >
-          {type === 'full'
-            ? isZh ? '完整掃描' : 'Full Scan'
-            : isZh ? '快速掃描' : 'Quick Scan'}
-        </button>
-      ))}
-    </div>
-  );
-}
-
 // ─── Input mode toggle ────────────────────────────────────────────────────────
 
 type InputMode = 'contract' | 'website';
@@ -215,11 +188,10 @@ function InputModeToggle({ value, onChange }: { value: InputMode; onChange: (v: 
 
 function ContractRow({
   value, onChange, onSubmit, isLoading,
-  scanType, onScanTypeChange, forceReverify, onForceReverifyChange,
+  forceReverify, onForceReverifyChange,
   inputMode, onInputModeChange,
 }: {
   value: string; onChange: (v: string) => void; onSubmit: () => void; isLoading: boolean;
-  scanType: ScanType; onScanTypeChange: (v: ScanType) => void;
   forceReverify: boolean; onForceReverifyChange: (v: boolean) => void;
   inputMode: InputMode; onInputModeChange: (v: InputMode) => void;
 }) {
@@ -235,7 +207,6 @@ function ContractRow({
     <div className="mb-12">
       <div className="flex items-center gap-3 mb-3">
         <InputModeToggle value={inputMode} onChange={onInputModeChange} />
-        <ScanSelector value={scanType} onChange={onScanTypeChange} />
         <div className="flex-1 relative">
           {isUrl ? (
             <Globe className="absolute left-3.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-700 pointer-events-none" />
@@ -467,7 +438,6 @@ export default function DashboardPage() {
   const [pageEntered, setPageEntered] = useState(false);
   // ── Input state ─────────────────────────────────────────────────────────────
   const [input, setInput]               = useState('');
-  const [scanType, setScanType]         = useState<ScanType>('full');
   const [forceReverify, setForceReverify] = useState(false);
   const [inputMode, setInputMode]       = useState<InputMode>('contract');
 
@@ -1268,8 +1238,6 @@ export default function DashboardPage() {
               onChange={setInput}
               onSubmit={handleSubmit}
               isLoading={isRunning}
-              scanType={scanType}
-              onScanTypeChange={setScanType}
               forceReverify={forceReverify}
               onForceReverifyChange={setForceReverify}
               inputMode={inputMode}
