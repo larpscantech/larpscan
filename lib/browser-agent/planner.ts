@@ -561,7 +561,14 @@ If a field explicitly expects a 0x wallet address as fee recipient, use fill_inp
 
     case 'DEX_SWAP':
     case 'ui+rpc':
-      return 'PRIORITY: Navigate to the swap/exchange surface → show the swap form is present and interactive → identify token selectors and amount inputs (stop before executing any swap).';
+      return `PRIORITY — execute a real buy/sell transaction on the DEX.
+1. Look at the available routes — find a path that contains "/token/" or "/trade/" or "/swap/" or "/pair/". Navigate there first. If there are multiple token pages, pick the first one.
+2. Once on the token/trading page, connect the wallet if a "Connect Wallet" button is visible.
+3. Find the trade form: an amount input (BNB, ETH, amount, "you pay") and a "Buy" or "Swap" button.
+4. Click on the "Buy" tab if present, then fill the amount input with the value 0.01.
+5. Click the "Buy" or "Swap" button immediately — do NOT stop before clicking. This triggers the on-chain transaction. The wallet will sign silently.
+6. After clicking, wait 2–3 seconds to observe the result (tx hash, success toast, or error).
+IMPORTANT: You MUST click the buy/swap button. Do not stop at filling the form.${connectedWallet ? `\nWALLET CONNECTED: ${connectedWallet}` : ''}`;
 
     case 'WALLET_FLOW':
     case 'wallet+rpc':

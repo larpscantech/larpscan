@@ -1874,6 +1874,13 @@ export async function executeSteps(
     try { await performStep(page, effectiveStep, baseDomain, options?.investigationWalletAddress, options?.featureType); stepSucceeded = true; } catch (e) { console.error('[executor] ReAct step error:', e); }
     if (stepSucceeded && (effectiveStep.action === 'click_text' || effectiveStep.action === 'click_selector')) { await page.waitForTimeout(1_500); loadingTriggered = await waitForPageStable(page); if (loadingTriggered) { await page.evaluate(() => window.scrollBy({ top: 400, behavior: 'smooth' })).catch(() => {}); await page.waitForTimeout(600); } } else if (stepSucceeded) { await page.waitForTimeout(1_000); }
     const urlAfter = page.url(); const urlChanged = urlAfter !== urlBefore;
+    // Re-establish wallet connection after navigating to a new page.
+    // DEX_SWAP and WALLET_FLOW rely on the wallet being available on every page.
+    if (urlChanged && options?.investigationWalletAddress &&
+        (options?.featureType === 'DEX_SWAP' || options?.featureType === 'ui+rpc' ||
+         options?.featureType === 'WALLET_FLOW' || options?.featureType === 'wallet+rpc')) {
+      await triggerWalletReconnect(page, { waitMs: 1_500 }).catch(() => {});
+    }
     const stepMessages = await capturePageMessages(page); const textAfter = await capturePageText(page);
     const headingsAfter = await getVisibleHeadings(page); const inputsAfter = await getVisibleInputLabels(page);
     // Off-domain guard

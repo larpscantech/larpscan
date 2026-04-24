@@ -10,6 +10,10 @@ import type { DbClaim, DbProject, DbVerificationRun } from '@/lib/db-types';
 export const runtime = 'nodejs';
 export const maxDuration = 540; // Must exceed STUCK_CHECKING_MS (8 min = 480s) with overhead
 
+// Hard wall: abort the browser session well before Vercel kills the whole function.
+// Leaves ~160 s to save evidence, run the verdict pipeline, and update the DB.
+const CLAIM_TIMEOUT_MS = 380_000;
+
 function summarizeBrowserFailure(error: unknown): string {
   const msg = error instanceof Error ? error.message : 'Unknown Playwright error';
   if (/startsWith/i.test(msg) || /Cannot read propert(?:y|ies) of (?:undefined|null)/i.test(msg)) {
@@ -78,11 +82,15 @@ export const POST = withErrorHandler(async (req: Request) => {
   };
 
   try {
-    verifyResult = await routeVerification(
-      project.website,
-      structuredClaim,
-      project.contract_address,
-    );
+    verifyResult = await Promise.race([
+      routeVerification(project.website, structuredClaim, project.contract_address),
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`Claim verification timed out after ${CLAIM_TIMEOUT_MS / 1_000}s`)),
+          CLAIM_TIMEOUT_MS,
+        ),
+      ),
+    ]);
     evidenceSummary   = verifyResult.evidenceSummary;
     screenshotDataUrl = verifyResult.screenshotDataUrl;
     videoUrl          = verifyResult.videoUrl;

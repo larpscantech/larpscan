@@ -49,6 +49,14 @@ function getPlaybookByFeature(featureType: string): FeaturePlaybook {
         ctaKeywords: ['connect', 'claim', 'swap', 'bridge', 'mine', 'start', 'generate', '連接', '領取', '兌換', '挖礦', '開始', '生成'],
         evidenceSignals: ['wallet', 'modal', 'form', 'pre-wallet ui', 'hash', 'worker'],
       };
+    case 'DEX_SWAP':
+    case 'ui+rpc':
+      return {
+        featureType,
+        routeKeywords: ['token', 'trade', 'swap', 'buy', 'sell', 'dex', 'exchange', 'pair', 'market', '交易', '購買', '出售'],
+        ctaKeywords: ['buy', 'sell', 'swap', 'trade', 'purchase', '購買', '出售', '兌換', '交易'],
+        evidenceSignals: ['amount input', 'token selector', 'buy button', 'sell button', 'tx hash', 'wallet connected'],
+      };
     case 'AGENT_LIFECYCLE':
     case 'MULTI_AGENT':
       return {
@@ -157,6 +165,10 @@ export function rankRouteCandidates(
       if (featureType === 'TOKEN_CREATION' && (path.includes('create') || path.includes('launch'))) {
         score += 3;
         reasons.push('creation feature route');
+      }
+      if (featureType === 'DEX_SWAP' && /\/token\/|\/trade\/|\/swap\/|\/pair\/|\/market\//i.test(path)) {
+        score += 5;
+        reasons.push('dex token detail route');
       }
       if (
         featureType !== 'DATA_DASHBOARD' &&

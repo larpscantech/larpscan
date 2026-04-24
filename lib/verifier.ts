@@ -747,6 +747,16 @@ async function recordInteraction(
 
     if (dataAlreadyVisible) {
       console.log('[verifier:record] DATA_DASHBOARD fast path — data visible, skipping agent loop');
+      // Scroll + wait so the recording captures live feed updates (prices, new tokens, etc.)
+      // Without this the video is only ~5 s and shows a static snapshot.
+      try {
+        await page.evaluate(() => window.scrollTo({ top: 400, behavior: 'smooth' }));
+        await page.waitForTimeout(4_000);
+        await page.evaluate(() => window.scrollTo({ top: 800, behavior: 'smooth' }));
+        await page.waitForTimeout(4_000);
+        await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'smooth' }));
+        await page.waitForTimeout(2_000);
+      } catch { /* non-fatal */ }
       // Capture a final screenshot as proof
       try {
         const buf = await page.screenshot({ type: 'jpeg', quality: 65, fullPage: false });
