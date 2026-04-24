@@ -40,7 +40,27 @@ async function handleRunCreation(
   project: DbProject,
   forceReverify: boolean,
 ): Promise<NextResponse> {
-  // ── 2. Check for existing in-progress run ─────────────────────────────────
+  // ── 2a. Force-reverify: close any lingering active runs so they don't block
+  //        the new run from acquiring a dispatch slot (countActiveVerifyingRuns
+  //        would still count stale 'verifying' runs, keeping the queue stuck).
+  if (forceReverify) {
+    const { data: staleRuns } = await supabase
+      .from('verification_runs')
+      .select('id, status, created_at')
+      .eq('project_id', project.id)
+      .in('status', ['pending', 'verifying', 'extracting', 'analyzing', 'queued']);
+
+    if (staleRuns && staleRuns.length > 0) {
+      const ids = staleRuns.map((r) => r.id);
+      await supabase
+        .from('verification_runs')
+        .update({ status: 'failed' })
+        .in('id', ids);
+      console.log(`[orchestrate] Force-reverify: closed ${ids.length} stale run(s) for project ${project.id}`);
+    }
+  }
+
+  // ── 2b. Check for existing in-progress run ────────────────────────────────
   if (!forceReverify) {
     const { data: activeRun } = await supabase
       .from('verification_runs')

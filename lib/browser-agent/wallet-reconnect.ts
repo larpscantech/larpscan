@@ -14,28 +14,31 @@ export async function triggerWalletReconnect(
   opts: { withEip6963?: boolean; waitMs?: number } = {},
 ): Promise<void> {
   const { withEip6963 = true, waitMs = 1_000 } = opts;
+  console.log('[wallet-reconnect] triggerWalletReconnect start, evaluating…');
+  await Promise.race([
+    page.evaluate((fireEip6963: boolean) => {
+      const w = window as unknown as Record<string, unknown>;
 
-  await page.evaluate((fireEip6963: boolean) => {
-    const w = window as unknown as Record<string, unknown>;
+      const eth = w['ethereum'] as
+        | { request?: (a: { method: string; params: unknown[] }) => Promise<unknown> }
+        | undefined;
+      if (eth && typeof eth.request === 'function') {
+        eth.request({ method: 'eth_requestAccounts', params: [] }).catch(() => {});
+      }
 
-    const eth = w['ethereum'] as
-      | { request?: (a: { method: string; params: unknown[] }) => Promise<unknown> }
-      | undefined;
-    if (eth && typeof eth.request === 'function') {
-      eth.request({ method: 'eth_requestAccounts', params: [] }).catch(() => {});
-    }
+      if (typeof w['__larpscanTriggerConnect'] === 'function') {
+        (w['__larpscanTriggerConnect'] as () => void)();
+      }
 
-    if (typeof w['__larpscanTriggerConnect'] === 'function') {
-      (w['__larpscanTriggerConnect'] as () => void)();
-    }
-
-    if (fireEip6963) {
-      window.dispatchEvent(new CustomEvent('eip6963:requestProvider'));
-    }
-  }, withEip6963).catch(() => {});
-
-  if (waitMs > 0) {
-    await page.waitForTimeout(waitMs);
+      if (fireEip6963) {
+        window.dispatchEvent(new CustomEvent('eip6963:requestProvider'));
+      }
+    }, withEip6963).catch(() => {}),
+    new Promise<void>((r) => setTimeout(r, 5_000)),
+  ]);
+  console.log('[wallet-reconnect] triggerWalletReconnect evaluate done, waiting…');
+  if (waitMs > 0 && !page.isClosed()) {
+    await page.waitForTimeout(waitMs).catch(() => {});
   }
 }
 

@@ -38,7 +38,7 @@ export async function dismissConsentBanner(page: Page): Promise<void> {
       const count = await btns.count().catch(() => 0);
       for (let i = 0; i < Math.min(count, 3); i++) {
         const btn = btns.nth(i);
-        const txt = await btn.textContent().catch(() => '');
+        const txt = await btn.textContent({ timeout: 2_000 }).catch(() => '');
         if (REJECT_RE.test(txt ?? '')) continue;
         const vis = await btn.isVisible({ timeout: 1_000 }).catch(() => false);
         if (!vis) continue;
@@ -73,11 +73,15 @@ export async function dismissConsentBanner(page: Page): Promise<void> {
 
     if (hasModal) {
       const DISMISS_RE = /^(ok|okay|got it|close|dismiss|no thanks|skip|continue|not now|maybe later|i understand)\b/i;
-      const dismissBtns = page.locator('button, [role="button"]').filter({ hasText: DISMISS_RE });
+      // Scope to buttons INSIDE modal containers to avoid clicking trading/action buttons on the main page
+      const modalContainers = page.locator(
+        '[role="dialog"], [role="alertdialog"], [class*="modal" i], [class*="popup" i], [class*="overlay" i]',
+      );
+      const dismissBtns = modalContainers.locator('button, [role="button"]').filter({ hasText: DISMISS_RE });
       const dCount = await dismissBtns.count().catch(() => 0);
       for (let i = 0; i < Math.min(dCount, 3); i++) {
         const btn = dismissBtns.nth(i);
-        const txt = await btn.textContent().catch(() => '');
+        const txt = await btn.textContent({ timeout: 2_000 }).catch(() => '');
         const vis = await btn.isVisible({ timeout: 1_000 }).catch(() => false);
         if (!vis) continue;
         await btn.evaluate((el) => (el as HTMLElement).click()).catch(() => {});

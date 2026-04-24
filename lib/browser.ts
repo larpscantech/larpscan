@@ -56,18 +56,32 @@ export async function connectBrowser(opts?: { record?: boolean }): Promise<Brows
   if (wsEndpoint) {
     console.log(`[browser] Connecting to Browserless (CDP, record=${opts?.record ?? false})`);
 
-    // Retry up to 4 times on 429 (Browserless rate limit / capacity)
-    const MAX_RETRIES = 4;
+    // Retry on 429 (Browserless rate limit / capacity).
+    // With 3 claims running concurrently and a plan that allows ~2 sessions,
+    // the 3rd claim will get 429. Retries with increasing back-off — the longest
+    // running claim (DATA_DASHBOARD fast path) takes 30–70s, so by the 3rd or 4th
+    // retry the slot should have freed up.
+    const MAX_RETRIES = 10;
+    const RETRY_DELAYS = [5, 10, 15, 20, 30, 45, 60, 60, 60, 60].map(s => s * 1_000);
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
-        const browser = await playwrightChromium.connectOverCDP(wsEndpoint);
+        // Guard against Browserless accepting the TCP connection but stalling
+        // the CDP handshake indefinitely (not a 429, just silent hang).
+        // 60s is generous — normal connect takes 3-10s.
+        const browser = await Promise.race([
+          playwrightChromium.connectOverCDP(wsEndpoint),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('CDP connect timed out (60s)')), 60_000),
+          ),
+        ]);
         return browser;
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         const is429 = msg.includes('429') || msg.toLowerCase().includes('too many requests');
-        if (is429 && attempt < MAX_RETRIES) {
-          const waitMs = Math.min(5000 * Math.pow(2, attempt), 30_000); // 5s, 10s, 20s, 30s
-          console.warn(`[browser] Browserless 429 — retrying in ${waitMs / 1000}s (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        const isTimeout = msg.includes('CDP connect timed out');
+        if ((is429 || isTimeout) && attempt < MAX_RETRIES) {
+          const waitMs = RETRY_DELAYS[attempt] ?? 60_000;
+          console.warn(`[browser] Browserless ${isTimeout ? 'connect-timeout' : '429'} — retrying in ${waitMs / 1000}s (attempt ${attempt + 1}/${MAX_RETRIES})`);
           await new Promise(r => setTimeout(r, waitMs));
           continue;
         }

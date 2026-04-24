@@ -319,7 +319,17 @@ export async function planWorkflow(
     return [];
   }
 
-  const featureGuidance = buildFeatureGuidance(featureType, strategy, connectedWalletAddress, passConditionPaths);
+  // If the claim is routed as WALLET_FLOW but the text clearly describes
+  // token / agent / NFT creation (deploy/mint/launch/create a token), override
+  // the featureType locally so the agent gets TOKEN_CREATION guidance and is
+  // allowed to submit the form and sign the on-chain transaction.
+  const claimLower = claim.toLowerCase();
+  const isTokenCreationClaim =
+    featureType === 'WALLET_FLOW' &&
+    /(create|launch|deploy|mint)\b.*\b(token|coin|nft|meme|agent)/i.test(claimLower);
+  const effectiveFeatureType = isTokenCreationClaim ? 'TOKEN_CREATION' : featureType;
+
+  const featureGuidance = buildFeatureGuidance(effectiveFeatureType, strategy, connectedWalletAddress, passConditionPaths);
   const playbook = getFeaturePlaybook(featureType);
   const rankedRoutes = rankRouteCandidates(pageState, featureType, claim, undefined, surface);
   const rankedCtas = rankCtaCandidates(pageState, featureType, claim);
@@ -468,6 +478,55 @@ PLANNING RULES (surface-finder mode — the ReAct loop handles interaction):
     }
 
     console.log(`[planner] Plan A: ${steps.length} step(s)`, JSON.stringify(steps, null, 2));
+
+    // ── Emergency fallback for creation features with empty plans ────────────
+    // When analyzePageState times out (e.g. Browserless is under load), routeCandidates
+    // is empty and the LLM generates no steps. For TOKEN_CREATION / WALLET_FLOW we
+    // know we need to navigate to a create-token page — inject a best-guess path.
+    if (steps.length === 0) {
+      const isCreationFeature =
+        featureType === 'TOKEN_CREATION' ||
+        featureType === 'WALLET_FLOW' ||
+        featureType === 'wallet+rpc' ||
+        /create.*token|launch.*token|mint.*token|token.*creat|token.*launch/i.test(claim);
+      if (isCreationFeature) {
+        // Derive language prefix from current URL.
+        // Handles both /en/some/path (trailing slash) and bare /en (end of pathname).
+        let langPrefix = '';
+        try {
+          const pn = new URL(pageState.url).pathname;
+          const m = pn.match(/^(\/[a-z]{2}(?:-[a-z]{2,4})?)(?:\/|$)/);
+          if (m) langPrefix = m[1]; // e.g. "/en"
+        } catch { /* ok */ }
+        // Build a prioritised list: language-prefixed paths first, then bare paths.
+        // Deduplicate so we don't generate identical entries when langPrefix is ''.
+        const candidateCreatePaths = [
+          ...(langPrefix ? [
+            `${langPrefix}/create-token`,
+            `${langPrefix}/create`,
+            `${langPrefix}/launch`,
+            `${langPrefix}/new-token`,
+          ] : []),
+          '/en/create-token',  // common default locale for sites like four.meme
+          '/create-token',
+          '/create',
+          '/launch',
+        ].filter((p, i, arr) => arr.indexOf(p) === i);
+        const createPath = candidateCreatePaths.find((p) => {
+          // Prefer paths that match route candidates if available
+          if (pageState.routeCandidates.includes(p)) return true;
+          // Otherwise just use the first candidate (best-effort)
+          return false;
+        }) ?? candidateCreatePaths[0];
+        // Use navigate with the deterministic /en/create-token path.
+        // open_link_text fails when analyzePageState timed out and the DOM
+        // hasn't rendered nav links yet.  navigate falls back to page.goto
+        // which works regardless of DOM state and preserves SIWE cookies.
+        console.log(`[planner] Emergency fallback: navigate "${createPath}" for creation feature`);
+        steps = [{ action: 'navigate', path: createPath }];
+      }
+    }
+
     return steps;
   } catch (e) {
     console.error('[planner] planWorkflow failed:', e);

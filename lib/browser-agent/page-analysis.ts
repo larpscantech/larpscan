@@ -236,33 +236,61 @@ function normaliseHref(href: string, origin: string): string | null {
 
 export async function capturePageText(page: Page): Promise<string> {
   try {
-    const raw = await page.evaluate(() => {
-      const clone = document.body.cloneNode(true) as HTMLElement;
+    // ── JS evaluation attempt (8s internal timer) ────────────────────────────
+    // On heavy SPAs (e.g. four.meme) the JS context can be too busy to respond.
+    // Wrap page.evaluate in a race so we always fall through to page.content().
+    const raw = await Promise.race([
+      page.evaluate(() => {
+        const clone = document.body.cloneNode(true) as HTMLElement;
 
-      // Remove non-content elements
-      clone.querySelectorAll('script,style,noscript,svg,img,video,canvas').forEach((el) => el.remove());
+        // Remove non-content elements
+        clone.querySelectorAll('script,style,noscript,svg,img,video,canvas').forEach((el) => el.remove());
 
-      // Remove Next.js / React error overlays — these render full JS stack traces
-      // in the DOM and pollute the page text with "Cannot read properties of
-      // undefined" etc., causing the verdict LLM to incorrectly flag the site as broken.
-      clone.querySelectorAll([
-        'nextjs-portal',                       // Next.js 13+ error overlay host
-        '[data-nextjs-dialog]',
-        '[data-nextjs-errors]',
-        '#__NEXT_DATA_ERRORS__',
-        '.__next-error-overlay',
-        '.nextjs-container-errors-header',
-        '.nextjs-container-errors',
-        '[class*="nextjs-toast-errors"]',
-        '[id*="__next_error"]',
-        '[id*="webpack-dev-server-client-overlay"]',
-        'vite-error-overlay',                  // Vite error overlay
-        '#vite-error-overlay',
-      ].join(',')).forEach((el) => el.remove());
+        // Remove Next.js / React error overlays — these render full JS stack traces
+        // in the DOM and pollute the page text with "Cannot read properties of
+        // undefined" etc., causing the verdict LLM to incorrectly flag the site as broken.
+        clone.querySelectorAll([
+          'nextjs-portal',                       // Next.js 13+ error overlay host
+          '[data-nextjs-dialog]',
+          '[data-nextjs-errors]',
+          '#__NEXT_DATA_ERRORS__',
+          '.__next-error-overlay',
+          '.nextjs-container-errors-header',
+          '.nextjs-container-errors',
+          '[class*="nextjs-toast-errors"]',
+          '[id*="__next_error"]',
+          '[id*="webpack-dev-server-client-overlay"]',
+          'vite-error-overlay',                  // Vite error overlay
+          '#vite-error-overlay',
+        ].join(',')).forEach((el) => el.remove());
 
-      return (clone as HTMLElement).innerText ?? '';
-    });
-    return raw.replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim().slice(0, 6000);
+        return (clone as HTMLElement).innerText ?? '';
+      }).catch(() => ''),
+      new Promise<string>((r) => setTimeout(() => r(''), 8_000)),
+    ]);
+    const clean = raw.replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim().slice(0, 6000);
+    if (clean.length > 20) return clean;
+
+    // ── HTML fallback ─────────────────────────────────────────────────────────
+    // On heavy SPAs (e.g. four.meme) the JS context can be too busy to return
+    // innerText. Fall back to page.content() which uses a different CDP path
+    // (DOM.getOuterHTML) and does not require JS evaluation.
+    const html = await page.content().catch(() => '');
+    if (!html) return clean;
+    // Strip HTML tags and decode entities to produce readable text
+    const stripped = html
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/\s{2,}/g, ' ')
+      .trim()
+      .slice(0, 6000);
+    return stripped;
   } catch {
     return '';
   }
@@ -307,25 +335,59 @@ export async function analyzePageState(
   const title = await page.title().catch(() => '');
 
   // ── Visible text ──────────────────────────────────────────────────────────
-  const visibleText = await capturePageText(page);
+  const visibleText = await capturePageText(page);  // already has 8s JS + content() fallback
+
+  // ── Get page HTML once for subsequent parsing (avoids repeated evaluate hangs) ─
+  // page.content() uses DOM.getOuterHTML which doesn't need JS evaluation,
+  // so it works even when the Chromium V8 isolate is busy.
+  const pageHtml = await page.content().catch(() => '');
+
+  // Helper: run $$eval with a 5s timeout fallback
+  async function safeEval<T>(selector: string, fn: (els: Element[]) => T, fallback: T): Promise<T> {
+    return Promise.race([
+      (page.$$eval(selector, fn as Parameters<typeof page.$$eval>[1]) as Promise<T>).catch(() => fallback),
+      new Promise<T>((r) => setTimeout(() => r(fallback), 5_000)),
+    ]);
+  }
 
   // ── Nav links ─────────────────────────────────────────────────────────────
-  const navLinks = await page.$$eval(
+  let navLinks = await safeEval(
     'nav a[href], header a[href]',
     (els) => els.map((el) => ({
       text: (el.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 60),
-      href: el.getAttribute('href') ?? undefined,
+      href: (el as HTMLAnchorElement).getAttribute('href') ?? undefined,
     })).filter((e) => e.text.length > 0),
-  ).catch(() => [] as { text: string; href?: string }[]);
+    [] as { text: string; href?: string }[],
+  );
 
   // ── All links ─────────────────────────────────────────────────────────────
-  const allLinks = await page.$$eval(
+  let allLinks = await safeEval(
     'a[href]',
     (els) => els.map((el) => ({
       text: (el.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 60),
-      href: el.getAttribute('href') ?? '',
-    })).filter((e) => e.text.length > 0 && e.href.length > 0),
-  ).catch(() => [] as { text: string; href: string }[]);
+      href: (el as HTMLAnchorElement).getAttribute('href') ?? '',
+    })).filter((e) => e.text.length > 0 && (e as { href: string }).href.length > 0),
+    [] as { text: string; href: string }[],
+  );
+
+  // ── HTML fallback for links ────────────────────────────────────────────────
+  // If both navLinks and allLinks came back empty ($$eval hung/timed out),
+  // parse href anchors from the raw HTML string instead.
+  if (navLinks.length === 0 && allLinks.length === 0 && pageHtml) {
+    const hrefRe = /<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    let m: RegExpExecArray | null;
+    const extractedLinks: { text: string; href: string }[] = [];
+    while ((m = hrefRe.exec(pageHtml)) !== null) {
+      const href = m[1].trim();
+      const text = (m[2] ?? '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60);
+      if (href && text) extractedLinks.push({ text, href });
+    }
+    allLinks = extractedLinks;
+    // Approximate nav links: entries with simple path hrefs (no query/fragment)
+    navLinks = extractedLinks
+      .filter(({ href }) => href.startsWith('/') && !href.includes('?') && !href.includes('#'))
+      .map(({ text, href }) => ({ text, href }));
+  }
 
   const links = allLinks.map(({ text, href }) => ({ text, href }));
 

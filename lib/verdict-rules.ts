@@ -989,6 +989,14 @@ const rule9: Rule = {
       console.log(`[verdict:l1] Rule 9 skipped: DATA_DASHBOARD with ${signals.ownDomainApiCalls.length} own-domain API calls — page is live, deferring to Rule 4`);
       return null;
     }
+    // For any feature type: if there was significant own-domain API activity (≥ 8 calls),
+    // the page was clearly live and the page_broken flag is a false positive caused by
+    // the hard-session kill closing the page before the final snapshot could be taken.
+    // Return null here so the verdict falls through to a more appropriate rule.
+    if (signals.ownDomainApiCalls.length >= 8) {
+      console.log(`[verdict:l1] Rule 9 skipped: ${signals.ownDomainApiCalls.length} own-domain API calls confirm page was live — page_broken is a post-kill false positive`);
+      return null;
+    }
     console.log('[verdict] Rule 9 MATCH — site unreachable (page_broken/SSL error)');
     return {
       resolved:      true,

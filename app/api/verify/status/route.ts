@@ -5,7 +5,7 @@ import { ok, err, withErrorHandler } from '@/lib/api-helpers';
 import { countActiveVerifyingRuns, dispatchClaimsForRun, MAX_CONCURRENT_RUNS } from '@/lib/claim-dispatcher';
 import type { DbVerificationRun, DbAgentLog, DbClaimWithEvidence, DbProject } from '@/lib/db-types';
 
-const STUCK_CHECKING_MS = 10 * 60 * 1000; // 10 min — generous for slow pages like bnbshare.fun
+const STUCK_CHECKING_MS = 15 * 60 * 1000; // 15 min — TOKEN_CREATION can take up to 12 min (Browserless retries + 6 min session)
 
 function claimStartTimes(logs: DbAgentLog[]): Map<string, number> {
   const map = new Map<string, number>();

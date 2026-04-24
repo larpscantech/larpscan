@@ -473,6 +473,10 @@ async function recordInteraction(
   recordingsDir: string,
   sessionId:     string,
   runMemory:     RunMemory,
+  // Hard upper bound on the entire browser session — when reached the browser
+  // is forcefully closed so the Browserless connection slot is freed even if
+  // the outer Promise.race in the claim route already abandoned this function.
+  maxSessionMs = 450_000,
 ): Promise<RecordingResult> {
   const probes: string[] = [];
   let videoUrl: string | undefined;
@@ -490,6 +494,15 @@ async function recordInteraction(
 
   const useBrowserless = isBrowserlessMode();
   const browser = await connectBrowser({ record: useBrowserless });
+
+  // Hard session kill — fires maxSessionMs after the browser connects.
+  // Ensures the Browserless slot is freed even when the outer Promise.race
+  // in the claim route has already abandoned this function (zombie prevention).
+  // clearTimeout(sessionKillTimer) is called in the finally block below.
+  const sessionKillTimer = setTimeout(() => {
+    console.warn(`[verifier:record] Hard session kill after ${maxSessionMs / 1_000}s — closing Browserless connection`);
+    browser.close().catch(() => {});
+  }, maxSessionMs);
 
   let context: Awaited<ReturnType<typeof browser.newContext>> | null = null;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- CDP session for Browserless recording
@@ -594,9 +607,9 @@ async function recordInteraction(
     // Check HTTP status + Cloudflare BEFORE starting the recording so we never
     // waste a recording session on a blocked or unreachable page.
     console.log(`[verifier:record] Navigating to ${baseUrl} (baseDomain: ${baseDomain})`);
-    let navResp = await page.goto(baseUrl, { waitUntil: 'load', timeout: 15_000 }).catch(() => null);
+    let navResp = await page.goto(baseUrl, { waitUntil: 'load', timeout: 30_000 }).catch(() => null);
     if (!navResp) {
-      navResp = await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 10_000 }).catch(() => null);
+      navResp = await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 }).catch(() => null);
     }
 
     if (!navResp) {
@@ -613,7 +626,12 @@ async function recordInteraction(
     }
 
     // Cloudflare / bot protection check — bail out before recording starts
-    const bodyRaw = await page.textContent('body').catch(() => '') ?? '';
+    // Use a 5s timeout — on heavy SPAs the body may not be queryable yet,
+    // but we don't want to hang here waiting for a layout-ready main thread.
+    const bodyRaw = await Promise.race([
+      page.textContent('body').catch(() => ''),
+      new Promise<string>((r) => setTimeout(() => r(''), 5_000)),
+    ]) ?? '';
     if (
       bodyRaw.includes('Just a moment') ||
       bodyRaw.includes('Checking your browser') ||
@@ -629,7 +647,12 @@ async function recordInteraction(
     // within the same browser session instead of opening a new connection.
     let effectiveBaseUrl = baseUrl;
     if (surface && surface !== '/' && baseUrl !== homepageUrl) {
-      const pageText = await page.evaluate(() => (document.body as HTMLElement).innerText ?? '').catch(() => '');
+      // page.evaluate has no built-in timeout — add a 5s race guard so a
+      // busy SPA main thread doesn't stall the session here.
+      const pageText = await Promise.race([
+        page.evaluate(() => (document.body as HTMLElement).innerText ?? '').catch(() => ''),
+        new Promise<string>((r) => setTimeout(() => r(''), 5_000)),
+      ]);
       const isLoginWall = /sign in|log in|connect wallet|wallet required/i.test(pageText);
       const isUnreachable =
         !isLoginWall &&
@@ -655,9 +678,17 @@ async function recordInteraction(
 
     // Start CDP recording AFTER the page has loaded and rendered so the video
     // begins with the actual site content instead of a blank white page.
+    // context.newCDPSession can hang indefinitely on CPU-heavy SPAs (e.g.
+    // four.meme) because Chrome's main thread is saturated and CDP messages
+    // queue up without replies. Guard with a hard 10-second timeout.
     if (enableRecording) {
       try {
-        cdpSession = await context.newCDPSession(page);
+        cdpSession = await Promise.race([
+          context.newCDPSession(page),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('CDP session creation timed out (10s)')), 10_000),
+          ),
+        ]);
         await cdpSession.send('Browserless.startRecording');
         recordingStartMs = Date.now();
         console.log('[verifier:record] CDP recording started (post-navigation)');
@@ -672,16 +703,32 @@ async function recordInteraction(
     // ── Dismiss cookie / GDPR consent banners ────────────────────────────────
     // Many sites show a consent overlay that blocks all interaction until
     // accepted. Dismiss it before wallet connect or any agent steps.
-    await dismissConsentBanner(page);
+    // Cap to 10 s — on heavy SPAs (four.meme) page.evaluate inside this
+    // function can hang if the browser main thread is saturated.
+    await Promise.race([
+      dismissConsentBanner(page),
+      new Promise<void>((r) => setTimeout(r, 10_000)),
+    ]);
 
     // ── Early wallet connect — before planning ────────────────────────────
     // Connect the investigation wallet as soon as the page loads so the
     // planner sees the post-connection DOM state (unlocked forms, hidden CTAs).
     // DATA_DASHBOARD claims are read-only — no wallet needed, skip entirely.
+    // Cap to 45 s — heavy SPAs (four.meme, etc.) have a busy JS main thread
+    // that makes each page.evaluate inside handleWalletPopups very slow. If
+    // we let this run indefinitely it consumes the whole 340 s session budget.
     if (walletEnabled && walletAddress && featureType !== 'DATA_DASHBOARD') {
-      const earlyWallet = await handleWalletPopups(
-        page, walletAddress, walletPolicy, featureType, 'recon', spentEtherThisRun,
-      );
+      const earlyWallet = await Promise.race([
+        handleWalletPopups(
+          page, walletAddress, walletPolicy, featureType, 'recon', spentEtherThisRun,
+        ),
+        new Promise<Awaited<ReturnType<typeof handleWalletPopups>>>((resolve) =>
+          setTimeout(
+            () => resolve({ detectedRequests: [], walletConnected: false, rejectedRequests: [], log: ['[wallet] Early connect timed out (45 s) — proceeding to agent'] }),
+            45_000,
+          ),
+        ),
+      ]);
       allWalletLogs.push(...earlyWallet.log);
       allDetectedRequests.push(...earlyWallet.detectedRequests);
       allRejectedRequests.push(...earlyWallet.rejectedRequests);
@@ -698,6 +745,14 @@ async function recordInteraction(
     // Wait for the DOM to hydrate before snapshotting — prevents false empty
     // forms/buttons on SPAs that render after JS runs.
     await waitForPageStability(page);
+    // Extra settle time after a wallet sign event — four.meme and similar SPAs
+    // trigger a full re-render after connecting a wallet (wagmi/RainbowKit state
+    // propagation). page.evaluate() calls queue behind that render, causing
+    // analyzePageState to time out with empty routes. A brief pause here allows
+    // the re-render to complete before we snapshot the DOM.
+    if (walletConnectedAny) {
+      await page.waitForTimeout(3_000);
+    }
     // Set a short evaluation timeout so page.evaluate() calls in analyzePageState
     // complete quickly on pages with busy JS threads (live polling, wallet init).
     // Without this, each of the 16 evaluate() calls could hang indefinitely.
@@ -708,11 +763,15 @@ async function recordInteraction(
         walletConnectedAny ? walletAddress ?? undefined : undefined,
       ),
       new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('[verifier] analyzePageState timeout (15s)')), 15_000),
+        setTimeout(() => reject(new Error('[verifier] analyzePageState timeout (25s)')), 25_000),
       ),
     ]).catch((err) => {
       console.warn('[verifier:record] Phase 1 page analysis timed out — using empty state:', String(err).slice(0, 120));
-      return emptyPageState;
+      // Use the actual redirected URL (e.g. four.meme redirects / → /en).
+      // This is critical for the planner's emergency fallback to derive the
+      // correct language prefix (e.g. /en/create-token instead of /create-token).
+      const actualUrl = page.isClosed() ? baseUrl : (page.url() || baseUrl);
+      return { ...emptyPageState, url: actualUrl };
     });
     page.setDefaultTimeout(20_000);
     pageState.apiSignals = [...runApiCalls];
@@ -1038,6 +1097,9 @@ async function recordInteraction(
     console.log(`[verifier:record] Total steps: ${allObservations.length}, API calls: ${runApiCalls.length}`);
 
   } finally {
+    // Cancel the hard session kill timer — the session ended normally.
+    clearTimeout(sessionKillTimer);
+
     // Use the early-captured recording buffer if available (stopped right
     // after agent finished). Fall back to stopping now if early stop failed.
     let rawBuffer: Buffer | null = earlyRecordingBuffer;
@@ -1164,6 +1226,14 @@ export async function verifyClaim(
     : path.join(process.cwd(), 'public', 'recordings');
   await fs.mkdir(recordingsDir, { recursive: true });
 
+  // WALLET_FLOW / TOKEN_CREATION claims get a larger session budget: they need
+  // to navigate to a create-token page, fill a multi-field form, and await a
+  // BSC transaction — all within a single Browserless session.  The Vercel
+  // maxDuration is 540 s, so cap just below that.
+  const maxSessionMs = (effectiveFeature === 'WALLET_FLOW' || effectiveFeature === 'TOKEN_CREATION')
+    ? 510_000
+    : 450_000;
+
   const recording = await recordInteraction(
     startUrl,
     baseUrl,
@@ -1176,6 +1246,7 @@ export async function verifyClaim(
     recordingsDir,
     sessionId,
     createRunMemory(),
+    maxSessionMs,
   );
 
   // Early exit if the inline analysis found the site unreachable or blocked

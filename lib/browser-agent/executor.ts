@@ -132,7 +132,8 @@ async function getFormProgressSnapshot(page: Page): Promise<FormProgressSnapshot
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function capturePageMessages(page: Page): Promise<PageMessage[]> {
-  const raw = await page.evaluate((): { type: string; text: string }[] => {
+  const raw = await Promise.race([
+    page.evaluate((): { type: string; text: string }[] => {
     const seen  = new Set<string>();
     const out:  { type: string; text: string }[] = [];
 
@@ -189,7 +190,9 @@ async function capturePageMessages(page: Page): Promise<PageMessage[]> {
     }
 
     return out.slice(0, 6);
-  }).catch(() => [] as { type: string; text: string }[]);
+  }).catch(() => [] as { type: string; text: string }[]),
+    new Promise<{ type: string; text: string }[]>((r) => setTimeout(() => r([]), 6_000)),
+  ]).catch(() => [] as { type: string; text: string }[]);
   return (raw as PageMessage[]);
 }
 
@@ -1208,7 +1211,8 @@ function isPassConditionMet(
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function findFormSubmitButton(page: Page, includePreview = false): Promise<string | null> {
-  return page.evaluate((withPreview: boolean) => {
+  return Promise.race([
+    page.evaluate((withPreview: boolean) => {
     // Primary submit actions — always checked
     const submitRe = /^(create|launch|deploy|mint|submit|build|publish|confirm|proceed|start)\b/i;
     // Secondary / preview-step buttons — checked when includePreview is true
@@ -1241,7 +1245,9 @@ async function findFormSubmitButton(page: Page, includePreview = false): Promise
     const allBtns = getVisibleBtns(document);
     const match = allBtns.find((el) => matchRe.test((el.textContent ?? '').trim()));
     return match ? (match.textContent ?? '').trim().slice(0, 60) : null;
-  }, includePreview).catch(() => null);
+  }, includePreview).catch(() => null),
+    new Promise<null>((r) => setTimeout(() => r(null), 6_000)),
+  ]).catch(() => null);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1380,6 +1386,7 @@ export async function executeSteps(
   }
 
   // ── Phase 1: Execute initial planned steps (navigation to surface) ──────
+  let lastAugmentedText = ''; // tracks page text from the most recent planned step
   for (const plannedStep of [...stepsToRun]) {
     if (observations.length >= STEP_BUDGET) break;
     const effectiveStep = applyFillInputSubstitutions(plannedStep, options);
@@ -1387,17 +1394,113 @@ export async function executeSteps(
     const urlBefore = page.url();
     let pStepOk = false;
     try { await performStep(page, effectiveStep, baseDomain, options?.investigationWalletAddress, options?.featureType); pStepOk = true; } catch (e) { console.error('[executor] Planned step error:', e); }
-    if (pStepOk && (effectiveStep.action === 'click_text' || effectiveStep.action === 'click_selector')) { await page.waitForTimeout(1_500); await waitForPageStable(page); } else if (pStepOk) { await page.waitForTimeout(1_000); }
+    console.log(`[executor] Planned step done: ok=${pStepOk} url=${page.url().slice(0, 80)}`);
     const pUrlAfter = page.url(); const pUrlChanged = pUrlAfter !== urlBefore;
-    const pMsgs = await capturePageMessages(page); const pText = await capturePageText(page);
-    const pObs: AgentObservation = { step: stepLabel(effectiveStep), isNoop: !pStepOk, result: pStepOk ? 'ok' : 'error', stage: options?.stage ?? 'execution', url: pUrlAfter, urlChanged: pUrlChanged, messages: pMsgs.length ? pMsgs : undefined, pageText: pText.slice(0, 400) };
+    if (pStepOk && (effectiveStep.action === 'click_text' || effectiveStep.action === 'click_selector')) { await page.waitForTimeout(1_500); await waitForPageStable(page); } else if (pStepOk) {
+      // For navigate steps that changed the URL, wait longer (up to 5s) to
+      // allow heavy SPAs like four.meme to fully render their form content.
+      await page.waitForTimeout(pUrlChanged ? 5_000 : 1_000);
+      // If we navigated to a new page, wait up to 15s for at least one input
+      // or interactive element to appear before we try to read page text.  On
+      // heavy SPAs the React tree is mounted asynchronously; without this wait
+      // capturePageText returns "" and the LLM has no context.
+      if (pUrlChanged) {
+        await page.waitForSelector(
+          'input:visible, textarea:visible, [contenteditable="true"]:visible, [role="textbox"]:visible',
+          { timeout: 15_000 },
+        ).catch(() => null);
+      }
+    }
+    console.log(`[executor] Planned step post-wait: capturing page text…`);
+    const [pMsgs, pText] = await Promise.race([
+      Promise.all([capturePageMessages(page), capturePageText(page)]),
+      // 15s window — heavy SPAs like four.meme can take 10+ seconds to render
+      // their JS-driven form content after navigation. Returning early with empty
+      // strings forces the agent to operate blind, producing wrong selectors.
+      new Promise<[PageMessage[], string]>((r) => setTimeout(() => r([[], '']), 15_000)),
+    ]).catch(() => [[] as PageMessage[], ''] as [PageMessage[], string]);
+    console.log(`[executor] Planned step text captured: ${pText.length} chars`);
+
+    // ── Retry for empty text after navigation ──────────────────────────────
+    // If capturePageText returned nothing after a URL change (heavy SPA not yet
+    // rendered), wait 10s more and retry once.  four.meme/en/create-token can
+    // take 15-25s to render form content after React client-side navigation.
+    let pTextFinal = pText;
+    if (pUrlChanged && pText.length === 0 && !page.isClosed()) {
+      console.log('[executor] Page text empty after nav — waiting 10s and retrying capturePageText…');
+      await page.waitForTimeout(10_000).catch(() => {});
+      const [, retryText] = await Promise.race([
+        Promise.all([capturePageMessages(page), capturePageText(page)]),
+        new Promise<[PageMessage[], string]>((r) => setTimeout(() => r([[], '']), 12_000)),
+      ]).catch(() => [[] as PageMessage[], ''] as [PageMessage[], string]);
+      if (retryText.length > 0) {
+        console.log(`[executor] Retry captured: ${retryText.length} chars`);
+        pTextFinal = retryText;
+      }
+    }
+
+    // ── Locator-based fallback ─────────────────────────────────────────────
+    // If capturePageText returned nothing (heavy SPA blocked page.evaluate),
+    // do a SINGLE $$eval call (one CDP round-trip, 8s timeout) to gather all
+    // visible field/button metadata in one shot. This avoids the N×getAttribute
+    // loop that could hang for 300+ seconds on busy Browserless sessions.
+    let augmentedText = pTextFinal;
+    if (augmentedText.length < 50 && pUrlChanged) {
+      try {
+        type FieldInfo = { tag: string; name: string | null; id: string | null; type: string | null; placeholder: string | null; ariaLabel: string | null };
+        type BtnInfo   = { text: string };
+        const [fields, buttons] = await Promise.race([
+          Promise.all([
+            page.$$eval(
+              'input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, [contenteditable="true"]',
+              (els) => (els as HTMLElement[]).slice(0, 20).map((el) => ({
+                tag: el.tagName.toLowerCase(),
+                name: (el as HTMLInputElement).name || null,
+                id: el.id || null,
+                type: (el as HTMLInputElement).type || null,
+                placeholder: (el as HTMLInputElement).placeholder || null,
+                ariaLabel: el.getAttribute('aria-label'),
+              })) as FieldInfo[],
+            ).catch((): FieldInfo[] => []),
+            page.$$eval(
+              'button, [role="button"]',
+              (els) => (els as HTMLElement[]).slice(0, 10).map((el) => ({
+                text: (el.textContent ?? '').trim().slice(0, 40),
+              })).filter((b) => b.text) as BtnInfo[],
+            ).catch((): BtnInfo[] => []),
+          ]),
+          new Promise<[FieldInfo[], BtnInfo[]]>((r) => setTimeout(() => r([[], []]), 8_000)),
+        ]);
+
+        if (fields.length > 0 || buttons.length > 0) {
+          const fieldLines = fields.map((f, i) =>
+            `[field ${i}] tag=${f.tag}` +
+            (f.name ? ` name="${f.name}"` : '') +
+            (f.id ? ` id="${f.id}"` : '') +
+            (f.type ? ` type="${f.type}"` : '') +
+            (f.placeholder ? ` placeholder="${f.placeholder}"` : '') +
+            (f.ariaLabel ? ` aria-label="${f.ariaLabel}"` : ''),
+          );
+          augmentedText = [
+            `[Form fields detected via $$eval on ${page.url()}]`,
+            ...fieldLines,
+            buttons.length ? `[Buttons: ${buttons.map((b) => b.text).join(' | ')}]` : '',
+          ].filter(Boolean).join('\n');
+          console.log(`[executor] Locator fallback ($$eval): ${fields.length} inputs, ${buttons.length} buttons`);
+        }
+      } catch (e) {
+        console.warn('[executor] Locator fallback failed:', e);
+      }
+    }
+    const pObs: AgentObservation = { step: stepLabel(effectiveStep), isNoop: !pStepOk, result: pStepOk ? 'ok' : 'error', stage: options?.stage ?? 'execution', url: pUrlAfter, urlChanged: pUrlChanged, messages: pMsgs.length ? pMsgs : undefined, pageText: augmentedText.slice(0, 400) };
     pObs.narrative = buildStepNarrative(pObs); runningNarratives.push(pObs.narrative ?? '');
     if (pObs.narrative && options?.recordingStartMs) { narrationSegments.push({ text: buildVoiceoverNarrative(pObs), timestampMs: Math.max(0, Date.now() - options.recordingStartMs) }); }
     observations.push(pObs);
     agentMemory = updateMemory(agentMemory, { action: effectiveStep.action, target: 'selector' in effectiveStep ? (effectiveStep as { selector: string }).selector : ('text' in effectiveStep ? (effectiveStep as { text: string }).text : undefined), value: 'value' in effectiveStep ? (effectiveStep as { value: string }).value : undefined, success: pStepOk, noop: !pStepOk, urlChanged: pUrlChanged, newUrl: pUrlChanged ? pUrlAfter : undefined, pageMessages: pMsgs.map((m) => ({ type: m.type, text: m.text })), visibleErrors: pMsgs.filter((m) => m.type === 'error').map((m) => m.text) });
-    let pBlocker = detectBlockerFromText(pText);
+    let pBlocker = detectBlockerFromText(augmentedText);
     if (pBlocker === 'wallet_required' && options?.investigationWalletAddress) { const reconnected = await autoReconnectWallet(page, options.investigationWalletAddress); if (reconnected) pBlocker = undefined; }
     if ((pBlocker === 'auth_required' || pBlocker === 'bot_protection') && (await getVisibleInputLabels(page)).length === 0) { return { observations, stopReason: 'blocker', consecutiveNoops, narrationSegments }; }
+    lastAugmentedText = augmentedText; // capture for post-loop batch fill guard
   }
 
   // ── Batch form fill for TOKEN_CREATION and WALLET_FLOW creation forms (Change G) ──
@@ -1410,16 +1513,29 @@ export async function executeSteps(
   const isCreationClaim = options?.featureType === 'TOKEN_CREATION' || options?.featureType === 'form+browser'
     || options?.featureType === 'WALLET_FLOW' || options?.featureType === 'wallet+rpc';
   let creationFormWasFilled = false; // set to true when batch fill runs on a creation form
-  const walletConnectUiVisible = isCreationClaim && await page.evaluate(() => {
-    const labels = ['connect wallet', 'connect a wallet', 'continue with a wallet', 'link wallet', 'sign in with wallet'];
-    const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
-    return btns.some((el) => {
-      const t = (el.textContent ?? '').toLowerCase().trim();
-      const r = (el as HTMLElement).getBoundingClientRect();
-      const s = window.getComputedStyle(el as HTMLElement);
-      return labels.some((l) => t.includes(l)) && r.width > 0 && s.display !== 'none';
-    });
-  }).catch(() => false);
+
+  // Fast-exit: if page text is completely empty after the planned step AND the
+  // augmented $$eval also found nothing, the page is broken/unloaded.  Running
+  // the batch form fill would fire N×4s locator timeouts — potentially consuming
+  // 100+ seconds before the ReAct loop even starts.  Skip directly to ReAct.
+  const pageIsEmpty = lastAugmentedText.length === 0;
+  if (isCreationClaim && pageIsEmpty) {
+    console.log('[executor] Page text empty after planned step — skipping batch fill, going straight to ReAct loop');
+  }
+
+  const walletConnectUiVisible = isCreationClaim && !pageIsEmpty && await Promise.race([
+    page.evaluate(() => {
+      const labels = ['connect wallet', 'connect a wallet', 'continue with a wallet', 'link wallet', 'sign in with wallet'];
+      const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+      return btns.some((el) => {
+        const t = (el.textContent ?? '').toLowerCase().trim();
+        const r = (el as HTMLElement).getBoundingClientRect();
+        const s = window.getComputedStyle(el as HTMLElement);
+        return labels.some((l) => t.includes(l)) && r.width > 0 && s.display !== 'none';
+      });
+    }).catch(() => false),
+    new Promise<boolean>((r) => setTimeout(() => r(false), 5_000)),
+  ]);
   if (isCreationClaim && walletConnectUiVisible) {
     console.log('[executor] Batch fill deferred — wallet connection UI visible, letting ReAct connect wallet first');
   }
@@ -1495,7 +1611,7 @@ export async function executeSteps(
     return '';
   };
 
-  if (isCreationClaim && !walletConnectUiVisible) {
+  if (isCreationClaim && !walletConnectUiVisible && !pageIsEmpty) {
     type RawInput = { placeholder: string; name: string; id: string; value: string; tagName: string; type: string; selector: string };
     const visibleInputs = await Promise.race([
       page.$$eval(
@@ -1561,7 +1677,8 @@ export async function executeSteps(
     }).catch(() => {});
 
     // JS-level fetch override inside the page: catches any validation call regardless of URL structure
-    await page.evaluate(() => {
+    await Promise.race([
+      page.evaluate(() => {
       const origFetch = window.fetch;
       (window as unknown as Record<string, unknown>)['__origFetch'] ??= origFetch;
       window.fetch = async function fetchOverride(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
@@ -1585,7 +1702,9 @@ export async function executeSteps(
         }
         return (origFetch as typeof window.fetch).call(this, input, init as RequestInit);
       };
-    }).catch(() => {});
+    }).catch(() => {}),
+      new Promise<void>((r) => setTimeout(r, 5_000)),
+    ]).catch(() => {});
 
     // ── Creation form detection (broader than token-only) ───────────────────
     // Covers: token creation, agent deployment, NFT minting, profile creation, etc.
@@ -1814,6 +1933,18 @@ export async function executeSteps(
 
   // ── Phase 2: Pure ReAct loop (observe → decide → act) ──────────────────
   console.log('[executor] Entering ReAct loop');
+  // Bail out immediately if the browser has already been hard-killed (page closed).
+  // Continuing with a closed page just produces N×"Target closed" noops that
+  // result in a false page_broken/untestable verdict.
+  try {
+    const _isPageClosed = page.isClosed();
+    if (_isPageClosed) {
+      console.warn('[executor] ReAct loop: page already closed (hard-kill fired) — skipping');
+      return { observations, stopReason: 'budget', consecutiveNoops, narrationSegments };
+    }
+  } catch {
+    return { observations, stopReason: 'budget', consecutiveNoops, narrationSegments };
+  }
   let reactStepCount = 0;
   // 10 LLM steps × ~25s each = ~250s max per claim — sufficient for BSC tx flows
   const REACT_BUDGET = 10;
@@ -1827,6 +1958,11 @@ export async function executeSteps(
   let lastStepAction: string | undefined;
   let lastStepChangedUrl = true; // force fresh extraction on first iteration
   while (reactStepCount < REACT_BUDGET && observations.length < STEP_BUDGET) {
+    // Bail out if the page was closed mid-loop (e.g. hard-kill fired during an LLM call)
+    if (page.isClosed()) {
+      console.warn('[executor] ReAct loop: page closed mid-loop — stopping');
+      break;
+    }
     // Only re-extract structured state when the page could have structurally changed.
     // Reuse cache after fill_input/scroll with no URL change — saves ~5s per step.
     const needsStateRefresh = lastStepChangedUrl ||
@@ -1881,7 +2017,10 @@ export async function executeSteps(
          options?.featureType === 'WALLET_FLOW' || options?.featureType === 'wallet+rpc')) {
       await triggerWalletReconnect(page, { waitMs: 1_500 }).catch(() => {});
     }
-    const stepMessages = await capturePageMessages(page); const textAfter = await capturePageText(page);
+    const [stepMessages, textAfter] = await Promise.race([
+      Promise.all([capturePageMessages(page), capturePageText(page)]),
+      new Promise<[PageMessage[], string]>((r) => setTimeout(() => r([[], '']), 8_000)),
+    ]).catch(() => [[] as PageMessage[], ''] as [PageMessage[], string]);
     const headingsAfter = await getVisibleHeadings(page); const inputsAfter = await getVisibleInputLabels(page);
     // Off-domain guard
     const bHost = (() => { try { return new URL(baseDomain).hostname.replace(/^www\./, ''); } catch { return ''; } })();
@@ -2180,31 +2319,93 @@ async function performStep(page: Page, step: AgentStep, baseDomain: string, wall
     case 'navigate': {
       const base = baseDomain.replace(/\/$/, '');
       const path = normalizeStepPath(step.path);
-      await page.goto(`${base}${path}`, { waitUntil: 'load', timeout: 25_000 }).catch(() =>
-        page.goto(`${base}${path}`, { waitUntil: 'domcontentloaded', timeout: 20_000 }).catch(() => {}),
-      );
+      const targetUrl = `${base}${path}`;
+      console.log(`[executor] performStep navigate: targeting ${targetUrl}`);
+
+      // For same-domain navigations, prefer clicking an anchor link (SPA-safe).
+      // page.goto causes a full hard reload which resets React/wagmi wallet state —
+      // some dApps (e.g. four.meme) then run an auth check in useEffect and redirect
+      // unauthenticated users before we can interact. Clicking the link does a
+      // client-side router navigation that preserves the existing auth + wallet state.
+      let spaNavDone = false;
+      try {
+        const currentOrigin = new URL(page.url()).origin;
+        const targetOrigin  = new URL(targetUrl).origin;
+        if (currentOrigin === targetOrigin && !page.isClosed()) {
+          // Try clicking a matching anchor (exact href match on path or full URL).
+          const clicked = await Promise.race([
+            page.click(`a[href="${path}"], a[href="${targetUrl}"]`, { timeout: 3_000 }).then(() => true),
+            new Promise<boolean>((r) => setTimeout(() => r(false), 3_500)),
+          ]).catch(() => false);
+
+          if (clicked) {
+            // Wait for the URL to settle at the target path.
+            await page.waitForURL(`**${path}**`, { timeout: 8_000 }).catch(() => {});
+            spaNavDone = true;
+            console.log(`[executor] performStep navigate: SPA link click succeeded → ${page.url()}`);
+          }
+        }
+      } catch { /* fall through to page.goto */ }
+
+      if (!spaNavDone) {
+        console.log(`[executor] performStep navigate: goto ${targetUrl}`);
+        await page.goto(targetUrl, { waitUntil: 'load', timeout: 25_000 }).catch(() =>
+          page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 }).catch(() => {}),
+        );
+      }
+
+      console.log(`[executor] performStep navigate: nav done, triggering wallet reconnect`);
       await page.waitForTimeout(2_000);
       await triggerWalletReconnect(page);
-      await dismissConsentBanner(page);
+      console.log(`[executor] performStep navigate: wallet reconnect done, dismissing banner`);
+      // dismissConsentBanner can hang on pages with complex modal stacks (e.g. trading UIs).
+      // Guard with a hard 5s timeout — consent banners should be instant to detect/dismiss.
+      await Promise.race([
+        dismissConsentBanner(page),
+        new Promise<void>((r) => setTimeout(r, 5_000)),
+      ]);
+      console.log(`[executor] performStep navigate: all done`);
       break;
     }
 
     case 'open_link_text': {
-      const href = await page.evaluate((text: string) => {
-        const anchors = Array.from(document.querySelectorAll('a[href]'));
-        const match   = anchors.find((el) => (el.textContent ?? '').trim().includes(text));
-        return match ? (match as HTMLAnchorElement).getAttribute('href') : null;
-      }, step.text);
-
-      const url = normalizeHrefToUrl(href, baseDomain);
-      if (url) {
-        await page.goto(url, { waitUntil: 'load', timeout: 25_000 }).catch(() =>
-          page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20_000 }).catch(() => {}),
+      // Prefer clicking the anchor directly — this triggers the React router's
+      // client-side navigation which preserves in-memory SIWE/wagmi auth state.
+      // page.goto on the href causes a full reload, which loses React state and
+      // lets useEffect guards redirect unauthenticated-looking users (e.g. /en/create-token → /en).
+      const textRegexEsc = step.text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const anchorLoc = page.locator(`a`).filter({ hasText: new RegExp(textRegexEsc, 'i') }).first();
+      const isVisible = await anchorLoc.isVisible({ timeout: 4_000 }).catch(() => false);
+      if (isVisible) {
+        await anchorLoc.click({ timeout: 8_000 }).catch(() => {});
+        // Wait for URL to change + network to settle, then re-trigger wallet.
+        // heavy SPAs like four.meme/en/create-token take 15-20s to render the
+        // React form tree after client-side navigation — networkidle is the most
+        // reliable signal that the JS/API waterfall has finished.
+        await page.waitForLoadState('networkidle', { timeout: 20_000 }).catch(() =>
+          page.waitForTimeout(5_000).catch(() => {}),
         );
-        await page.waitForTimeout(2_000);
         await triggerWalletReconnect(page);
       } else {
-        throw new Error(`Link with text "${step.text}" not found`);
+        // Fallback: find href via evaluate and use page.goto.
+        const href = await Promise.race([
+          page.evaluate((text: string) => {
+            const anchors = Array.from(document.querySelectorAll('a[href]'));
+            const match   = anchors.find((el) => (el.textContent ?? '').trim().toLowerCase().includes(text.toLowerCase()));
+            return match ? (match as HTMLAnchorElement).getAttribute('href') : null;
+          }, step.text).catch(() => null as string | null),
+          new Promise<null>((r) => setTimeout(() => r(null), 5_000)),
+        ]);
+        const url = normalizeHrefToUrl(href, baseDomain);
+        if (url) {
+          await page.goto(url, { waitUntil: 'load', timeout: 25_000 }).catch(() =>
+            page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20_000 }).catch(() => {}),
+          );
+          await page.waitForTimeout(2_000);
+          await triggerWalletReconnect(page);
+        } else {
+          throw new Error(`Link with text "${step.text}" not found`);
+        }
       }
       break;
     }
@@ -2227,8 +2428,14 @@ async function performStep(page: Page, step: AgentStep, baseDomain: string, wall
       // Before clicking a submit/create button, auto-inject fake images and
       // mark so we wait longer for the async transaction to come back.
       // Matches final-action buttons on token launchers, NFT minters, agent creators, etc.
-      const isSubmitAction = /^(create|launch|deploy|mint|submit|build|publish|generate|confirm|proceed|next|continue|create\s+agent|create\s+new\s+agent|build\s+agent|deploy\s+agent|create\s+token|launch\s+token|deploy\s+token|create\s+nft|mint\s+nft|mint\s+soul|mint\s+token)$/i.test(step.text.trim())
-        || /^(create|launch|deploy|mint|build|publish)\s+\w+$/i.test(step.text.trim());
+      // IMPORTANT: Only treat as submit if we are already on a create/form page.
+      // e.g. clicking "Create Token" from the nav bar is a *navigation* step, not a submit.
+      const currentUrlForSubmit = page.isClosed() ? '' : (page.url() ?? '');
+      const isOnCreatePage = /create|launch|deploy|mint|build/i.test(currentUrlForSubmit);
+      const isSubmitAction = isOnCreatePage && (
+        /^(create|launch|deploy|mint|submit|build|publish|generate|confirm|proceed|next|continue|create\s+agent|create\s+new\s+agent|build\s+agent|deploy\s+agent|create\s+token|launch\s+token|deploy\s+token|create\s+nft|mint\s+nft|mint\s+soul|mint\s+token)$/i.test(step.text.trim())
+        || /^(create|launch|deploy|mint|build|publish)\s+\w+$/i.test(step.text.trim())
+      );
       if (isSubmitAction) {
         await injectFakeImagesIfNeeded(page);
         await clearDevBuyFields(page);

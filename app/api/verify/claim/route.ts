@@ -11,8 +11,10 @@ export const runtime = 'nodejs';
 export const maxDuration = 540; // Must exceed STUCK_CHECKING_MS (8 min = 480s) with overhead
 
 // Hard wall: abort the browser session well before Vercel kills the whole function.
-// Leaves ~160 s to save evidence, run the verdict pipeline, and update the DB.
-const CLAIM_TIMEOUT_MS = 380_000;
+// Increased to 550s on local dev to allow TOKEN_CREATION enough time to:
+// - Retry through Browserless 429s / timeouts (up to 315s of retries)  
+// - Run the actual browser session (up to 370s session kill)
+const CLAIM_TIMEOUT_MS = 550_000;
 
 function summarizeBrowserFailure(error: unknown): string {
   const msg = error instanceof Error ? error.message : 'Unknown Playwright error';
@@ -167,12 +169,14 @@ export const POST = withErrorHandler(async (req: Request) => {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-async function maybeCompleteRun(runId: string, _origin: string) {
+async function maybeCompleteRun(runId: string, origin: string) {
   const { data: remaining } = await supabase
     .from('claims')
     .select('id, status')
     .eq('verification_run_id', runId)
     .in('status', ['pending', 'checking']);
+
+  const pendingOnly = (remaining ?? []).filter((c) => c.status === 'pending');
 
   if (!remaining?.length) {
     await supabase
@@ -181,6 +185,16 @@ async function maybeCompleteRun(runId: string, _origin: string) {
       .eq('id', runId);
     await log(runId, 'Verification complete');
     console.log('[verify/claim] All claims done — run marked complete');
+  } else if (pendingOnly.length > 0) {
+    // Daisy-chain: fire the next pending claim now that this one is done.
+    // Import lazily to avoid circular-dependency issues at module load time.
+    // 30 s cooldown: gives Browserless time to finish encoding the previous
+    // session's video, release memory, and drain its internal CDP queue before
+    // the next (potentially heavy) session starts.
+    const { dispatchNextClaim } = await import('@/lib/claim-dispatcher');
+    dispatchNextClaim(runId, origin, 30_000).catch((e) =>
+      console.error('[verify/claim] Failed to dispatch next claim:', e),
+    );
   }
 }
 
