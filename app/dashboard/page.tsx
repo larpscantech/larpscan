@@ -333,13 +333,14 @@ function EmptyState() {
 interface ClaimsSectionProps {
   phase: Phase;
   claims: Claim[];
+  /** Raw DB rows — used during `verifying` to show verdicts as each claim finishes (not stuck on "Queued"). */
+  dbClaims: DbClaim[];
   visibleClaimsCount: number;
-  resolvedResultsCount: number;
   checkingClaimIndex: number;
 }
 
 function ClaimsSection({
-  phase, claims, visibleClaimsCount, resolvedResultsCount, checkingClaimIndex,
+  phase, claims, dbClaims, visibleClaimsCount, checkingClaimIndex,
 }: ClaimsSectionProps) {
   const skeletonCount = 3;
 
@@ -376,6 +377,10 @@ function ClaimsSection({
     return (
       <div className="space-y-1">
         {claims.map((claim, i) => {
+          const db = dbClaims[i];
+          const isResolved =
+            !!db && db.status !== 'pending' && db.status !== 'checking';
+
           const stripped = {
             ...claim,
             verdict: undefined,
@@ -389,11 +394,17 @@ function ClaimsSection({
             walletAddress: undefined,
             blockerReason: undefined,
           };
-          if (i === checkingClaimIndex) {
+
+          // Show real verdict + evidence as soon as the server finishes a claim —
+          // do not keep cards on "Queued" until the whole run completes.
+          const displayClaim = isResolved ? claim : stripped;
+          const isChecking = !isResolved && i === checkingClaimIndex;
+
+          if (isChecking) {
             return (
               <AuditClaimCard
                 key={claim.id}
-                claim={stripped}
+                claim={displayClaim}
                 index={i}
                 isChecking={true}
               />
@@ -403,7 +414,7 @@ function ClaimsSection({
             return (
               <AuditClaimCard
                 key={claim.id}
-                claim={stripped}
+                claim={displayClaim}
                 index={i}
                 defaultExpanded={false}
               />
@@ -455,7 +466,6 @@ export default function DashboardPage() {
   // ── Reveal animation state ───────────────────────────────────────────────────
   const [projectLoaded, setProjectLoaded]               = useState(false);
   const [visibleClaimsCount, setVisibleClaimsCount]     = useState(0);
-  const [resolvedResultsCount, setResolvedResultsCount] = useState(0);
   const [checkingClaimIndex, setCheckingClaimIndex]     = useState(-1);
 
   const runIdRef  = useRef(0);
@@ -531,14 +541,18 @@ export default function DashboardPage() {
           setProjectLoaded(true);
 
           if (data.run.status === 'complete') {
-            setResolvedResultsCount(data.claims?.length ?? 0);
             setCheckingClaimIndex(-1);
             setPhase('complete');
             setDisplayedLogs(['Restored from previous run ✓']);
           } else {
             // Still verifying — restore verifying phase and let poll loop take over
             setPhase('verifying');
-            setCheckingClaimIndex(0);
+            const rows = data.claims ?? [];
+            const checkingIdx = rows.findIndex((c) => c.status === 'checking');
+            const firstPendingIdx = rows.findIndex((c) => c.status === 'pending');
+            if (checkingIdx >= 0) setCheckingClaimIndex(checkingIdx);
+            else if (firstPendingIdx >= 0) setCheckingClaimIndex(firstPendingIdx);
+            else setCheckingClaimIndex(0);
             setDisplayedLogs([`Reconnected to run ${urlRunId.slice(0, 8)}…`]);
           }
         } catch {
@@ -625,7 +639,6 @@ export default function DashboardPage() {
             setCurrentRunId(data.runId);
             setRealClaims(statusData.claims);
             setVisibleClaimsCount(statusData.claims.length);
-            setResolvedResultsCount(statusData.claims.length);
             setCheckingClaimIndex(-1);
             setProjectLoaded(true);
             setPhase('complete');
@@ -678,14 +691,6 @@ export default function DashboardPage() {
     setPhase('verifying');
     setCheckingClaimIndex(0);
 
-    let rotateIdx = 0;
-    const rotatePeriodMs = 5_000;
-    const rotateTimer = setInterval(() => {
-      if (!alive()) { clearInterval(rotateTimer); return; }
-      rotateIdx = (rotateIdx + 1) % Math.max(1, visibleClaimsCount || 3);
-      setCheckingClaimIndex(rotateIdx);
-    }, rotatePeriodMs);
-
     const maxPollMs = 10 * 60 * 1000;
     const pollStart = Date.now();
     let finalStatus: { claims: DbClaimWithEvidence[]; logs: { message: string }[] } | null = null;
@@ -706,6 +711,17 @@ export default function DashboardPage() {
         if (statusRes.claims.length > 0) {
           setRealClaims(statusRes.claims);
           setVisibleClaimsCount(statusRes.claims.length);
+          // Daisy-chain: only one claim is `checking` at a time — drive the live
+          // indicator from the server, not a rotating timer (which desynced cards).
+          const checkingIdx = statusRes.claims.findIndex((c) => c.status === 'checking');
+          const firstPendingIdx = statusRes.claims.findIndex((c) => c.status === 'pending');
+          if (checkingIdx >= 0) {
+            setCheckingClaimIndex(checkingIdx);
+          } else if (firstPendingIdx >= 0) {
+            setCheckingClaimIndex(firstPendingIdx);
+          } else {
+            setCheckingClaimIndex(-1);
+          }
         }
 
         // Sync server logs into the UI
@@ -752,7 +768,6 @@ export default function DashboardPage() {
       }
     }
 
-    clearInterval(rotateTimer);
     setCheckingClaimIndex(-1);
 
     if (!finalStatus && alive()) {
@@ -774,7 +789,6 @@ export default function DashboardPage() {
       for (let i = 0; i < finalStatus.claims.length; i++) {
         if (!alive()) break;
         await sleep(350);
-        setResolvedResultsCount(i + 1);
         const c = finalStatus.claims[i];
         const label = (c.status === 'pending' || c.status === 'checking')
           ? 'PROCESSING'
@@ -783,7 +797,7 @@ export default function DashboardPage() {
       }
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [addLog, visibleClaimsCount]);
+  }, [addLog]);
 
   // ── Core verification pipeline ────────────────────────────────────────────────
   // Single API call to /api/verify/orchestrate handles everything server-side:
@@ -803,7 +817,6 @@ export default function DashboardPage() {
     setApiError(null);
     setProjectLoaded(false);
     setVisibleClaimsCount(0);
-    setResolvedResultsCount(0);
     setCheckingClaimIndex(-1);
     setElapsed(0);
 
@@ -887,7 +900,6 @@ export default function DashboardPage() {
 
         setRealClaims(statusRes.claims);
         setVisibleClaimsCount(statusRes.claims.length);
-        setResolvedResultsCount(statusRes.claims.length);
         setCheckingClaimIndex(-1);
         setPhase('complete');
         addLog('Cached verification loaded ✓');
@@ -946,7 +958,6 @@ export default function DashboardPage() {
           if (allDone && liveStatus.run?.status === 'complete') {
             setRealClaims(liveStatus.claims);
             setVisibleClaimsCount(liveStatus.claims.length);
-            setResolvedResultsCount(liveStatus.claims.length);
             setCheckingClaimIndex(-1);
             setPhase('complete');
             addLog('Verification complete (joined finished run) ✓');
@@ -958,10 +969,11 @@ export default function DashboardPage() {
           if (liveStatus.claims.length > 0) {
             setRealClaims(liveStatus.claims);
             setVisibleClaimsCount(liveStatus.claims.length);
-            const resolved = liveStatus.claims.filter(
-              (c) => c.status !== 'pending' && c.status !== 'checking',
-            ).length;
-            setResolvedResultsCount(resolved);
+            const checkingIdx = liveStatus.claims.findIndex((c) => c.status === 'checking');
+            const firstPendingIdx = liveStatus.claims.findIndex((c) => c.status === 'pending');
+            if (checkingIdx >= 0) setCheckingClaimIndex(checkingIdx);
+            else if (firstPendingIdx >= 0) setCheckingClaimIndex(firstPendingIdx);
+            else setCheckingClaimIndex(-1);
           }
         }
       } catch {
@@ -1029,7 +1041,6 @@ export default function DashboardPage() {
     setApiError(null);
     setProjectLoaded(false);
     setVisibleClaimsCount(0);
-    setResolvedResultsCount(0);
     setCheckingClaimIndex(-1);
     setElapsed(0);
 
@@ -1059,7 +1070,6 @@ export default function DashboardPage() {
 
         setRealClaims(statusRes.claims);
         setVisibleClaimsCount(statusRes.claims.length);
-        setResolvedResultsCount(statusRes.claims.length);
         setCheckingClaimIndex(-1);
         setPhase('complete');
         addLog('Verification loaded ✓');
@@ -1093,7 +1103,6 @@ export default function DashboardPage() {
     setApiError(null);
     setProjectLoaded(false);
     setVisibleClaimsCount(0);
-    setResolvedResultsCount(0);
     setCheckingClaimIndex(-1);
     setElapsed(0);
     setInput('');
@@ -1280,8 +1289,8 @@ export default function DashboardPage() {
                   <ClaimsSection
                     phase={phase}
                     claims={frontendClaims}
+                    dbClaims={realClaims}
                     visibleClaimsCount={visibleClaimsCount}
-                    resolvedResultsCount={resolvedResultsCount}
                     checkingClaimIndex={checkingClaimIndex}
                   />
                 </div>
