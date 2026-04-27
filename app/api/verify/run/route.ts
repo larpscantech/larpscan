@@ -72,14 +72,22 @@ export const POST = withErrorHandler(async (req: Request) => {
   // happens on the very first status poll (usually within 1-2 seconds).
   await log(runId, 'Run queued — waiting for verification slot');
 
-  // Calculate queue position
-  const { count: aheadCount } = await supabase
-    .from('verification_runs')
-    .select('id', { count: 'exact', head: true })
-    .eq('status', 'pending')
-    .lt('created_at', run.created_at);
+  // Calculate queue position (best-effort — never fail the route if count breaks)
+  let queuePosition = 1;
+  if (run.created_at) {
+    const { count: aheadCount, error: queueErr } = await supabase
+      .from('verification_runs')
+      .select('id', { count: 'exact', head: true })
+      .eq('status', 'pending')
+      .lt('created_at', run.created_at);
 
-  const queuePosition = (aheadCount ?? 0) + 1;
+    if (queueErr) {
+      console.error('[verify/run] queue count error:', queueErr.message);
+    } else {
+      queuePosition = (aheadCount ?? 0) + 1;
+    }
+  }
+
   console.log(`[verify/run] Run ${runId} queued (position ${queuePosition})`);
   return ok({ runId, results: [], status: 'queued', queuePosition });
 });

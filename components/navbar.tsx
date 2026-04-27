@@ -1,11 +1,46 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { AnimatePresence, motion } from 'framer-motion';
-import { cn } from '@/lib/utils';
+import { Copy } from 'lucide-react';
+import { cn, truncateAddressPump } from '@/lib/utils';
 import { useLocale } from '@/components/locale-provider';
+
+export type NavbarProps = {
+  /**
+   * When set (e.g. on the dashboard), shows a compact CA / URL chip next to the logo:
+   * raw `0x…` address, `url:host` from DB, or an `https://` website URL.
+   */
+  contractContext?: string | null;
+};
+
+type ParsedContext = { kind: 'ca' | 'url'; full: string; display: string };
+
+function parseContractContext(raw: string | null | undefined): ParsedContext | null {
+  if (raw == null) return null;
+  const s = raw.trim();
+  if (!s) return null;
+  if (s.startsWith('url:')) {
+    const rest = s.slice(4);
+    const display =
+      rest.length > 28 ? `${rest.slice(0, 10)}…${rest.slice(-6)}` : rest;
+    return { kind: 'url', full: s, display };
+  }
+  if (/^0x[0-9a-fA-F]{40,}$/i.test(s)) {
+    return { kind: 'ca', full: s, display: truncateAddressPump(s) };
+  }
+  if (/^https?:\/\//i.test(s)) {
+    try {
+      const host = new URL(s).hostname;
+      return { kind: 'url', full: s, display: host.length > 32 ? `${host.slice(0, 14)}…` : host };
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
 
 function Logo() {
   return (
@@ -44,21 +79,32 @@ function XIcon() {
   );
 }
 
-export function Navbar() {
+export function Navbar({ contractContext }: NavbarProps = {}) {
   const [scrolled, setScrolled] = useState(false);
   const pathname = usePathname();
   const { locale, setLocale } = useLocale();
 
+  const parsedContext = useMemo(
+    () => parseContractContext(contractContext ?? null),
+    [contractContext],
+  );
+
   const copy = locale === 'zh-TW'
     ? {
-        home: '首頁',
-        docs: '文件',
-        open: '進入儀表板',
+        home:      '首頁',
+        docs:      '文件',
+        open:      '進入儀表板',
+        labelCa:   '合約',
+        labelUrl:  '網址',
+        copyLabel: '複製到剪貼簿',
       }
     : {
-        home: 'Home',
-        docs: 'Docs',
-        open: 'Enter Dashboard',
+        home:      'Home',
+        docs:      'Docs',
+        open:      'Enter Dashboard',
+        labelCa:   'CA',
+        labelUrl:  'URL',
+        copyLabel: 'Copy to clipboard',
       };
 
   const NAV_LINKS = [
@@ -83,10 +129,37 @@ export function Navbar() {
       )}
     >
       <div className="max-w-[1240px] mx-auto px-8">
-        <div className="flex items-center justify-between h-[64px]">
-          <Link href="/home" className="hover:opacity-80 transition-opacity duration-150">
-            <Logo />
-          </Link>
+        <div className="flex items-center justify-between h-[64px] gap-3">
+          <div className="flex items-center gap-2 sm:gap-3 min-w-0 shrink">
+            <Link href="/home" className="hover:opacity-80 transition-opacity duration-150 flex-shrink-0">
+              <Logo />
+            </Link>
+            {parsedContext && (
+              <div
+                className="hidden min-[400px]:flex items-center gap-1.5 pl-2 pr-1 py-1 rounded-sm border border-[#1f1f27] bg-[#0a0a0e]/80 max-w-[min(45vw,220px)] sm:max-w-[min(38vw,280px)]"
+                title={parsedContext.full}
+              >
+                <span className="text-[8px] font-semibold uppercase tracking-[0.14em] text-zinc-500 flex-shrink-0">
+                  {parsedContext.kind === 'ca' ? copy.labelCa : copy.labelUrl}
+                </span>
+                <span className="font-mono text-[9px] sm:text-[10px] text-zinc-300 truncate tabular-nums">
+                  {parsedContext.display}
+                </span>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(parsedContext.full);
+                    } catch { /* noop */ }
+                  }}
+                  className="flex-shrink-0 p-0.5 text-zinc-600 hover:text-zinc-300 transition-colors"
+                  aria-label={copy.copyLabel}
+                >
+                  <Copy className="w-2.5 h-2.5 sm:w-3 sm:h-3" />
+                </button>
+              </div>
+            )}
+          </div>
 
           <div className="hidden md:flex items-center gap-8">
             {NAV_LINKS.map((link) => {

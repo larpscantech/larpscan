@@ -213,6 +213,7 @@ export function AuditClaimCard({
 
   return (
     <div
+      data-claim-live-check={isChecking ? 'true' : 'false'}
       className={cn(
         'border-l-[3px] pl-7 pr-7 py-6 mb-1.5',
         'bg-cv-card rounded-xl shadow-card',

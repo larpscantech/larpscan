@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
 import { ArrowRight, RotateCcw, AlertCircle, Globe } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Navbar } from '@/components/navbar';
@@ -336,11 +336,10 @@ interface ClaimsSectionProps {
   /** Raw DB rows — used during `verifying` to show verdicts as each claim finishes (not stuck on "Queued"). */
   dbClaims: DbClaim[];
   visibleClaimsCount: number;
-  checkingClaimIndex: number;
 }
 
 function ClaimsSection({
-  phase, claims, dbClaims, visibleClaimsCount, checkingClaimIndex,
+  phase, claims, dbClaims, visibleClaimsCount,
 }: ClaimsSectionProps) {
   const skeletonCount = 3;
 
@@ -374,6 +373,16 @@ function ClaimsSection({
   }
 
   if (phase === 'verifying') {
+    if (claims.length === 0) {
+      return (
+        <div className="space-y-1">
+          {Array.from({ length: skeletonCount }, (_, i) => (
+            <AuditClaimCardSkeleton key={i} index={i} />
+          ))}
+        </div>
+      );
+    }
+
     return (
       <div className="space-y-1">
         {claims.map((claim, i) => {
@@ -398,7 +407,11 @@ function ClaimsSection({
           // Show real verdict + evidence as soon as the server finishes a claim —
           // do not keep cards on "Queued" until the whole run completes.
           const displayClaim = isResolved ? claim : stripped;
-          const isChecking = !isResolved && i === checkingClaimIndex;
+          // Only the claim with DB status `checking` is active. During the 30s
+          // Browserless cooldown no row is `checking`; do not fake a spinner on
+          // the first `pending` row (that looked like "claim 01 validating while
+          // claim 03 is already done").
+          const isChecking = db?.status === 'checking';
 
           if (isChecking) {
             return (
@@ -466,7 +479,6 @@ export default function DashboardPage() {
   // ── Reveal animation state ───────────────────────────────────────────────────
   const [projectLoaded, setProjectLoaded]               = useState(false);
   const [visibleClaimsCount, setVisibleClaimsCount]     = useState(0);
-  const [checkingClaimIndex, setCheckingClaimIndex]     = useState(-1);
 
   const runIdRef  = useRef(0);
   // Kept in sync with `phase` so effects with stable deps can read the latest phase
@@ -516,50 +528,16 @@ export default function DashboardPage() {
       setInputMode('website');
       setInput(urlWebsite);
     }
+  }, []);
 
-    // ── Instantly restore run from ?runId= on refresh / direct link ──────────
-    // If the URL has ?runId=, skip the debounce+orchestrate path entirely:
-    // fetch the run status directly and restore the UI state in <1s.
+  // Enter verifying + show pipeline immediately for ?runId= (before status fetch returns).
+  useLayoutEffect(() => {
+    if (typeof window === 'undefined') return;
     const urlRunId = new URLSearchParams(window.location.search).get('runId')?.trim();
-    if (urlRunId && /^[0-9a-f-]{36}$/i.test(urlRunId)) {
-      void (async () => {
-        try {
-          const res = await fetch(`/api/verify/status?runId=${urlRunId}`);
-          if (!res.ok) return;
-          const data = await res.json() as {
-            run:     DbVerificationRun;
-            claims:  DbClaimWithEvidence[];
-            logs:    { message: string }[];
-            project: DbProject | null;
-          };
-          // Only restore if in-flight or recently completed
-          if (!data.run) return;
-          if (data.project) setRealProject(data.project);
-          setCurrentRunId(urlRunId);
-          setRealClaims(data.claims ?? []);
-          setVisibleClaimsCount(data.claims?.length ?? 0);
-          setProjectLoaded(true);
-
-          if (data.run.status === 'complete') {
-            setCheckingClaimIndex(-1);
-            setPhase('complete');
-            setDisplayedLogs(['Restored from previous run ✓']);
-          } else {
-            // Still verifying — restore verifying phase and let poll loop take over
-            setPhase('verifying');
-            const rows = data.claims ?? [];
-            const checkingIdx = rows.findIndex((c) => c.status === 'checking');
-            const firstPendingIdx = rows.findIndex((c) => c.status === 'pending');
-            if (checkingIdx >= 0) setCheckingClaimIndex(checkingIdx);
-            else if (firstPendingIdx >= 0) setCheckingClaimIndex(firstPendingIdx);
-            else setCheckingClaimIndex(0);
-            setDisplayedLogs([`Reconnected to run ${urlRunId.slice(0, 8)}…`]);
-          }
-        } catch {
-          // Non-fatal — user can click verify manually
-        }
-      })();
-    }
+    if (!urlRunId || !/^[0-9a-f-]{36}$/i.test(urlRunId)) return;
+    setPhase('verifying');
+    setCurrentRunId(urlRunId);
+    setDisplayedLogs([`Reconnecting to run ${urlRunId.slice(0, 8)}…`]);
   }, []);
 
   useEffect(() => {
@@ -639,7 +617,6 @@ export default function DashboardPage() {
             setCurrentRunId(data.runId);
             setRealClaims(statusData.claims);
             setVisibleClaimsCount(statusData.claims.length);
-            setCheckingClaimIndex(-1);
             setProjectLoaded(true);
             setPhase('complete');
             setDisplayedLogs(['Restored from previous run ✓']);
@@ -689,7 +666,6 @@ export default function DashboardPage() {
     sleep: (ms: number) => Promise<void>,
   ): Promise<boolean> => {
     setPhase('verifying');
-    setCheckingClaimIndex(0);
 
     const maxPollMs = 10 * 60 * 1000;
     const pollStart = Date.now();
@@ -713,17 +689,6 @@ export default function DashboardPage() {
         if (statusRes.claims.length > 0) {
           setRealClaims(statusRes.claims);
           setVisibleClaimsCount(statusRes.claims.length);
-          // Daisy-chain: only one claim is `checking` at a time — drive the live
-          // indicator from the server, not a rotating timer (which desynced cards).
-          const checkingIdx = statusRes.claims.findIndex((c) => c.status === 'checking');
-          const firstPendingIdx = statusRes.claims.findIndex((c) => c.status === 'pending');
-          if (checkingIdx >= 0) {
-            setCheckingClaimIndex(checkingIdx);
-          } else if (firstPendingIdx >= 0) {
-            setCheckingClaimIndex(firstPendingIdx);
-          } else {
-            setCheckingClaimIndex(-1);
-          }
         }
 
         // Sync server logs into the UI
@@ -789,8 +754,6 @@ export default function DashboardPage() {
       }
     }
 
-    setCheckingClaimIndex(-1);
-
     if (!finalStatus && alive()) {
       console.warn(`${TAG} Poll timed out — fetching latest partial results`, STYLE);
       addLog('Some claims are still processing — showing available results');
@@ -827,6 +790,89 @@ export default function DashboardPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [addLog]);
 
+  // ── ?runId= deep link: hydrate from /status then poll until complete ─────────
+  // Without this loop the UI showed a frozen first snapshot (no live checking state).
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const urlRunId = new URLSearchParams(window.location.search).get('runId')?.trim();
+    if (!urlRunId || !/^[0-9a-f-]{36}$/i.test(urlRunId)) return;
+
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        const res = await fetch(`/api/verify/status?runId=${urlRunId}`);
+        if (!res.ok) {
+          if (!cancelled) {
+            setPhase('idle');
+            setCurrentRunId(null);
+            setDisplayedLogs([]);
+          }
+          return;
+        }
+        const data = await res.json() as {
+          run:     DbVerificationRun;
+          claims:  DbClaimWithEvidence[];
+          logs:    { message: string }[];
+          project: DbProject | null;
+        };
+        if (!data.run) {
+          if (!cancelled) {
+            setPhase('idle');
+            setCurrentRunId(null);
+            setDisplayedLogs([]);
+          }
+          return;
+        }
+        if (cancelled) return;
+
+        if (data.project) setRealProject(data.project);
+        setCurrentRunId(urlRunId);
+        setRealClaims(data.claims ?? []);
+        setVisibleClaimsCount(data.claims?.length ?? 0);
+        setProjectLoaded(true);
+
+        if (data.run.status === 'complete') {
+          setPhase('complete');
+          setDisplayedLogs(['Restored from previous run ✓']);
+          return;
+        }
+
+        setPhase('verifying');
+        setDisplayedLogs([`Reconnected to run ${urlRunId.slice(0, 8)}…`]);
+
+        if (cancelled) return;
+
+        const myRunId = ++runIdRef.current;
+        const alive = () => runIdRef.current === myRunId;
+        const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+        const joinedAllResolved = await pollRunToCompletion(urlRunId, alive, sleep);
+        if (!alive() || cancelled) return;
+
+        setPhase('complete');
+        if (joinedAllResolved) {
+          addLog('Verification run complete ✓');
+        } else {
+          addLog(
+            'Verification finished with incomplete claims — partial report. Refresh the page or run Verify again to retry pending items.',
+          );
+        }
+        void fetchRecentScans();
+      } catch {
+        if (!cancelled) {
+          setPhase('idle');
+          setCurrentRunId(null);
+          setDisplayedLogs([]);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      runIdRef.current++;
+    };
+  }, [pollRunToCompletion, fetchRecentScans, addLog]);
+
   // ── Core verification pipeline ────────────────────────────────────────────────
   // Single API call to /api/verify/orchestrate handles everything server-side:
   // discover → dedup → scrape → extract → dispatch claim workers.
@@ -845,7 +891,6 @@ export default function DashboardPage() {
     setApiError(null);
     setProjectLoaded(false);
     setVisibleClaimsCount(0);
-    setCheckingClaimIndex(-1);
     setElapsed(0);
 
     console.group(`${TAG} ══ Verification run started ══`, STYLE);
@@ -928,7 +973,6 @@ export default function DashboardPage() {
 
         setRealClaims(statusRes.claims);
         setVisibleClaimsCount(statusRes.claims.length);
-        setCheckingClaimIndex(-1);
         setPhase('complete');
         addLog('Cached verification loaded ✓');
         void fetchRecentScans();
@@ -980,13 +1024,14 @@ export default function DashboardPage() {
         }>('/api/verify/status', `/api/verify/status?runId=${runId}`);
 
         if (alive()) {
-          const allDone = liveStatus.claims.every(
-            (c) => c.status !== 'pending' && c.status !== 'checking',
-          );
+          const allDone =
+            liveStatus.claims.length > 0 &&
+            liveStatus.claims.every(
+              (c) => c.status !== 'pending' && c.status !== 'checking',
+            );
           if (allDone && liveStatus.run?.status === 'complete') {
             setRealClaims(liveStatus.claims);
             setVisibleClaimsCount(liveStatus.claims.length);
-            setCheckingClaimIndex(-1);
             setPhase('complete');
             addLog('Verification complete (joined finished run) ✓');
             void fetchRecentScans();
@@ -997,11 +1042,6 @@ export default function DashboardPage() {
           if (liveStatus.claims.length > 0) {
             setRealClaims(liveStatus.claims);
             setVisibleClaimsCount(liveStatus.claims.length);
-            const checkingIdx = liveStatus.claims.findIndex((c) => c.status === 'checking');
-            const firstPendingIdx = liveStatus.claims.findIndex((c) => c.status === 'pending');
-            if (checkingIdx >= 0) setCheckingClaimIndex(checkingIdx);
-            else if (firstPendingIdx >= 0) setCheckingClaimIndex(firstPendingIdx);
-            else setCheckingClaimIndex(-1);
           }
         }
       } catch {
@@ -1075,7 +1115,6 @@ export default function DashboardPage() {
     setApiError(null);
     setProjectLoaded(false);
     setVisibleClaimsCount(0);
-    setCheckingClaimIndex(-1);
     setElapsed(0);
 
     // Build a minimal project object from the recent scan data
@@ -1104,7 +1143,6 @@ export default function DashboardPage() {
 
         setRealClaims(statusRes.claims);
         setVisibleClaimsCount(statusRes.claims.length);
-        setCheckingClaimIndex(-1);
         setPhase('complete');
         addLog('Verification loaded ✓');
       } catch (e) {
@@ -1143,7 +1181,6 @@ export default function DashboardPage() {
     setApiError(null);
     setProjectLoaded(false);
     setVisibleClaimsCount(0);
-    setCheckingClaimIndex(-1);
     setElapsed(0);
     setInput('');
   }, []);
@@ -1331,7 +1368,6 @@ export default function DashboardPage() {
                     claims={frontendClaims}
                     dbClaims={realClaims}
                     visibleClaimsCount={visibleClaimsCount}
-                    checkingClaimIndex={checkingClaimIndex}
                   />
                 </div>
 
