@@ -186,15 +186,17 @@ async function maybeCompleteRun(runId: string, origin: string) {
     await log(runId, 'Verification complete');
     console.log('[verify/claim] All claims done — run marked complete');
   } else if (pendingOnly.length > 0) {
-    // Daisy-chain: fire the next pending claim now that this one is done.
-    // Import lazily to avoid circular-dependency issues at module load time.
-    // 30 s cooldown: gives Browserless time to finish encoding the previous
-    // session's video, release memory, and drain its internal CDP queue before
-    // the next (potentially heavy) session starts.
+    // Daisy-chain: schedule the next pending claim after cooldown.
+    //
+    // MUST await: on Vercel/serverless the invocation freezes as soon as this
+    // route returns 200. A fire-and-forget dispatchNextClaim never reaches the
+    // 30s sleep or outbound POST — only the first claim in a run would run.
     const { dispatchNextClaim } = await import('@/lib/claim-dispatcher');
-    dispatchNextClaim(runId, origin, 30_000).catch((e) =>
-      console.error('[verify/claim] Failed to dispatch next claim:', e),
-    );
+    try {
+      await dispatchNextClaim(runId, origin, 30_000);
+    } catch (e) {
+      console.error('[verify/claim] Failed to dispatch next claim:', e);
+    }
   }
 }
 

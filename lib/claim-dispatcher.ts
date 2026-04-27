@@ -90,11 +90,13 @@ const PRIORITY_FEATURE_TYPES = ['WALLET_FLOW', 'TOKEN_CREATION'];
  * @param cooldownMs  Optional delay before firing the HTTP POST.  Pass > 0 for
  *                    all but the first claim to give Browserless time to encode
  *                    the previous session's video and free memory.
+ *
+ * When chaining from `/api/verify/claim`, the route handler **must** await this
+ * function (including cooldown) before returning — otherwise serverless hosts
+ * freeze the isolate and the next claim never dispatches.
  */
 export async function dispatchNextClaim(runId: string, origin: string, cooldownMs = 0): Promise<void> {
   // Optional cooldown — lets Browserless finish encoding and GC between sessions.
-  // Does NOT delay the previous claim's HTTP response (this function is called
-  // fire-and-forget from maybeCompleteRun in the claim route).
   if (cooldownMs > 0) {
     console.log(`[claim-dispatcher] Cooling down ${cooldownMs / 1_000}s before next claim (Browserless recovery)…`);
     await new Promise<void>((r) => setTimeout(r, cooldownMs));
@@ -146,39 +148,45 @@ export async function dispatchNextClaim(runId: string, origin: string, cooldownM
   await log(runId, `Dispatching claim: ${claim.claim.slice(0, 60)}`);
   console.log(`[claim-dispatcher] Firing claim ${claim.id} for run ${runId}`);
 
-  // Fire-and-forget: don't await the HTTP response.  The daisy-chain continues
-  // when the claim route calls dispatchNextClaim after it finishes.
-  fireClaimRequest(claim.id, runId, origin);
+  // Await request flush only — do not wait for the next claim's full handler
+  // (that would serialize multi-minute work inside one invocation).
+  await flushClaimRequest(claim.id, runId, origin);
 }
 
-/** Send a fire-and-forget HTTP POST to the claim route. */
-function fireClaimRequest(claimId: string, runId: string, origin: string): void {
+/** POST to the claim route and resolve once the request is fully written (serverless-safe handoff). */
+function flushClaimRequest(claimId: string, runId: string, origin: string): Promise<void> {
   const payload   = JSON.stringify({ runId, claimId });
   const claimUrl  = new URL(`${origin}/api/verify/claim`);
   const requestFn = claimUrl.protocol === 'https:' ? httpsRequest : httpRequest;
 
-  const req = requestFn({
-    hostname: claimUrl.hostname,
-    port:     claimUrl.port || (claimUrl.protocol === 'https:' ? 443 : 80),
-    path:     claimUrl.pathname,
-    method:   'POST',
-    headers:  {
-      'Content-Type':   'application/json',
-      'Content-Length': Buffer.byteLength(payload),
-    },
-  });
-
-  req.on('error', (e) => {
-    console.error(`[claim-dispatcher] HTTP error for claim ${claimId}:`, e);
-  });
-
-  req.on('response', (res) => {
-    res.resume(); // drain the response body to free the socket
-    res.on('end', () => {
-      console.log(`[claim-dispatcher] Claim ${claimId} HTTP response received`);
+  return new Promise((resolve, reject) => {
+    const req = requestFn({
+      hostname: claimUrl.hostname,
+      port:     claimUrl.port || (claimUrl.protocol === 'https:' ? 443 : 80),
+      path:     claimUrl.pathname,
+      method:   'POST',
+      headers:  {
+        'Content-Type':   'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
     });
-  });
 
-  req.write(payload);
-  req.end();
+    req.on('error', (e) => {
+      console.error(`[claim-dispatcher] HTTP error for claim ${claimId}:`, e);
+      reject(e);
+    });
+
+    // Drain response in background so the next invocation can complete independently.
+    req.on('response', (res) => {
+      res.resume();
+      res.on('end', () => {
+        console.log(`[claim-dispatcher] Claim ${claimId} HTTP response received`);
+      });
+    });
+
+    req.on('finish', () => resolve());
+
+    req.write(payload);
+    req.end();
+  });
 }
