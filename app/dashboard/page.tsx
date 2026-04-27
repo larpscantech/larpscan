@@ -687,7 +687,7 @@ export default function DashboardPage() {
     runId: string,
     alive: () => boolean,
     sleep: (ms: number) => Promise<void>,
-  ) => {
+  ): Promise<boolean> => {
     setPhase('verifying');
     setCheckingClaimIndex(0);
 
@@ -695,6 +695,8 @@ export default function DashboardPage() {
     const pollStart = Date.now();
     let finalStatus: { claims: DbClaimWithEvidence[]; logs: { message: string }[] } | null = null;
     let dispatchRetried = false;
+    /** Re-dispatch once when DB says run is complete but claims are still in flight (inconsistent state). */
+    let redispatchStuckComplete = false;
 
     while (alive() && Date.now() - pollStart < maxPollMs) {
       await sleep(5_000);
@@ -729,8 +731,27 @@ export default function DashboardPage() {
           setDisplayedLogs(statusRes.logs.map((l) => l.message));
         }
 
-        // If the run is already terminal (complete/failed), we're done
+        // Terminal run — but trust claim rows over a stale `complete` flag (server
+        // bug or race). Keep polling until every claim is terminal or timeout.
         if (statusRes.run.status === 'complete' || statusRes.run.status === 'failed') {
+          const inFlight =
+            statusRes.claims.length > 0 &&
+            statusRes.claims.some((c) => c.status === 'pending' || c.status === 'checking');
+          if (statusRes.run.status === 'complete' && inFlight) {
+            console.warn(
+              `${TAG} Run marked complete but claims still pending/checking — continuing poll`,
+              STYLE,
+            );
+            if (!redispatchStuckComplete) {
+              redispatchStuckComplete = true;
+              fetch('/api/verify/run', {
+                method:  'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body:    JSON.stringify({ runId }),
+              }).catch(() => {});
+            }
+            continue;
+          }
           finalStatus = statusRes;
           console.log(`${TAG} Run is ${statusRes.run.status} — done polling`, STYLE);
           break;
@@ -796,6 +817,13 @@ export default function DashboardPage() {
         addLog(`Claim ${String(i + 1).padStart(2, '0')} → ${label}`);
       }
     }
+
+    const allResolved = !!(
+      finalStatus &&
+      finalStatus.claims.length > 0 &&
+      finalStatus.claims.every((c) => c.status !== 'pending' && c.status !== 'checking')
+    );
+    return allResolved;
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [addLog]);
 
@@ -985,7 +1013,7 @@ export default function DashboardPage() {
       if (!alive()) { console.groupEnd(); return; }
     }
 
-    await pollRunToCompletion(runId, alive, sleep);
+    const allClaimsResolved = await pollRunToCompletion(runId, alive, sleep);
 
     if (!alive()) { console.groupEnd(); return; }
 
@@ -998,7 +1026,13 @@ export default function DashboardPage() {
         if (!alive()) { console.groupEnd(); return; }
 
     setPhase('complete');
-    addLog('Verification run complete ✓');
+    if (allClaimsResolved) {
+      addLog('Verification run complete ✓');
+    } else {
+      addLog(
+        'Verification finished with incomplete claims — partial report. Refresh the page or run Verify again to retry pending items.',
+      );
+    }
     void fetchRecentScans();
 
     console.log(`${TAG} ══ Run complete ══`, STYLE);
@@ -1082,12 +1116,18 @@ export default function DashboardPage() {
     } else {
       // ── In-progress: join the polling loop ────────────────────────────────
       addLog('Verification in progress — joining...');
-      await pollRunToCompletion(v.id, alive, sleep);
+      const joinedAllResolved = await pollRunToCompletion(v.id, alive, sleep);
 
       if (!alive()) return;
 
     setPhase('complete');
-    addLog('Verification run complete ✓');
+    if (joinedAllResolved) {
+      addLog('Verification run complete ✓');
+    } else {
+      addLog(
+        'Verification finished with incomplete claims — partial report. Refresh or run Verify again.',
+      );
+    }
     void fetchRecentScans();
     }
   }, [phase, addLog, fetchRecentScans, pollRunToCompletion]);

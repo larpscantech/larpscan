@@ -87,8 +87,13 @@ export const GET = withErrorHandler(async (req: Request) => {
       }
     }
 
-    // Close the run when every claim is in a terminal state
-    const allDone = claims.every((c) => c.status !== 'pending' && c.status !== 'checking');
+    // Close the run when every claim is in a terminal state.
+    // IMPORTANT: `[].every(...)` is true in JS — never auto-complete when the
+    // claims query came back empty (race before rows exist, or transient error),
+    // or the run will flip to "complete" while workers are still enqueueing.
+    const allDone =
+      claims.length > 0 &&
+      claims.every((c) => c.status !== 'pending' && c.status !== 'checking');
     if (allDone && run.status !== 'pending') {
       await supabase.from('verification_runs').update({ status: 'complete' }).eq('id', runId);
       await log(runId, 'Verification complete');
