@@ -1,0 +1,1328 @@
+import path    from 'path';
+import fs      from 'fs/promises';
+import { randomUUID } from 'crypto';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import { fixWebmDuration } from 'webm-duration-fix-buffer';
+import { connectBrowser, isServerlessRuntime, isBrowserlessMode } from './browser';
+import { generateNarration } from './tts';
+import type { NarrationSegment } from './tts';
+
+const execFileAsync = promisify(execFile);
+import { supabase } from './supabase';
+import {
+  analyzePageState,
+  planWorkflow,
+  replanWorkflow,
+  executeSteps,
+  buildEvidenceSummary,
+  handleWalletPopups,
+  injectWalletMockIntoContext,
+  dismissConsentBanner,
+} from './browser-agent';
+import type { Page } from 'playwright';
+import type { AgentObservation, AttemptMemory, PageState } from './browser-agent/types';
+import { createRunMemory, updateRunMemory } from './browser-agent/run-memory';
+import type { RunMemory } from './browser-agent/run-memory';
+import { buildSignals } from './verdict-signals';
+import type { VerdictSignals } from './verdict-signals';
+import {
+  buildWorkflowHypothesis,
+  shouldTriggerRecovery,
+  updateAttemptMemory,
+} from './browser-agent/workflow';
+import { isWalletConfigured, investigationWalletAddress } from './wallet/client';
+import { policyForFeatureType } from './wallet/policy';
+import { takeSnapshot, formatDiff } from './wallet/snapshots';
+import { runSafetyMonitor, formatSafetyReport } from './wallet/monitor';
+import { exposeSigningBridge, drainTransactionHashes, drainTransactionAttempt } from './wallet/signer';
+import { waitForTxReceiptOutcome } from './wallet/tx-confirm';
+import type { WalletRequestContext } from './wallet/request-classifier';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WebM → MP4 conversion
+//
+// Browserless CDP recording produces VP9 WebM with sparse keyframes (~15-30s).
+// Seeking freezes because the browser must decode from the last keyframe.
+// Re-encoding to H.264 MP4 with keyframes every 2s gives instant seeking.
+// Uses ffmpeg-static which runs natively on Vercel (Fluid compute).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Parse the response from Browserless.stopRecording into a Buffer.
+ *
+ * Browserless has returned different formats across versions:
+ *   1. response.value is already a Buffer / Uint8Array (older versions)
+ *   2. response.value is a binary string (older Browserless < v2)
+ *   3. response.value is { type: "Buffer", data: number[] } (newer versions)
+ *   4. response.value is a base64 string
+ *
+ * We handle all four and return null if we can't produce a non-empty Buffer.
+ */
+function parseRecordingResponse(response: unknown): Buffer | null {
+  if (!response || typeof response !== 'object') return null;
+  const r = response as Record<string, unknown>;
+
+  // Browserless has returned data under different keys across versions.
+  // Try 'value' first (CDP standard), then 'data' (some Browserless builds).
+  const val = r.value ?? r.data ?? r.buffer ?? r.result;
+
+  if (!val) {
+    console.warn('[verifier:record] parseRecordingResponse: no data key found in response. Keys:', Object.keys(r).join(', '));
+    return null;
+  }
+
+  // Case 1: already a Buffer / Uint8Array
+  if (Buffer.isBuffer(val)) {
+    if (val.length > 0) { console.log(`[verifier:record] parseRecordingResponse: Buffer (${val.length} bytes)`); return val; }
+    return null;
+  }
+  if (val instanceof Uint8Array) {
+    if (val.length > 0) { console.log(`[verifier:record] parseRecordingResponse: Uint8Array (${val.length} bytes)`); return Buffer.from(val); }
+    return null;
+  }
+
+  // Case 3: { type: "Buffer", data: number[] }
+  if (typeof val === 'object' && (val as Record<string,unknown>).type === 'Buffer') {
+    const data = (val as Record<string,unknown>).data;
+    if (Array.isArray(data) && data.length > 0) {
+      console.log(`[verifier:record] parseRecordingResponse: {type:"Buffer"} (${data.length} bytes)`);
+      return Buffer.from(data as number[]);
+    }
+    return null;
+  }
+
+  if (typeof val === 'string' && val.length > 0) {
+    // Case 4: base64 — check that the FIRST 200 chars only contain base64 characters.
+    // The old check tested val.slice(0,100) against /=*$/ which always fails in the
+    // middle of a base64 string (padding only appears at the very end), causing real
+    // recordings to be silently dropped. The correct check is just: are the chars valid?
+    const sample = val.slice(0, 200);
+    const isBase64Like = /^[A-Za-z0-9+/=]+$/.test(sample);
+    if (isBase64Like && val.length > 100) {
+      try {
+        const buf = Buffer.from(val, 'base64');
+        if (buf.length > 100) {
+          // Quick sanity check: WebM starts with EBML header 0x1A45DFA3
+          const isWebM = buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3;
+          console.log(`[verifier:record] parseRecordingResponse: base64 string → ${buf.length} bytes (WebM magic: ${isWebM})`);
+          return buf;
+        }
+      } catch { /* fall through to binary */ }
+    }
+    // Case 2: binary string
+    const buf = Buffer.from(val, 'binary');
+    if (buf.length > 100) {
+      const isWebM = buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3;
+      console.log(`[verifier:record] parseRecordingResponse: binary string → ${buf.length} bytes (WebM magic: ${isWebM})`);
+      return buf;
+    }
+    console.warn(`[verifier:record] parseRecordingResponse: string value too short (${val.length} chars, isBase64Like=${isBase64Like})`);
+    return null;
+  }
+
+  console.warn('[verifier:record] parseRecordingResponse: unrecognised value type:', typeof val);
+  return null;
+}
+
+async function convertWebmToMp4(webmBuffer: Buffer, tag: string): Promise<Buffer | null> {
+  let ffmpegPath: string;
+  try {
+    ffmpegPath = require('ffmpeg-static') as string;
+  } catch {
+    console.warn(`[${tag}] ffmpeg-static not available, skipping MP4 conversion`);
+    return null;
+  }
+
+  const tmpIn  = path.join('/tmp', `${randomUUID()}.webm`);
+  const tmpOut = path.join('/tmp', `${randomUUID()}.mp4`);
+
+  try {
+    await fs.writeFile(tmpIn, webmBuffer);
+
+    await execFileAsync(ffmpegPath, [
+      '-y',
+      '-i', tmpIn,
+      '-pix_fmt', 'yuv420p',
+      '-vf', 'scale=960:-2,fps=24',  // deduplicate frames + scale down
+      '-c:v', 'libx264',
+      '-preset', 'veryfast',
+      '-crf', '34',
+      '-g', '48',
+      '-keyint_min', '24',
+      '-an',
+      '-movflags', '+faststart',
+      tmpOut,
+    ], { timeout: 120_000, maxBuffer: 50 * 1024 * 1024 });
+
+    const mp4Buffer = await fs.readFile(tmpOut);
+    const inKB  = (webmBuffer.length / 1024).toFixed(0);
+    const outKB = (mp4Buffer.length / 1024).toFixed(0);
+    console.log(`[${tag}] MP4 conversion: ${inKB}KB → ${outKB}KB`);
+
+    // Supabase free tier has a 50MB upload limit; reject oversized files
+    if (mp4Buffer.length > 45 * 1024 * 1024) {
+      console.warn(`[${tag}] MP4 too large (${outKB}KB), falling back to WebM`);
+      return null;
+    }
+
+    return mp4Buffer;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const stderr = (err as { stderr?: string })?.stderr;
+    console.warn(`[${tag}] MP4 conversion failed: ${msg.slice(0, 300)}`);
+    if (stderr) console.warn(`[${tag}] ffmpeg stderr (last 300): ${stderr.slice(-300)}`);
+    return null;
+  } finally {
+    await fs.unlink(tmpIn).catch(() => {});
+    await fs.unlink(tmpOut).catch(() => {});
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Merge AI narration audio into an existing MP4 buffer.
+//
+// Takes the silent MP4 + an MP3 narration track and mixes them using ffmpeg.
+// The video stream is copied (no re-encode). Audio is encoded as AAC.
+// The output is capped to the video duration (-shortest) so a long narration
+// track never pads the video with extra silent frames.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function mergeNarrationAudio(
+  mp4Buffer: Buffer,
+  audioBuf:  Buffer,
+  tag:       string,
+): Promise<Buffer> {
+  let ffmpegPath: string;
+  try {
+    ffmpegPath = require('ffmpeg-static') as string;
+  } catch {
+    console.warn(`[${tag}] ffmpeg-static unavailable — skipping narration merge`);
+    return mp4Buffer;
+  }
+
+  const tmpVideo = path.join('/tmp', `${randomUUID()}-video.mp4`);
+  const tmpAudio = path.join('/tmp', `${randomUUID()}-narration.mp3`);
+  const tmpOut   = path.join('/tmp', `${randomUUID()}-merged.mp4`);
+
+  try {
+    await fs.writeFile(tmpVideo, mp4Buffer);
+    await fs.writeFile(tmpAudio, audioBuf);
+
+    await execFileAsync(ffmpegPath, [
+      '-y',
+      '-i',    tmpVideo,
+      '-i',    tmpAudio,
+      '-c:v',  'copy',
+      '-c:a',  'aac',
+      '-b:a',  '96k',
+      '-map',  '0:v:0',
+      '-map',  '1:a:0',
+      '-shortest',
+      '-movflags', '+faststart',
+      tmpOut,
+    ], { timeout: 60_000, maxBuffer: 10 * 1024 * 1024 });
+
+    const merged = await fs.readFile(tmpOut);
+    console.log(`[${tag}] Narration merged: ${(mp4Buffer.length / 1024).toFixed(0)}KB → ${(merged.length / 1024).toFixed(0)}KB`);
+    return merged;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[${tag}] Narration merge failed: ${msg.slice(0, 300)}`);
+    return mp4Buffer;
+  } finally {
+    await fs.unlink(tmpVideo).catch(() => {});
+    await fs.unlink(tmpAudio).catch(() => {});
+    await fs.unlink(tmpOut).catch(() => {});
+  }
+}
+
+export interface WalletEvidence {
+  walletEnabled:       boolean;
+  walletAddress?:      string;
+  walletConnected:     boolean;
+  detectedRequests:    WalletRequestContext[];
+  rejectedRequests:    WalletRequestContext[];
+  snapshotBefore?:     { nativeSol: string };
+  snapshotAfter?:      { nativeSol: string };
+  unexpectedOutflow:   boolean;
+  safetyReport?:       string;
+  walletLog:           string[];
+}
+
+export interface VerifyClaimResult {
+  evidenceSummary:    string;
+  siteLoaded:         boolean;
+  blocked:            boolean;
+  screenshotDataUrl?: string;
+  videoUrl?:          string;
+  /** Final-state screenshot after all interactions, for visual verdict grounding. */
+  finalScreenshotDataUrl?: string;
+  /** Structured signals for the two-layer verdict system. Present only for
+   *  browser-verified claims that completed Session 2. */
+  signals?:           VerdictSignals;
+  /** Wallet-related evidence for wallet-gated claims. Present when wallet is configured. */
+  walletEvidence?:    WalletEvidence;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// stripJsRuntimeErrors
+//
+// Removes JavaScript runtime error lines (TypeError, ReferenceError, stack
+// frames, etc.) from page text before it enters any evidence or probe string.
+// These errors are extremely common background noise on React/Next.js apps and
+// must never drive a verdict on their own — they need to be scrubbed at the
+// source so no LLM call ever sees them as content.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function stripJsRuntimeErrors(text: string): string {
+  return text
+    // Full error type lines: "TypeError: Cannot read properties of undefined (reading 'x')"
+    .replace(/(?:TypeError|ReferenceError|SyntaxError|RangeError|URIError|EvalError)[^\n]{0,300}\n?/g, '')
+    // "Cannot read propert(y|ies) of undefined/null ..."
+    .replace(/Cannot read propert(?:y|ies) of (?:undefined|null)[^\n]{0,200}\n?/gi, '')
+    // Stack frames: "    at foo (bundle.js:1:2)" or "at Module.foo (webpack://...)"
+    .replace(/[ \t]+at\s+\S.*(?:\.js|\.ts|\.tsx|\.mjs|webpack)[^\n]{0,150}\n?/g, '')
+    // Remaining multi-blank lines left by stripping
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+interface AnalysisResult {
+  probes:             string[];
+  siteLoaded:         boolean;
+  blocked:            boolean;
+  pageText:           string;
+  title:              string;
+  screenshotDataUrl?: string;
+  surfaceStatus:      number | null;
+}
+
+/** Raw structured data returned by recordInteraction for signal extraction */
+interface RecordingResult {
+  probes:              string[];
+  videoUrl?:           string;
+  observations:        AgentObservation[];
+  finalPageState:      PageState;
+  runApiCalls:         string[];
+  walletEvidence:      WalletEvidence;
+  /** JPEG screenshot captured after all interactions complete.
+   *  Used by the verdict LLM for visual grounding. */
+  finalScreenshotDataUrl?: string;
+  /** True when Plan B observations were all no-ops → wallet_only_gate blocker. */
+  walletOnlyGateDetected?: boolean;
+  /** Unhandled JS errors captured by page.on('pageerror') during the run.
+   *  Distinguishes "feature page crashed" (FAILED) from "feature absent" (LARP). */
+  pageJsErrors:        string[];
+  /** Inline analysis flags (formerly Session 1). False means site unreachable/blocked. */
+  siteLoaded:          boolean;
+  blocked:             boolean;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+function normalizeUrl(website: string): string {
+  const t = website.trim();
+  return /^https?:\/\//i.test(t) ? t : `https://${t}`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Session 1 — Analysis (no recording)
+// Lightweight health check: HTTP status, screenshot, Cloudflare detection.
+// Uses analyzePageState() for richer blocker/fallback detection.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function analyzeWebsite(baseUrl: string): Promise<AnalysisResult> {
+  const probes: string[] = [];
+  let siteLoaded        = false;
+  let blocked           = false;
+  let pageText          = '';
+  let title             = '';
+  let screenshotDataUrl: string | undefined;
+  let surfaceStatus:    number | null = null;
+
+  const browser = await connectBrowser();
+
+  try {
+    const context = await browser.newContext({
+        userAgent:
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+          '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        viewport: { width: 1280, height: 720 },
+      });
+
+    const page = await context.newPage();
+    page.setDefaultTimeout(20_000);
+
+    console.log(`[verifier:analyze] Navigating to ${baseUrl}`);
+
+    let rootResp = await page
+      .goto(baseUrl, { waitUntil: 'load', timeout: 15_000 })
+      .catch(() => null);
+
+    if (!rootResp) {
+      rootResp = await page
+        .goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 10_000 })
+        .catch(() => null);
+    }
+
+    if (!rootResp) {
+      probes.push(`GET ${baseUrl} → TIMEOUT / DNS_ERROR`);
+      return { probes, siteLoaded, blocked, pageText, title, surfaceStatus: null };
+    }
+
+    await page.waitForTimeout(1_000);
+
+    const status = rootResp.status();
+    surfaceStatus = status;
+    siteLoaded    = status < 400;
+    probes.push(`GET ${baseUrl} → ${status}`);
+
+    if (status >= 500) {
+      return { probes, siteLoaded, blocked, pageText, title, surfaceStatus };
+    }
+
+    // Use analyzePageState for richer blocker detection
+    const pageState = await analyzePageState(page);
+    title    = pageState.title;
+    pageText = pageState.visibleText;
+
+    // Cloudflare / bot protection check (using both raw body and pageState blockers)
+    const bodyRaw = await page.textContent('body').catch(() => '') ?? '';
+    if (
+      pageState.blockers.includes('bot_protection') ||
+      bodyRaw.includes('Just a moment') ||
+      bodyRaw.includes('Checking your browser') ||
+      bodyRaw.includes('cf-browser-verification')
+    ) {
+      blocked = true;
+      probes.push('BLOCKED: Cloudflare / bot protection');
+      return { probes, siteLoaded, blocked, pageText, title, surfaceStatus };
+    }
+
+    if (title)  probes.push(`Page title: "${title}"`);
+    const cleanedProbeText = stripJsRuntimeErrors(pageText);
+    if (cleanedProbeText.length > 20)  probes.push(`Page content:\n${cleanedProbeText}`);
+    else if (pageText.length > 20)     probes.push('Page content: initial client render noise only — no stable text captured');
+    else                               probes.push('Page content: empty (SPA render delay or auth wall)');
+
+    // Log detected blockers
+    if (pageState.blockers.length > 0) {
+      probes.push(`Blockers detected: ${pageState.blockers.join(', ')}`);
+    }
+
+    // UI summary
+    probes.push(`UI: ${pageState.buttons.length} button(s), ${pageState.forms.flatMap(f => f.inputs).length} input(s), ${pageState.links.length} link(s)`);
+
+    // Screenshot
+    try {
+      const buf = await page.screenshot({
+        type: 'jpeg', quality: 55,
+        clip: { x: 0, y: 0, width: 1280, height: 720 },
+      });
+      screenshotDataUrl = `data:image/jpeg;base64,${buf.toString('base64')}`;
+      console.log(`[verifier:analyze] Screenshot: ${Math.round(buf.length / 1024)}KB`);
+    } catch { /* non-fatal */ }
+
+    if (!isBrowserlessMode()) {
+      await context.close().catch(() => {});
+    }
+  } finally {
+    await browser.close().catch(() => {});
+  }
+
+  return { probes, siteLoaded, blocked, pageText, title, screenshotDataUrl, surfaceStatus };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// waitForPageStability — ensures the DOM has hydrated before analyzePageState.
+//
+// SPAs (React/Next.js) render an empty body until JavaScript runs. If we call
+// analyzePageState immediately after navigation the page state snapshot may
+// capture empty forms/buttons, triggering false auth_required hard-stops.
+// This helper waits for either networkidle OR any visible heading/button —
+// whichever comes first — capping the wait at 2s so it never blocks long.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function waitForPageStability(page: Page): Promise<void> {
+  await Promise.race([
+    page.waitForLoadState('networkidle', { timeout: 2000 }),
+    page.waitForSelector('button, h1, h2', { timeout: 2000 }),
+  ]).catch(() => {});
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Session 2 — Interaction recording
+// Planning happens here in the live recording session so the planner always
+// sees the true rendered DOM state, not a stale Session 1 snapshot.
+// Returns raw structured data (observations, finalPageState, runApiCalls) in
+// addition to probes/videoUrl so verifyClaim can build VerdictSignals.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function recordInteraction(
+  baseUrl:       string,
+  homepageUrl:   string,
+  claimId:       string,
+  claim:         string,
+  passCondition: string,
+  featureType:   string,
+  surface:       string,
+  strategy:      string,
+  recordingsDir: string,
+  sessionId:     string,
+  runMemory:     RunMemory,
+  // Hard upper bound on the entire browser session — when reached the browser
+  // is forcefully closed so the Browserless connection slot is freed even if
+  // the outer Promise.race in the claim route already abandoned this function.
+  maxSessionMs = 450_000,
+): Promise<RecordingResult> {
+  const probes: string[] = [];
+  let videoUrl: string | undefined;
+  let finalScreenshotDataUrl: string | undefined;
+  let siteLoaded = false;
+  let blocked    = false;
+
+  // Fallback empty page state returned if Session 2 fails entirely
+  const emptyPageState: PageState = {
+    url: baseUrl, title: '', visibleText: '', navLinks: [], links: [],
+    routeCandidates: [], ctaCandidates: [], buttons: [], forms: [],
+    headings: [], sectionLabels: [], tableHeaders: [], chartSignals: [],
+    disabledControls: [], blockers: [], hasModal: false, apiSignals: [],
+  };
+
+  const useBrowserless = isBrowserlessMode();
+  const browser = await connectBrowser({ record: useBrowserless });
+
+  // Hard session kill — fires maxSessionMs after the browser connects.
+  // Ensures the Browserless slot is freed even when the outer Promise.race
+  // in the claim route has already abandoned this function (zombie prevention).
+  // clearTimeout(sessionKillTimer) is called in the finally block below.
+  const sessionKillTimer = setTimeout(() => {
+    console.warn(`[verifier:record] Hard session kill after ${maxSessionMs / 1_000}s — closing Browserless connection`);
+    browser.close().catch(() => {});
+  }, maxSessionMs);
+
+  let context: Awaited<ReturnType<typeof browser.newContext>> | null = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- CDP session for Browserless recording
+  let cdpSession: any = null;
+  let recordingStartMs = 0;
+  let allObservations: AgentObservation[] = [];
+  let allNarrationSegments: NarrationSegment[] = [];
+  let finalPageState: PageState = emptyPageState;
+  const runApiCalls: string[] = [];
+  let walletOnlyGateDetected = false;
+  let earlyRecordingBuffer: Buffer | null = null;
+  let earlyRecordingDurationMs = 0;
+  const pageJsErrors: string[] = [];
+
+  // ── Wallet setup ────────────────────────────────────────────────────────
+  const walletEnabled  = isWalletConfigured();
+  const walletAddress  = investigationWalletAddress;
+  const walletPolicy   = policyForFeatureType(featureType);
+  const allWalletLogs: string[] = [];
+  const allDetectedRequests: WalletRequestContext[] = [];
+  const allRejectedRequests: WalletRequestContext[] = [];
+  let walletConnectedAny = false;
+  let spentSolThisRun  = 0;
+
+  const walletEvidence: WalletEvidence = {
+    walletEnabled,
+    walletAddress:     walletAddress ?? undefined,
+    walletConnected:   false,
+    detectedRequests:  [],
+    rejectedRequests:  [],
+    unexpectedOutflow: false,
+    walletLog:         [],
+  };
+
+  if (walletEnabled) {
+    console.log(`[verifier:record] Wallet-aware session — address: ${walletAddress}`);
+  }
+
+  try {
+    const enableRecording = useBrowserless;
+
+    if (enableRecording) {
+      console.log('[verifier:record] Video recording ENABLED (Browserless CDP)');
+    } else {
+      console.log('[verifier:record] Video recording DISABLED (local mode — set BROWSERLESS_TOKEN to enable)');
+    }
+
+    // connectOverCDP gives us one default context that inherits the proxy and
+    // stealth settings from the connection URL. Creating a new context would
+    // lose those settings, so we always reuse the default context in Browserless.
+    // IMPORTANT: We still call context.newPage() — we do NOT reuse the existing
+    // default page. Recording is tied to the context (not the page), so creating
+    // a fresh page within the default context is both safe and correct.
+    context = useBrowserless
+      ? browser.contexts()[0] ?? await browser.newContext()
+      : await browser.newContext({
+          userAgent:
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+            '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          viewport:    { width: 1280, height: 720 },
+        });
+
+    // Install signing bridge FIRST so it's available when addInitScript runs.
+    // Pass sessionId so this run's tx hashes are isolated from concurrent runs.
+    if (walletEnabled && walletAddress && featureType !== 'DATA_DASHBOARD') {
+      await exposeSigningBridge(context, sessionId);
+      await injectWalletMockIntoContext(context, walletAddress);
+    }
+
+    const page = await context.newPage();
+    page.setDefaultTimeout(20_000);
+
+    // ── Run-level network listener ──────────────────────────────────────────
+    page.on('response', (response) => {
+      const url    = response.url();
+      const status = response.status();
+      if (
+        url.includes('/api/') || url.includes('.json') ||
+        url.includes('graphql') || url.includes('/rpc') ||
+        url.includes('/v1/')   || url.includes('/v2/')
+      ) {
+        runApiCalls.push(`${status} ${url}`);
+      }
+    });
+
+    // ── Unhandled JS error listener ─────────────────────────────────────────
+    page.on('pageerror', (error) => {
+      const msg = error.message ?? '';
+      if (
+        /Cannot read propert|is not a function|is not defined|Cannot set propert|undefined is not|null is not/i.test(msg)
+      ) {
+        pageJsErrors.push(msg.slice(0, 200));
+        console.warn(`[verifier:pageerror] JS crash captured: ${msg.slice(0, 100)}`);
+      }
+    });
+
+    // baseDomain must always be the root origin so that navigate("/path") steps
+    // never produce double-paths like /create/create.
+    const baseDomain = new URL(baseUrl).origin;
+
+    // ── Inline analysis (formerly Session 1) ────────────────────────────────
+    // Check HTTP status + Cloudflare BEFORE starting the recording so we never
+    // waste a recording session on a blocked or unreachable page.
+    console.log(`[verifier:record] Navigating to ${baseUrl} (baseDomain: ${baseDomain})`);
+    let navResp = await page.goto(baseUrl, { waitUntil: 'load', timeout: 30_000 }).catch(() => null);
+    if (!navResp) {
+      navResp = await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 }).catch(() => null);
+    }
+
+    if (!navResp) {
+      probes.push(`GET ${baseUrl} → TIMEOUT / DNS_ERROR`);
+      return { probes, siteLoaded: false, blocked: false, observations: [], finalPageState: emptyPageState, runApiCalls, walletEvidence, pageJsErrors };
+    }
+
+    const navStatus = navResp.status();
+    siteLoaded = navStatus < 400;
+    probes.push(`GET ${baseUrl} → ${navStatus}`);
+
+    if (navStatus >= 500) {
+      return { probes, siteLoaded, blocked: false, observations: [], finalPageState: emptyPageState, runApiCalls, walletEvidence, pageJsErrors };
+    }
+
+    // Cloudflare / bot protection check — bail out before recording starts
+    // Use a 5s timeout — on heavy SPAs the body may not be queryable yet,
+    // but we don't want to hang here waiting for a layout-ready main thread.
+    const bodyRaw = await Promise.race([
+      page.textContent('body').catch(() => ''),
+      new Promise<string>((r) => setTimeout(() => r(''), 5_000)),
+    ]) ?? '';
+    if (
+      bodyRaw.includes('Just a moment') ||
+      bodyRaw.includes('Checking your browser') ||
+      bodyRaw.includes('cf-browser-verification')
+    ) {
+      blocked = true;
+      probes.push('BLOCKED: Cloudflare / bot protection');
+      return { probes, siteLoaded: true, blocked: true, observations: [], finalPageState: emptyPageState, runApiCalls, walletEvidence, pageJsErrors };
+    }
+
+    // ── Surface fallback (inline — no second connection needed) ─────────────
+    // If the specific surface path is unreachable, retry from the homepage
+    // within the same browser session instead of opening a new connection.
+    let effectiveBaseUrl = baseUrl;
+    if (surface && surface !== '/' && baseUrl !== homepageUrl) {
+      // page.evaluate has no built-in timeout — add a 5s race guard so a
+      // busy SPA main thread doesn't stall the session here.
+      const pageText = await Promise.race([
+        page.evaluate(() => (document.body as HTMLElement).innerText ?? '').catch(() => ''),
+        new Promise<string>((r) => setTimeout(() => r(''), 5_000)),
+      ]);
+      const isLoginWall = /sign in|log in|connect wallet|wallet required/i.test(pageText);
+      const isUnreachable =
+        !isLoginWall &&
+        (navStatus === 404 || navStatus === 410 || navStatus >= 500 || pageText.trim().length < 20);
+
+      if (isUnreachable) {
+        console.warn(`[verifier:record] Surface "${surface}" unreachable (status=${navStatus}) — navigating to homepage`);
+        probes.push(`Surface "${surface}" unreachable (HTTP ${navStatus}) — retried from homepage`);
+        const fallbackResp = await page.goto(homepageUrl, { waitUntil: 'load', timeout: 15_000 }).catch(() => null);
+        if (fallbackResp && fallbackResp.status() < 400) {
+          effectiveBaseUrl = homepageUrl;
+          siteLoaded = true;
+        }
+      }
+    }
+
+    // ── Hydration wait + recording start ────────────────────────────────────
+    // When a wallet mock is active the page uses wagmi localStorage pre-connect;
+    // wagmi v2 with ssr:true needs ~4-5 s to hydrate before the connected state
+    // appears in the DOM. Use a longer wait so analyzePageState sees the correct
+    // connected state and doesn't emit a false wallet_required blocker.
+    await page.waitForTimeout(walletEnabled && featureType !== 'DATA_DASHBOARD' ? 5_000 : 2_500);
+
+    // Start CDP recording AFTER the page has loaded and rendered so the video
+    // begins with the actual site content instead of a blank white page.
+    // context.newCDPSession can hang indefinitely on CPU-heavy SPAs (e.g.
+    // pump.fun) because Chrome's main thread is saturated and CDP messages
+    // queue up without replies. Guard with a hard 10-second timeout.
+    if (enableRecording) {
+      try {
+        cdpSession = await Promise.race([
+          context.newCDPSession(page),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('CDP session creation timed out (10s)')), 10_000),
+          ),
+        ]);
+        await cdpSession.send('Browserless.startRecording');
+        recordingStartMs = Date.now();
+        console.log('[verifier:record] CDP recording started (post-navigation)');
+      } catch (recErr) {
+        console.warn('[verifier:record] CDP recording start failed (non-fatal):', recErr);
+        cdpSession = null;
+      }
+    }
+    // Update baseDomain if surface fallback navigated to homepage
+    const effectiveBaseDomain = new URL(effectiveBaseUrl).origin;
+
+    // ── Dismiss cookie / GDPR consent banners ────────────────────────────────
+    // Many sites show a consent overlay that blocks all interaction until
+    // accepted. Dismiss it before wallet connect or any agent steps.
+    // Cap to 10 s — on heavy SPAs (pump.fun) page.evaluate inside this
+    // function can hang if the browser main thread is saturated.
+    await Promise.race([
+      dismissConsentBanner(page),
+      new Promise<void>((r) => setTimeout(r, 10_000)),
+    ]);
+
+    // ── Early wallet connect — before planning ────────────────────────────
+    // Connect the investigation wallet as soon as the page loads so the
+    // planner sees the post-connection DOM state (unlocked forms, hidden CTAs).
+    // DATA_DASHBOARD claims are read-only — no wallet needed, skip entirely.
+    // Cap to 45 s — heavy SPAs (pump.fun, etc.) have a busy JS main thread
+    // that makes each page.evaluate inside handleWalletPopups very slow. If
+    // we let this run indefinitely it consumes the whole 340 s session budget.
+    if (walletEnabled && walletAddress && featureType !== 'DATA_DASHBOARD') {
+      const earlyWallet = await Promise.race([
+        handleWalletPopups(
+          page, walletAddress, walletPolicy, featureType, 'recon', spentSolThisRun,
+        ),
+        new Promise<Awaited<ReturnType<typeof handleWalletPopups>>>((resolve) =>
+          setTimeout(
+            () => resolve({ detectedRequests: [], walletConnected: false, rejectedRequests: [], log: ['[wallet] Early connect timed out (45 s) — proceeding to agent'] }),
+            45_000,
+          ),
+        ),
+      ]);
+      allWalletLogs.push(...earlyWallet.log);
+      allDetectedRequests.push(...earlyWallet.detectedRequests);
+      allRejectedRequests.push(...earlyWallet.rejectedRequests);
+      if (earlyWallet.walletConnected) {
+        walletConnectedAny = true;
+        probes.push(`Investigation wallet connected early (address: ${walletAddress})`);
+        // Give the site time to re-render after wallet connection
+        await page.waitForTimeout(2_500);
+      }
+    }
+
+    // ── Phase 1: Live page analysis + Plan A ────────────────────────────────
+    console.log('[verifier:record] Analyzing page state...');
+    // Wait for the DOM to hydrate before snapshotting — prevents false empty
+    // forms/buttons on SPAs that render after JS runs.
+    await waitForPageStability(page);
+    // Extra settle time after a wallet sign event — pump.fun and similar SPAs
+    // trigger a full re-render after connecting a wallet (Phantom wallet-adapter state
+    // propagation). page.evaluate() calls queue behind that render, causing
+    // analyzePageState to time out with empty routes. A brief pause here allows
+    // the re-render to complete before we snapshot the DOM.
+    if (walletConnectedAny) {
+      await page.waitForTimeout(3_000);
+    }
+    // Set a short evaluation timeout so page.evaluate() calls in analyzePageState
+    // complete quickly on pages with busy JS threads (live polling, wallet init).
+    // Without this, each of the 16 evaluate() calls could hang indefinitely.
+    page.setDefaultTimeout(5_000);
+    const pageState = await Promise.race([
+      analyzePageState(
+        page,
+        walletConnectedAny ? walletAddress ?? undefined : undefined,
+      ),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('[verifier] analyzePageState timeout (25s)')), 25_000),
+      ),
+    ]).catch((err) => {
+      console.warn('[verifier:record] Phase 1 page analysis timed out — using empty state:', String(err).slice(0, 120));
+      // Use the actual redirected URL (e.g. pump.fun redirects / → /en).
+      // This is critical for the planner's emergency fallback to derive the
+      // correct language prefix (e.g. /en/create-token instead of /create-token).
+      const actualUrl = page.isClosed() ? baseUrl : (page.url() || baseUrl);
+      return { ...emptyPageState, url: actualUrl };
+    });
+    page.setDefaultTimeout(20_000);
+    pageState.apiSignals = [...runApiCalls];
+
+    console.log(
+      `[verifier:record] Page state — blockers: [${pageState.blockers.join(', ')}], ` +
+      `routes: [${pageState.routeCandidates.join(', ')}], buttons: ${pageState.buttons.length}`,
+    );
+
+    // ── Change A: Pre-planner fast exit for hard blockers ──────────────────
+    // Skip planWorkflow when the page is genuinely unreachable.
+    // NOTE: auth_required and wallet_required are intentionally excluded here —
+    // on web3 creation/wallet pages these often just mean "wallet not connected yet",
+    // and the early wallet connect + agent interaction can navigate past them.
+    const HARD_BLOCKERS = ['bot_protection', 'page_broken', 'coming_soon', 'geo_blocked'];
+    const hasHardBlocker = pageState.blockers.some((b) => HARD_BLOCKERS.includes(b));
+
+    if (hasHardBlocker) {
+      console.log(`[verifier:record] Pre-planner skip — hard blocker detected: [${pageState.blockers.join(', ')}]`);
+    }
+
+    // ── DATA_DASHBOARD fast path ─────────────────────────────────────────────
+    // If dashboard data (table headers or chart signals) is already visible at
+    // page load with no blockers, skip the full agent loop entirely.
+    // The old approach (skip planWorkflow but keep executeSteps) caused the agent
+    // to navigate away before JS rendered the data. Skipping executeSteps too
+    // prevents that and saves the full LLM plan + up to 12 agent steps.
+    const dataAlreadyVisible =
+      (featureType === 'DATA_DASHBOARD' || featureType === 'dashboard+browser') &&
+      (pageState.tableHeaders.length >= 2 || pageState.chartSignals.length >= 3) &&
+      pageState.blockers.length === 0;
+
+    if (dataAlreadyVisible) {
+      console.log('[verifier:record] DATA_DASHBOARD fast path — data visible, skipping agent loop');
+      // Scroll + wait so the recording captures live feed updates (prices, new tokens, etc.)
+      // Without this the video is only ~5 s and shows a static snapshot.
+      try {
+        await page.evaluate(() => window.scrollTo({ top: 400, behavior: 'smooth' }));
+        await page.waitForTimeout(4_000);
+        await page.evaluate(() => window.scrollTo({ top: 800, behavior: 'smooth' }));
+        await page.waitForTimeout(4_000);
+        await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'smooth' }));
+        await page.waitForTimeout(2_000);
+      } catch { /* non-fatal */ }
+      // Capture a final screenshot as proof
+      try {
+        const buf = await page.screenshot({ type: 'jpeg', quality: 65, fullPage: false });
+        finalScreenshotDataUrl = `data:image/jpeg;base64,${buf.toString('base64')}`;
+      } catch { /* non-fatal */ }
+      // Synthetic observation so VerdictSignals sees at least one step
+      allObservations.push({
+        step: 'observe: Dashboard data visible at page load — fast path',
+        result: `Dashboard confirmed: headers=[${pageState.tableHeaders.slice(0, 4).join(', ')}]`,
+        isNoop: false,
+        visibleSignals: ['data_visible', 'table_loaded'],
+        newInputs: [],
+      });
+      finalPageState = pageState;
+    }
+
+    if (!dataAlreadyVisible) {
+    // ── Phase 1.5: Workflow hypothesis (recon → hypothesis) ─────────────────
+    const hypothesis = buildWorkflowHypothesis(claim, featureType, pageState);
+    console.log(
+      `[verifier:record] Hypothesis — likelySurface: ${hypothesis.likelySurface ?? 'n/a'}, ` +
+      `firstAction: ${hypothesis.firstMeaningfulAction ? JSON.stringify(hypothesis.firstMeaningfulAction) : 'n/a'}`,
+    );
+
+    // Capture a planning screenshot — passed to the planner so it can visually
+    // understand the page layout before generating steps, just like a human
+    // tester would look at the page before writing their test plan.
+    let planningScreenshotDataUrl: string | undefined;
+    try {
+      const buf = await page.screenshot({ type: 'jpeg', quality: 65, fullPage: false });
+      planningScreenshotDataUrl = `data:image/jpeg;base64,${buf.toString('base64')}`;
+    } catch { /* non-fatal */ }
+
+    let attemptMemory: AttemptMemory = {
+      attemptedRoutes: [],
+      attemptedCtas: [],
+      attemptedActions: [],
+      noopActions: [],
+    };
+
+    const planA = hasHardBlocker
+      ? []
+      : await planWorkflow(
+          claim, passCondition, featureType, surface, strategy, pageState,
+          walletAddress ?? undefined,
+          planningScreenshotDataUrl,
+          runMemory,
+        );
+    console.log(`[verifier:record] Plan A: ${planA.length} step(s)`);
+
+    // ── Pre-execution wallet snapshot ────────────────────────────────────────
+    let snapshotBefore = walletEnabled ? await takeSnapshot() : null;
+    if (snapshotBefore) {
+      allWalletLogs.push(`[wallet] Pre-run balance: ${snapshotBefore.nativeSol} SOL`);
+    }
+
+    // ── Phase 2: Execute Plan A ─────────────────────────────────────────────
+    if (planA.length > 0) {
+      const planAResult = await executeSteps(page, planA, effectiveBaseDomain, runApiCalls, {
+        stage:                      'execution',
+        hypothesis,
+        investigationWalletAddress: walletAddress ?? undefined,
+        claim,
+        passCondition,
+        featureType,
+        recordingStartMs,
+      });
+      allObservations = planAResult.observations;
+      allNarrationSegments.push(...planAResult.narrationSegments);
+      attemptMemory = updateAttemptMemory(attemptMemory, planAResult.observations);
+    } else {
+      probes.push(`Planning returned empty plan — blockers: [${pageState.blockers.join(', ')}]`);
+    }
+
+    // ── Wallet popup check after Plan A (only if not already connected) ──────
+    if (walletEnabled && walletAddress && !walletConnectedAny) {
+      const walletResult = await handleWalletPopups(
+        page, walletAddress, walletPolicy, featureType, 'execution', spentSolThisRun,
+      );
+      allWalletLogs.push(...walletResult.log);
+      allDetectedRequests.push(...walletResult.detectedRequests);
+      allRejectedRequests.push(...walletResult.rejectedRequests);
+      if (walletResult.walletConnected) {
+        walletConnectedAny = true;
+        probes.push(`Wallet connected (address: ${walletAddress})`);
+        await page.waitForTimeout(2_000);
+      }
+    }
+
+    // ── Phase 3: Adaptive replanning ───────────────────────────────────────
+    const shouldReplan     = planA.length > 0 && shouldTriggerRecovery(allObservations, 15);
+    const totalSteps       = allObservations.length;
+
+    if (shouldReplan) {
+      console.log('[verifier:record] Replanning threshold reached — generating Plan B...');
+
+      // Build RunMemory from Plan A observations so Plan B knows what was already tried.
+      updateRunMemory(runMemory, allObservations, featureType, walletConnectedAny);
+
+      await waitForPageStability(page);
+
+      const updatedPageState = await analyzePageState(
+        page,
+        walletConnectedAny ? walletAddress ?? undefined : undefined,
+      );
+      updatedPageState.apiSignals = [...runApiCalls];
+
+      // Capture a screenshot for the recovery planner so it reasons visually
+      // about the current page state, not just DOM text.
+      let replanScreenshotDataUrl: string | undefined;
+      try {
+        const buf = await page.screenshot({ type: 'jpeg', quality: 60, fullPage: false });
+        replanScreenshotDataUrl = `data:image/jpeg;base64,${buf.toString('base64')}`;
+      } catch { /* non-fatal */ }
+
+      const planB = await replanWorkflow(
+        claim, passCondition, featureType, surface, strategy,
+        updatedPageState, allObservations, attemptMemory,
+        walletAddress ?? undefined,
+        runMemory,
+        replanScreenshotDataUrl,
+      );
+
+      if (planB.length > 0) {
+        const remainingBudget = Math.max(0, 15 - totalSteps);
+        const planBCapped     = planB.slice(0, remainingBudget);
+
+        console.log(`[verifier:record] Plan B: ${planBCapped.length} step(s) (budget remaining: ${remainingBudget})`);
+        const planBResult = await executeSteps(page, planBCapped, effectiveBaseDomain, runApiCalls, {
+          stage:                      'recovery',
+          hypothesis,
+          investigationWalletAddress: walletAddress ?? undefined,
+          claim,
+          passCondition,
+          featureType,
+          recordingStartMs,
+        });
+        allObservations   = [...allObservations, ...planBResult.observations];
+        allNarrationSegments.push(...planBResult.narrationSegments);
+        attemptMemory = updateAttemptMemory(attemptMemory, planBResult.observations);
+
+        // Wallet popup check after Plan B (only if not already connected)
+        if (walletEnabled && walletAddress && !walletConnectedAny) {
+          const walletResultB = await handleWalletPopups(
+            page, walletAddress, walletPolicy, featureType, 'recovery', spentSolThisRun,
+          );
+          allWalletLogs.push(...walletResultB.log);
+          allDetectedRequests.push(...walletResultB.detectedRequests);
+          allRejectedRequests.push(...walletResultB.rejectedRequests);
+          if (walletResultB.walletConnected) {
+            walletConnectedAny = true;
+          }
+        }
+
+        // If plan B also produced only no-ops, record wallet_only_gate signal
+        const planBNoops = planBResult.observations.filter((o) => o.isNoop).length;
+        if (planBNoops === planBResult.observations.length && planBResult.observations.length > 0) {
+          walletOnlyGateDetected = true;
+          probes.push('No meaningful interaction possible — feature may require wallet or is not accessible without authentication (wallet_only_gate)');
+        }
+      } else {
+        probes.push('Replanning returned empty plan — no alternative approach found');
+      }
+    }
+
+    // ── Stop recording immediately — agent work is done ─────────────────────
+    // Capture the video buffer NOW so the video ends on the agent's final
+    // action, not 20-30s later during post-processing / evidence building.
+    if (cdpSession) {
+      try {
+        earlyRecordingDurationMs = Date.now() - recordingStartMs;
+        console.log(`[verifier:record] Stopping CDP recording early (${(earlyRecordingDurationMs / 1000).toFixed(1)}s — right after agent finished)`);
+        const response = await cdpSession.send('Browserless.stopRecording');
+        earlyRecordingBuffer = parseRecordingResponse(response);
+        if (earlyRecordingBuffer) {
+          console.log(`[verifier:record] Early recording captured: ${(earlyRecordingBuffer.length / 1024).toFixed(0)}KB`);
+          cdpSession = null; // successfully captured — prevent double-stop in finally
+        } else {
+          console.warn(`[verifier:record] stopRecording returned no usable data. Full response: ${JSON.stringify(response).slice(0, 500)}`);
+          // Do NOT null cdpSession here — let the finally block retry with a fresh stop call
+        }
+      } catch (e) {
+        console.warn('[verifier:record] Early recording stop failed (will retry in finally):', e);
+      }
+    }
+
+    // ── Generate closing narration segment ─────────────────────────────────
+    if (allNarrationSegments.length > 0 && earlyRecordingDurationMs > 0) {
+      const stepCount = allObservations.length;
+      const lastObs = allObservations[allObservations.length - 1];
+      const lastUrl = lastObs?.url ?? 'unknown page';
+      const closingText = `Verification complete. The agent performed ${stepCount} steps and finished on ${lastUrl.replace(/^https?:\/\//, '')}.`;
+      allNarrationSegments.push({
+        text: closingText,
+        timestampMs: Math.max(0, earlyRecordingDurationMs - 3000),
+      });
+    }
+
+    // ── Phase 4: Final page state + evidence summary ────────────────────────
+    finalPageState = await analyzePageState(
+      page,
+      walletConnectedAny ? walletAddress ?? undefined : undefined,
+    );
+    finalPageState.apiSignals = [...runApiCalls];
+
+    // Capture a final screenshot AFTER all interactions. This is passed to the
+    // verdict LLM for visual grounding — it can see the actual post-interaction
+    // UI state (wallet connected, form filled, result loaded) rather than
+    // inferring it from truncated text evidence.
+    try {
+      const buf = await page.screenshot({ type: 'jpeg', quality: 70, fullPage: false });
+      finalScreenshotDataUrl = `data:image/jpeg;base64,${buf.toString('base64')}`;
+      console.log('[verifier:record] Final screenshot captured for verdict visual grounding');
+    } catch {
+      console.warn('[verifier:record] Final screenshot failed (non-fatal)');
+    }
+
+    const evidenceBlock = buildEvidenceSummary(allObservations, finalPageState, runApiCalls, baseUrl);
+    probes.push(evidenceBlock);
+
+    console.log(`[verifier:record] Final URL: ${finalPageState.url}`);
+    console.log(`[verifier:record] Total steps: ${allObservations.length}, API calls: ${runApiCalls.length}`);
+
+    // ── Post-execution wallet snapshot + safety check ───────────────────────
+    if (walletEnabled) {
+      const snapshotAfter = await takeSnapshot();
+
+      if (snapshotBefore && snapshotAfter) {
+        const safetyResult = await runSafetyMonitor({
+          snapshotBefore,
+          snapshotAfter,
+          txHashes:            [],   // future: collect from wallet client
+          expectedMaxOutflowLamports: BigInt(0),
+        });
+
+        const safetyText = formatSafetyReport(safetyResult);
+        probes.push(safetyText);
+        allWalletLogs.push(`[wallet] Post-run balance: ${snapshotAfter.nativeSol} SOL`);
+        allWalletLogs.push(formatDiff(safetyResult.snapshotDiff!));
+
+        walletEvidence.snapshotBefore     = { nativeSol: snapshotBefore.nativeSol };
+        walletEvidence.snapshotAfter      = { nativeSol: snapshotAfter.nativeSol };
+        walletEvidence.unexpectedOutflow  = safetyResult.unexpectedOutflow;
+        walletEvidence.safetyReport       = safetyText;
+
+        if (safetyResult.haltRun) {
+          probes.push('⚠ WALLET SAFETY: unexpected outflow detected — further wallet actions halted');
+          console.warn('[verifier:record] Wallet safety halt triggered');
+        }
+      }
+
+      walletEvidence.walletConnected  = walletConnectedAny;
+      walletEvidence.detectedRequests = allDetectedRequests;
+      walletEvidence.rejectedRequests = allRejectedRequests;
+      walletEvidence.walletLog        = allWalletLogs;
+
+      if (allWalletLogs.length > 0) {
+        probes.push(`\n--- Wallet Evidence ---\n${allWalletLogs.join('\n')}`);
+      }
+      if (allDetectedRequests.length > 0) {
+        probes.push(
+          `Wallet requests intercepted: ${allDetectedRequests.map((r) => r.description).join(' | ')}`,
+        );
+      }
+      if (allRejectedRequests.length > 0) {
+        probes.push(
+          `Wallet requests rejected by policy: ${allRejectedRequests.map((r) => r.description).join(' | ')}`,
+        );
+      }
+    } // closes if (walletEnabled)
+    } // end if (!dataAlreadyVisible)
+
+    // ── Evidence summary (both fast-path and full-path) ──────────────────────
+    if (allObservations.length > 0 && !probes.some((p) => p.includes('Step'))) {
+      const evidenceBlock = buildEvidenceSummary(allObservations, finalPageState, runApiCalls, baseUrl);
+      probes.push(evidenceBlock);
+    }
+    console.log(`[verifier:record] Final URL: ${finalPageState.url}`);
+    console.log(`[verifier:record] Total steps: ${allObservations.length}, API calls: ${runApiCalls.length}`);
+
+  } finally {
+    // Cancel the hard session kill timer — the session ended normally.
+    clearTimeout(sessionKillTimer);
+
+    // Use the early-captured recording buffer if available (stopped right
+    // after agent finished). Fall back to stopping now if early stop failed.
+    let rawBuffer: Buffer | null = earlyRecordingBuffer;
+    let durationMs = earlyRecordingDurationMs;
+
+    if (!rawBuffer && cdpSession) {
+      try {
+        durationMs = Date.now() - recordingStartMs;
+        console.log(`[verifier:record] Stopping CDP recording (fallback, ${(durationMs / 1000).toFixed(1)}s)...`);
+        const response = await cdpSession.send('Browserless.stopRecording');
+        rawBuffer = parseRecordingResponse(response);
+        if (!rawBuffer) {
+          // Log the full response so we can see exactly what Browserless returned
+          const responseStr = JSON.stringify(response);
+          console.warn(`[verifier:record] Fallback stopRecording returned no usable data.`);
+          console.warn(`[verifier:record] Response type: ${typeof response}, keys: ${response && typeof response === 'object' ? Object.keys(response as object).join(', ') : 'n/a'}`);
+          console.warn(`[verifier:record] Response (first 600): ${responseStr.slice(0, 600)}`);
+        }
+      } catch (e) {
+        console.warn('[verifier:record] Video save failed (non-fatal):', e);
+      }
+    }
+
+    if (rawBuffer && rawBuffer.length > 0) {
+      try {
+        console.log(`[verifier:record] Processing recording: ${(rawBuffer.length / 1024).toFixed(0)}KB, ${(durationMs / 1000).toFixed(1)}s`);
+        let uploadBuffer: Buffer = rawBuffer;
+        let fileName = `${claimId}.webm`;
+        let contentType = 'video/webm';
+
+        const mp4 = await convertWebmToMp4(rawBuffer, 'verifier:record');
+        if (mp4) {
+          const narrationBuf = await generateNarration(allNarrationSegments, durationMs);
+          uploadBuffer = narrationBuf
+            ? await mergeNarrationAudio(mp4, narrationBuf, 'verifier:record')
+            : mp4;
+          fileName = `${claimId}.mp4`;
+          contentType = 'video/mp4';
+        } else {
+          try {
+            const rawBlob = new Blob([new Uint8Array(rawBuffer)], { type: 'video/webm' });
+            const fixedBlob = await fixWebmDuration(rawBlob);
+            uploadBuffer = Buffer.from(await fixedBlob.arrayBuffer());
+            console.log('[verifier:record] WebM patched with duration + cues (fallback)');
+          } catch (fixErr) {
+            console.warn('[verifier:record] WebM patch failed (uploading raw):', fixErr);
+          }
+        }
+
+        await supabase.storage.createBucket('recordings', { public: true }).catch(() => {});
+
+        const { error: uploadErr } = await supabase.storage
+          .from('recordings')
+          .upload(fileName, uploadBuffer, {
+            contentType,
+            upsert: true,
+          });
+
+        if (uploadErr) {
+          console.warn(`[verifier:record] Supabase upload error: ${uploadErr.message}`);
+        } else {
+          const { data } = supabase.storage
+            .from('recordings')
+            .getPublicUrl(fileName);
+          videoUrl = data.publicUrl;
+          console.log(`[verifier:record] Video uploaded → ${videoUrl}`);
+        }
+      } catch (e) {
+        console.warn('[verifier:record] Video processing failed (non-fatal):', e);
+      }
+    } else if (earlyRecordingBuffer === null && cdpSession) {
+      console.warn('[verifier:record] No recording data captured');
+    }
+
+    // connectOverCDP default context — do NOT close it explicitly or the
+    // entire browser connection tears down prematurely.
+    if (context && !useBrowserless) {
+      await context.close().catch(() => {});
+    }
+    await browser.close().catch(() => {});
+    console.log('[verifier:record] Browser closed');
+  }
+
+  return { probes, videoUrl, observations: allObservations, finalPageState, runApiCalls, walletEvidence, finalScreenshotDataUrl, walletOnlyGateDetected, pageJsErrors, siteLoaded, blocked };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public entry point
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function verifyClaim(
+  website:       string,
+  claim:         string,
+  passCondition: string,
+  claimId:       string,
+  surface?:      string,
+  featureType?:  string,
+  strategy?:     string,
+): Promise<VerifyClaimResult> {
+  // Session ID isolates this claim's tx hashes from concurrent verifications.
+  // Generated here so it spans both recordInteraction() and drainTransactionHashes().
+  const sessionId = randomUUID();
+
+  const baseUrl  = normalizeUrl(website);
+  const startUrl = surface && surface !== '/'
+    ? `${baseUrl.replace(/\/$/, '')}${surface}`
+    : baseUrl;
+
+  const effectiveSurface  = surface  ?? '/';
+  const effectiveFeature  = featureType ?? 'UI_FEATURE';
+  const effectiveStrategy = strategy    ?? 'ui+browser';
+
+  console.log(`\n[verifier] ══ Claim: "${claim.slice(0, 60)}" ══`);
+  console.log(`[verifier] Feature: ${effectiveFeature} | Strategy: ${effectiveStrategy} | Surface: ${effectiveSurface}`);
+  if (startUrl !== baseUrl) {
+    console.log(`[verifier] Surface override: ${startUrl}`);
+  }
+
+  // ── Single session: analyse + record + execute ───────────────────────────
+  // Session 1 (analyzeWebsite) is now inlined at the start of recordInteraction.
+  // This halves the number of Browserless connections per claim.
+  const recordingsDir = isServerlessRuntime()
+    ? path.join('/tmp', 'recordings')
+    : path.join(process.cwd(), 'public', 'recordings');
+  await fs.mkdir(recordingsDir, { recursive: true });
+
+  // WALLET_FLOW / TOKEN_CREATION claims get a larger session budget: they need
+  // to navigate to a create-token page, fill a multi-field form, and await a
+  // Solana transaction — all within a single Browserless session.  The Vercel
+  // maxDuration is 540 s, so cap just below that.
+  const maxSessionMs = (effectiveFeature === 'WALLET_FLOW' || effectiveFeature === 'TOKEN_CREATION')
+    ? 510_000
+    : 450_000;
+
+  const recording = await recordInteraction(
+    startUrl,
+    baseUrl,
+    claimId,
+    claim,
+    passCondition,
+    effectiveFeature,
+    effectiveSurface,
+    effectiveStrategy,
+    recordingsDir,
+    sessionId,
+    createRunMemory(),
+    maxSessionMs,
+  );
+
+  // Early exit if the inline analysis found the site unreachable or blocked
+  if (!recording.siteLoaded || recording.blocked) {
+    return {
+      evidenceSummary:   recording.probes.join('\n'),
+      siteLoaded:        recording.siteLoaded,
+      blocked:           recording.blocked,
+      screenshotDataUrl: recording.finalScreenshotDataUrl,
+    };
+  }
+
+  // Collect any on-chain transaction hashes submitted during verification
+  const submittedTxHashes  = drainTransactionHashes(sessionId);
+  const transactionAttempted = drainTransactionAttempt(sessionId);
+  let txReceiptStatus: 'success' | 'reverted' | 'timeout' | undefined;
+  if (submittedTxHashes.length > 0) {
+    const primaryHash = submittedTxHashes[submittedTxHashes.length - 1] as `0x${string}`;
+    console.log(`[verifier] On-chain tx hash (broadcast): ${primaryHash}`);
+    txReceiptStatus = await waitForTxReceiptOutcome(primaryHash);
+    console.log(`[verifier] On-chain receipt outcome: ${txReceiptStatus}`);
+  }
+  if (transactionAttempted && submittedTxHashes.length === 0) {
+    console.log('[verifier] Transaction was attempted but not broadcast (likely insufficient SOL for fees)');
+  }
+
+  // ── Build structured signals from raw recording data ──────────────────────
+  const signals = buildSignals(
+    recording.observations,
+    recording.finalPageState,
+    recording.runApiCalls,
+    startUrl,
+    recording.siteLoaded,
+    recording.blocked,
+    recording.probes.some((p) => p.includes('retried from homepage')),
+    recording.walletEvidence,
+    submittedTxHashes,
+    txReceiptStatus,
+    transactionAttempted,
+    effectiveSurface,
+    recording.walletOnlyGateDetected,
+    recording.pageJsErrors,
+    '',  // recon page text no longer needed — inline analysis covers it
+  );
+
+  console.log(
+    `[verifier] Signals — ownApi: ${signals.ownDomainApiCalls.length}, ` +
+    `form: ${signals.formAppeared}, cta: ${signals.enabledCtaPresent}, ` +
+    `blockers: [${signals.blockersEncountered.join(', ')}], ` +
+    `noops: ${signals.noopCount}/${signals.totalSteps}`,
+  );
+
+  const receiptNote =
+    submittedTxHashes.length > 0 && txReceiptStatus
+      ? [
+          '--- On-chain confirmation ---',
+          `Hash: ${submittedTxHashes[submittedTxHashes.length - 1]}`,
+          `Receipt: ${txReceiptStatus}`,
+          txReceiptStatus === 'reverted'
+            ? 'Execution reverted on-chain (matches dApp "Transaction failed" when present).'
+            : '',
+        ]
+          .filter(Boolean)
+          .join('\n')
+      : '';
+
+  return {
+    evidenceSummary:
+      recording.probes.join('\n') +
+      (receiptNote ? `\n${receiptNote}` : ''),
+    siteLoaded:        recording.siteLoaded,
+    blocked:           recording.blocked,
+    screenshotDataUrl:      recording.finalScreenshotDataUrl,
+    videoUrl:               recording.videoUrl,
+    finalScreenshotDataUrl: recording.finalScreenshotDataUrl,
+    signals,
+    walletEvidence:         recording.walletEvidence,
+  };
+}
