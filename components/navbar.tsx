@@ -7,6 +7,7 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { Copy } from 'lucide-react';
 import { cn, truncateAddressPump } from '@/lib/utils';
 import { useLocale } from '@/components/locale-provider';
+import { ConnectWalletButton } from '@/components/connect-wallet-button';
 
 export type NavbarProps = {
   /**
@@ -196,6 +197,7 @@ export function Navbar({ contractContext }: NavbarProps = {}) {
           </div>
 
           <div className="flex items-center gap-5">
+            <ConnectWalletButton showMintNudge={false} />
             <a
               href="https://x.com/larpscanbnb"
               target="_blank"

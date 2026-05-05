@@ -3,6 +3,7 @@ import { Inter, JetBrains_Mono } from 'next/font/google';
 import './globals.css';
 import { LocaleProvider } from '@/components/locale-provider';
 import { ShaderBackground } from '@/components/shader-background';
+import { WalletProviderWrapper } from '@/components/wallet-provider';
 
 const inter = Inter({
   subsets: ['latin'],
@@ -27,7 +28,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en" className={`${inter.variable} ${jetbrainsMono.variable}`}>
       <body className="font-sans text-white antialiased">
         <ShaderBackground />
-        <LocaleProvider>{children}</LocaleProvider>
+        <WalletProviderWrapper>
+          <LocaleProvider>{children}</LocaleProvider>
+        </WalletProviderWrapper>
       </body>
     </html>
   );
