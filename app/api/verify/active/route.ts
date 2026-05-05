@@ -1,0 +1,104 @@
+import { NextRequest } from 'next/server';
+import { supabase } from '@/lib/supabase';
+import { ok, withErrorHandler } from '@/lib/api-helpers';
+import { isSolanaMintAddress } from '@/lib/utils';
+import type { DbProject, DbVerificationRun } from '@/lib/db-types';
+
+export const runtime = 'nodejs';
+
+/**
+ * Lightweight read-only endpoint: checks whether a mint currently has an
+ * active in-progress run or a recent completed run.
+ *
+ * No side-effects — no run creation, no discovery, no scraping.
+ * Called by the dashboard's debounced input handler to auto-join active runs
+ * and by the on-mount URL-restore logic to reconnect after a refresh.
+ *
+ * GET /api/verify/active?ca=<solana-mint>
+ *
+ * Response:
+ *   hasActiveRun: true  → a run is currently verifying; supply runId to join
+ *   hasActiveRun: false + hasCompletedRun: true → cached result available
+ *   hasActiveRun: false + hasCompletedRun: false → no run exists yet
+ */
+
+const STALE_RUN_MS = 8 * 60 * 1000;
+const ACTIVE_STATUSES = ['pending', 'verifying', 'extracting', 'analyzing'];
+
+export const GET = withErrorHandler(async (req: Request) => {
+  const params = new URL((req as NextRequest).url).searchParams;
+  const ca     = params.get('ca')?.trim()  ?? '';
+  const urlParam = params.get('url')?.trim() ?? '';
+
+  // Resolve a synthetic contract_address key from whichever param was supplied.
+  // Mint mode: look up by the exact base58 Solana mint (case-sensitive).
+  // URL mode:  normalise to "url:<hostname>" — the key used by orchestrate.
+  let lookupKey: string;
+
+  if (ca && isSolanaMintAddress(ca)) {
+    lookupKey = ca;
+  } else if (urlParam && /^https?:\/\/.+/i.test(urlParam)) {
+    try {
+      const hostname = new URL(urlParam).hostname.replace(/^www\./, '');
+      lookupKey = `url:${hostname}`;
+    } catch {
+      return ok({ hasActiveRun: false, hasCompletedRun: false, runId: null, runStatus: null });
+    }
+  } else {
+    return ok({ hasActiveRun: false, hasCompletedRun: false, runId: null, runStatus: null });
+  }
+
+  // ── Look up project by mint / URL key ─────────────────────────────────────
+  const { data: project } = await supabase
+    .from('projects')
+    .select('id')
+    .eq('contract_address', lookupKey)
+    .maybeSingle<Pick<DbProject, 'id'>>();
+
+  if (!project) {
+    return ok({ hasActiveRun: false, hasCompletedRun: false, runId: null, runStatus: null });
+  }
+
+  // ── Check for active in-progress run ─────────────────────────────────────
+  const { data: activeRun } = await supabase
+    .from('verification_runs')
+    .select('id, status, created_at')
+    .eq('project_id', project.id)
+    .in('status', ACTIVE_STATUSES)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle<Pick<DbVerificationRun, 'id' | 'status' | 'created_at'>>();
+
+  if (activeRun) {
+    const age = Date.now() - new Date(activeRun.created_at).getTime();
+    if (age < STALE_RUN_MS) {
+      return ok({
+        hasActiveRun:    true,
+        hasCompletedRun: false,
+        runId:           activeRun.id,
+        runStatus:       activeRun.status,
+      });
+    }
+  }
+
+  // ── Check for most recent completed run ───────────────────────────────────
+  const { data: completedRun } = await supabase
+    .from('verification_runs')
+    .select('id, status, created_at')
+    .eq('project_id', project.id)
+    .eq('status', 'complete')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle<Pick<DbVerificationRun, 'id' | 'status' | 'created_at'>>();
+
+  if (completedRun) {
+    return ok({
+      hasActiveRun:    false,
+      hasCompletedRun: true,
+      runId:           completedRun.id,
+      runStatus:       'complete',
+    });
+  }
+
+  return ok({ hasActiveRun: false, hasCompletedRun: false, runId: null, runStatus: null });
+});
