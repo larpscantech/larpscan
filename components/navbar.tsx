@@ -111,6 +111,7 @@ export function Navbar({ contractContext }: NavbarProps = {}) {
   const NAV_LINKS = [
     { label: copy.home, href: '/home' },
     { label: copy.docs, href: '/docs' },
+    { label: locale === 'zh-TW' ? '鑄造代理' : 'Mint Agent', href: '/agent/mint' },
   ];
 
   useEffect(() => {
