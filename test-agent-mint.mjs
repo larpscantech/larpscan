@@ -1,17 +1,18 @@
 /**
- * Playwright test — Wallet connect + Agent Mint page
+ * Playwright test — Wallet connect + Agent Mint multi-step form
  *
  * Run: TEST_BASE_URL=http://localhost:3000 node test-agent-mint.mjs
  *
  * What we test (no real wallet needed — page works with mock contract):
  *  1. /agent/mint loads without errors
  *  2. "Connect your wallet" prompt is visible before connect
- *  3. ConnectKit modal opens when button is clicked
- *  4. Agent preview card renders with expected content
- *  5. Navbar on all pages shows a Connect Wallet button
- *  6. Dashboard navbar has Connect Wallet
- *  7. /agent/mint has correct page title content
- *  8. "What you get" feature list renders
+ *  3. RainbowKit modal opens when button is clicked
+ *  4. Mint page shows "BAP-578" branding
+ *  5. Navbar has Connect Wallet button
+ *  6. Dashboard navbar has Connect Wallet button
+ *  7. Mint page has multi-step form steps (Identity, Personality, AI Config, Memory, Review)
+ *  8. Agent type selector renders all 6 agent types
+ *  9. No JS errors on mint page
  */
 
 import { chromium } from 'playwright';
@@ -76,28 +77,41 @@ function fail(name, reason) { results.push({ name, ok: false, reason }); console
       await sleep(600);
     }
 
-    // ── 4. Agent preview card ───────────────────────────────────────────────
-    console.log('[4] Checking agent preview card…');
-    const card = await page.locator('[data-testid="agent-preview-card"]').isVisible().catch(() => false);
-    if (card) pass('agent preview card visible');
-    else fail('agent preview card visible', 'data-testid="agent-preview-card" not found');
+    // ── 4. BAP-578 branding ─────────────────────────────────────────────────
+    console.log('[4] Checking BAP-578 branding…');
+    const pageBody = await page.locator('body').innerText().catch(() => '');
+    if (pageBody.includes('BAP-578')) pass('BAP-578 branding on mint page');
+    else fail('BAP-578 branding on mint page', 'BAP-578 not found in page text');
 
-    const cardText = await page.locator('[data-testid="agent-preview-card"]').innerText().catch(() => '');
-    if (cardText.includes('Larpscan Verifier')) pass('agent card shows correct name');
-    else fail('agent card shows correct name', `got: ${cardText.slice(0, 80)}`);
+    if (pageBody.includes('Create Your AI Agent')) pass('page heading correct');
+    else fail('page heading correct', 'heading not found');
 
-    if (cardText.includes('BAP-578')) pass('agent card shows BAP-578 standard');
-    else fail('agent card shows BAP-578 standard', 'BAP-578 not in card');
+    // ── 5. Multi-step form metadata (always rendered, no wallet needed) ─────
+    console.log('[5] Checking mint-form-meta data attributes…');
+    await page.waitForSelector('[data-testid="mint-form-meta"]', { timeout: 10_000 }).catch(() => {});
+    const metaEl = page.locator('[data-testid="mint-form-meta"]');
+    const metaVisible = await metaEl.count() > 0;
+    if (!metaVisible) {
+      fail('mint-form-meta element present', 'not found');
+    } else {
+      pass('mint-form-meta element present');
+      const steps      = await metaEl.getAttribute('data-steps').catch(() => '');
+      const types      = await metaEl.getAttribute('data-agent-types').catch(() => '');
+      const fields     = await metaEl.getAttribute('data-bap578-fields').catch(() => '');
 
-    // ── 5. "What you get" list ──────────────────────────────────────────────
-    console.log('[5] Checking feature list…');
-    const featureText = await page.locator('text=What you get').isVisible().catch(() => false);
-    if (featureText) pass('"What you get" section visible');
-    else fail('"What you get" section visible', 'section heading not found');
-
-    const freeText = await page.locator('text=free mints').isVisible().catch(() => false);
-    if (freeText) pass('free mint info shown');
-    else fail('free mint info shown', '"free mints" text not found');
+      for (const s of ['Identity', 'Personality', 'AI Config', 'Memory', 'Review & Mint']) {
+        if (steps?.includes(s)) pass(`step "${s}" in meta`);
+        else fail(`step "${s}" in meta`, `got: ${steps}`);
+      }
+      for (const t of ['Verifier Agent', 'DeFi Agent', 'Game Agent', 'DAO Agent', 'Creator Agent', 'Strategic Agent']) {
+        if (types?.includes(t)) pass(`agent type "${t}" in meta`);
+        else fail(`agent type "${t}" in meta`, `got: ${types}`);
+      }
+      for (const f of ['persona', 'experience', 'voiceHash', 'animationURI', 'vaultURI']) {
+        if (fields?.includes(f)) pass(`BAP-578 field "${f}" in meta`);
+        else fail(`BAP-578 field "${f}" in meta`, `got: ${fields}`);
+      }
+    }
 
     // ── 6. Navbar has connect wallet button ─────────────────────────────────
     console.log('[6] Checking navbar Connect Wallet button…');
