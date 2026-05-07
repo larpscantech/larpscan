@@ -47,31 +47,55 @@ export async function countActiveVerifyingRuns(): Promise<number> {
 }
 
 /**
- * Kick off sequential claim processing for a run.
+ * Kick off parallel claim processing for a run.
  *
- * Dispatches ONLY THE FIRST pending claim via a fire-and-forget HTTP POST.
- * When that claim completes, its route handler calls `dispatchNextClaim`
- * which fires the next pending claim, and so on.  This daisy-chain ensures
- * strict serial execution without relying on a long-lived HTTP connection.
- *
- * If a claim is already 'checking' for this run, we skip dispatch — the
- * daisy-chain is already in progress.
+ * Stakes ALL pending claims atomically then fires HTTP POSTs for all of them
+ * simultaneously.  Each claim handler calls maybeCompleteRun independently —
+ * no daisy-chain needed.
  */
 export async function dispatchClaimsForRun(runId: string, origin: string): Promise<void> {
-  // Guard: if any claim is already in 'checking' state, the daisy-chain is
-  // already running — don't start a second chain.
-  const { count: checkingCount } = await supabase
+  const { data: allPending } = await supabase
     .from('claims')
-    .select('id', { count: 'exact', head: true })
+    .select('*')
     .eq('verification_run_id', runId)
-    .eq('status', 'checking');
+    .eq('status', 'pending')
+    .order('created_at', { ascending: true })
+    .returns<DbClaim[]>();
 
-  if ((checkingCount ?? 0) > 0) {
-    console.log(`[claim-dispatcher] Claim already checking for run ${runId} — skipping duplicate dispatch`);
+  if (!allPending?.length) {
+    console.log(`[claim-dispatcher] No pending claims for run ${runId}`);
     return;
   }
 
-  await dispatchNextClaim(runId, origin);
+  // Priority features (WALLET_FLOW, TOKEN_CREATION) need the freshest session — run first
+  const sorted = [...allPending].sort((a, b) => {
+    const aPri = PRIORITY_FEATURE_TYPES.includes(a.feature_type ?? '') ? 0 : 1;
+    const bPri = PRIORITY_FEATURE_TYPES.includes(b.feature_type ?? '') ? 0 : 1;
+    return aPri - bPri;
+  });
+
+  // Stake all claims atomically before firing any (prevents duplicate workers)
+  const staked: DbClaim[] = [];
+  for (const claim of sorted) {
+    const { data: s } = await supabase
+      .from('claims')
+      .update({ status: 'checking' })
+      .eq('id', claim.id)
+      .eq('status', 'pending')
+      .select('id')
+      .single<{ id: string }>();
+    if (s) staked.push(claim);
+  }
+
+  if (!staked.length) {
+    console.log(`[claim-dispatcher] All claims already taken for run ${runId}`);
+    return;
+  }
+
+  await log(runId, `Dispatching ${staked.length} claim${staked.length > 1 ? 's' : ''} in parallel`);
+  console.log(`[claim-dispatcher] Firing ${staked.length} claims in parallel for run ${runId}`);
+
+  await Promise.all(staked.map(claim => flushClaimRequest(claim.id, runId, origin)));
 }
 
 /**
@@ -132,16 +156,16 @@ export async function dispatchNextClaim(runId: string, origin: string, cooldownM
   }
 
   // Atomically stake the claim (prevents duplicate workers)
-  const { data: staked } = await supabase
-    .from('claims')
-    .update({ status: 'checking' })
-    .eq('id', claim.id)
-    .eq('status', 'pending')
-    .select('id')
-    .single<{ id: string }>();
+    const { data: staked } = await supabase
+      .from('claims')
+      .update({ status: 'checking' })
+      .eq('id', claim.id)
+      .eq('status', 'pending')
+      .select('id')
+      .single<{ id: string }>();
 
-  if (!staked) {
-    console.log(`[claim-dispatcher] Claim ${claim.id} already taken — skipping`);
+    if (!staked) {
+      console.log(`[claim-dispatcher] Claim ${claim.id} already taken — skipping`);
     return;
   }
 
@@ -157,7 +181,7 @@ export async function dispatchNextClaim(runId: string, origin: string, cooldownM
 function flushClaimRequest(claimId: string, runId: string, origin: string): Promise<void> {
   const payload   = JSON.stringify({ runId, claimId });
   const claimUrl  = new URL(`${origin}/api/verify/claim`);
-  const requestFn = claimUrl.protocol === 'https:' ? httpsRequest : httpRequest;
+    const requestFn = claimUrl.protocol === 'https:' ? httpsRequest : httpRequest;
 
   return new Promise((resolve, reject) => {
     const req = requestFn({

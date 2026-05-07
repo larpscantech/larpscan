@@ -62,15 +62,6 @@ export function ConnectWalletButton({ className, showMintNudge = true }: Connect
         </Link>
       )}
 
-      {isConnected && hasAgent && (
-        <Link
-          href="/agent/mint"
-          data-testid="agent-badge"
-          className="text-[10px] font-semibold uppercase tracking-[0.18em] px-3 py-2.5 rounded-sm bg-emerald-900/30 border border-emerald-700/40 text-emerald-400 transition-all duration-150 whitespace-nowrap"
-        >
-          Agent Active
-        </Link>
-      )}
     </div>
   );
 }

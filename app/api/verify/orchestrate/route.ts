@@ -39,6 +39,7 @@ function hasInfrastructureFailure(claims: DbClaimWithEvidence[]): boolean {
 async function handleRunCreation(
   project: DbProject,
   forceReverify: boolean,
+  agentId?: string | null,
 ): Promise<NextResponse> {
   // ── 2a. Force-reverify: close any lingering active runs so they don't block
   //        the new run from acquiring a dispatch slot (countActiveVerifyingRuns
@@ -112,7 +113,7 @@ async function handleRunCreation(
   // ── 4. Create new run ─────────────────────────────────────────────────────
   const { data: run, error: runError } = await supabase
     .from('verification_runs')
-    .insert({ project_id: project.id, status: 'pending' })
+    .insert({ project_id: project.id, status: 'pending', agent_id: agentId ?? null })
     .select()
     .single<DbVerificationRun>();
 
@@ -297,6 +298,7 @@ export const POST = withErrorHandler(async (req: Request) => {
   const contractAddress = (body?.contractAddress ?? '').trim();
   const websiteUrl      = (body?.websiteUrl      ?? '').trim();
   const forceReverify   = Boolean(body?.forceReverify);
+  const agentId         = (body?.agentId as string | undefined) ?? null;
 
   if (!contractAddress && !websiteUrl) {
     return err('contractAddress or websiteUrl is required');
@@ -335,7 +337,7 @@ export const POST = withErrorHandler(async (req: Request) => {
     }
 
     console.log(`[orchestrate] URL-only mode: ${websiteUrl} → project ${urlProject.id}`);
-    return handleRunCreation(urlProject, forceReverify);
+    return handleRunCreation(urlProject, forceReverify, agentId);
   }
 
   // ── CA mode: discover project via on-chain + aggregators ──────────────────
@@ -418,5 +420,5 @@ export const POST = withErrorHandler(async (req: Request) => {
     }
   }
 
-  return handleRunCreation(project, forceReverify);
+  return handleRunCreation(project, forceReverify, agentId);
 });

@@ -293,6 +293,17 @@ export interface VerdictResult {
   blockerReason?: string;
 }
 
+/** Optional context injected by a named NFA agent running the verification. */
+export interface AgentContext {
+  /** The agent's custom system instructions / personality. */
+  instructions?: string | null;
+  /**
+   * The agent's accumulated findings from past scans.
+   * Each string is formatted as "[VERDICT] claim text"
+   */
+  pastFindings: string[];
+}
+
 const VERDICT_MAP: Record<string, ClaimStatus> = {
   VERIFIED:    'verified',
   LARP:        'larp',
@@ -310,10 +321,10 @@ export async function determineVerdict(
   evidenceSummary: string,
   signals?:        VerdictSignals,
   featureType?:    string,
-  /** JPEG data URL of the final page state after all interactions.
-   *  Attached as a vision image so the LLM can visually verify the claim
-   *  instead of relying solely on truncated text evidence. */
+  /** JPEG data URL of the final page state after all interactions. */
   finalScreenshotDataUrl?: string,
+  /** Optional NFA agent context — injects personality + memory into the LLM. */
+  agentContext?: AgentContext,
 ): Promise<VerdictResult> {
 
   // ── Layer 1: deterministic rules ──────────────────────────────────────────
@@ -380,6 +391,31 @@ export async function determineVerdict(
   // ── Layer 2: LLM fallback ─────────────────────────────────────────────────
   console.log('[verdict] Layer 2: calling GPT-4o...');
 
+  // Build agent-aware system prompt
+  const agentSections: string[] = [];
+  if (agentContext?.instructions) {
+    agentSections.push(
+      '\n\n==================================================\nAGENT INSTRUCTIONS\n==================================================\n' +
+      agentContext.instructions.trim() +
+      '\nApply these instructions when weighing evidence and forming your verdict.',
+    );
+  }
+  if (agentContext?.pastFindings && agentContext.pastFindings.length > 0) {
+    agentSections.push(
+      '\n\n==================================================\nAGENT MEMORY (previous findings by this agent)\n==================================================\n' +
+      agentContext.pastFindings.join('\n') +
+      '\nUse this history to recognize patterns. If this agent previously found LARP on a similar claim type from the same project, weight that context appropriately.',
+    );
+  }
+
+  const systemContent = agentSections.length > 0
+    ? SYSTEM.replace('Respond with JSON only:', agentSections.join('') + '\n\nRespond with JSON only:')
+    : SYSTEM;
+
+  if (agentSections.length > 0) {
+    console.log(`[verdict] Agent context injected — ${agentContext?.pastFindings?.length ?? 0} past findings`);
+  }
+
   // Optionally prepend a compact signal summary to help orient the LLM
   const signalContext = signals ? buildSignalContext(signals, featureType, deterministic.reasons) : '';
   const fullEvidence  = signalContext ? `${signalContext}\n\n${evidenceSummary}` : evidenceSummary;
@@ -420,7 +456,7 @@ export async function determineVerdict(
       max_tokens:       500,
       response_format:  { type: 'json_object' },
       messages: [
-        { role: 'system', content: SYSTEM },
+        { role: 'system', content: systemContent },
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         { role: 'user',   content: userContent as any },
       ],

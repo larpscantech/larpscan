@@ -25,14 +25,21 @@ function getLogStyle(log: string): { color: string; prefix: string } {
   return { color: 'text-zinc-500', prefix: '·' };
 }
 
+function getAgentLogStyle(log: string): { color: string; prefix: string } | null {
+  if (/^Agent .+ · .+ memor/i.test(log)) {
+    return { color: 'text-blue-400/80', prefix: '◆' };
+  }
+  return null;
+}
+
 export function InlineLogs({ logs, isLive = false }: InlineLogsProps) {
   const [expanded, setExpanded] = useState(true);
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
-  // Keep scroll pinned to bottom
+  // Scroll the log container itself — never scroll the page viewport
   useEffect(() => {
-    if (expanded && bottomRef.current) {
-      bottomRef.current.scrollIntoView({ behavior: 'smooth' });
+    if (expanded && scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [logs.length, expanded]);
 
@@ -90,11 +97,12 @@ export function InlineLogs({ logs, isLive = false }: InlineLogsProps) {
             className="overflow-hidden"
           >
             <div
+              ref={scrollRef}
               className="max-h-56 overflow-y-auto border-t border-cv-border/50 scrollbar-thin px-6 py-4 space-y-1.5"
             >
               <AnimatePresence initial={false}>
                 {logs.map((log, i) => {
-                  const { color, prefix } = getLogStyle(log);
+                  const { color, prefix } = getAgentLogStyle(log) ?? getLogStyle(log);
                   return (
                     <motion.div
                       key={i}
@@ -124,7 +132,7 @@ export function InlineLogs({ logs, isLive = false }: InlineLogsProps) {
                   </motion.span>
                 </div>
               )}
-              <div ref={bottomRef} />
+              <div />
             </div>
           </motion.div>
         )}

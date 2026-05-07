@@ -123,6 +123,25 @@ create index if not exists idx_logs_created
 create index if not exists idx_evidence_claim
   on evidence_items(claim_id);
 
+-- ── agents ────────────────────────────────────────────────────────────────────
+-- One row per minted NFA. Created after on-chain mint confirms.
+create table if not exists agents (
+  id             uuid        default gen_random_uuid() primary key,
+  owner_address  text        not null,
+  token_id       text,               -- on-chain token ID parsed from Transfer event
+  tx_hash        text,               -- mint transaction hash
+  name           text        not null,
+  description    text,
+  image          text,
+  personality    text        not null default 'larpscan'
+                             check (personality in ('larpscan', 'custom')),
+  system_prompt  text,               -- only populated when personality = 'custom'
+  chain          text        not null default 'bsc',
+  created_at     timestamptz default now()
+);
+
+create index if not exists idx_agents_owner on agents(owner_address);
+
 -- ── Row-level security ────────────────────────────────────────────────────────
 -- All reads/writes go through the service role key in API routes,
 -- so RLS is disabled for now. Enable and tighten once a user auth layer is added.
@@ -131,3 +150,7 @@ alter table verification_runs disable row level security;
 alter table claims            disable row level security;
 alter table agent_logs        disable row level security;
 alter table evidence_items    disable row level security;
+alter table agents            disable row level security;
+
+-- ── Migration (run against existing DB instead of full schema reset) ──────────
+-- alter table agents add column if not exists ... (add future columns here)

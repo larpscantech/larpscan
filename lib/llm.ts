@@ -34,7 +34,7 @@ export interface ProductUnderstanding {
 
 // ── System prompt ─────────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `You are a blockchain product analyst and auditor.
+export const LARPSCAN_SYSTEM_PROMPT = `You are a blockchain product analyst and auditor.
 
 Your job is two steps performed in a single response:
 
@@ -229,7 +229,7 @@ export async function extractClaimsFromText(
     max_tokens:      2_200,
     response_format: { type: 'json_object' },
     messages: [
-      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: LARPSCAN_SYSTEM_PROMPT },
       { role: 'user',   content: userMessage },
     ],
   });

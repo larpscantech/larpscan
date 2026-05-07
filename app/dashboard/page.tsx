@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
+import { useAccount } from 'wagmi';
 import { ArrowRight, RotateCcw, AlertCircle, Globe } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Navbar } from '@/components/navbar';
@@ -133,6 +134,40 @@ async function apiGet<T extends Record<string, unknown>>(
   }
 }
 
+// ─── Browser notifications ────────────────────────────────────────────────────
+
+async function requestNotificationPermission() {
+  if (typeof window === 'undefined' || !('Notification' in window)) return;
+  if (Notification.permission === 'default') {
+    await Notification.requestPermission().catch(() => {});
+  }
+}
+
+function sendScanNotification(
+  projectName: string,
+  claims: { status: string }[],
+) {
+  if (typeof window === 'undefined' || !('Notification' in window)) return;
+  if (Notification.permission !== 'granted') return;
+  if (document.visibilityState === 'visible') return; // already watching — skip
+
+  const verified = claims.filter(c => c.status === 'verified').length;
+  const larp     = claims.filter(c => c.status === 'larp').length;
+  const total    = claims.length;
+
+  const body = total > 0
+    ? `${verified} verified · ${larp} larp · ${total} claims checked`
+    : 'Scan finished';
+
+  try {
+    new Notification(`Scan complete — ${projectName}`, {
+      body,
+      icon: '/favicon.ico',
+      tag:  'larpscan-complete',
+    });
+  } catch { /* unsupported in some browsers */ }
+}
+
 // ─── Section divider (animated label) ────────────────────────────────────────
 
 function SectionDivider({ label }: { label: string }) {
@@ -151,6 +186,40 @@ function SectionDivider({ label }: { label: string }) {
         </motion.span>
       </AnimatePresence>
       <div className="flex-1 h-px bg-gradient-to-r from-red-600/30 to-transparent" />
+    </div>
+  );
+}
+
+// ─── Agent selector ──────────────────────────────────────────────────────────
+
+interface AgentOption { id: string; name: string; token_id: string | null }
+
+function AgentSelector({
+  agents, value, onChange,
+}: {
+  agents: AgentOption[];
+  value:  string | null;
+  onChange: (id: string | null) => void;
+}) {
+  if (agents.length === 0) return null;
+
+  return (
+    <div className="flex items-center gap-2.5 mb-3 ml-1">
+      <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-zinc-600 flex-shrink-0">
+        Scan as agent
+      </span>
+      <select
+        value={value ?? ''}
+        onChange={e => onChange(e.target.value || null)}
+        className="flex-1 max-w-[260px] h-8 px-2.5 rounded-sm text-[11px] font-mono bg-[#09090d] border border-[#1c1c22] text-zinc-300 focus:outline-none focus:border-[#b91c1c]/50 transition-all cursor-pointer"
+      >
+        <option value="">Platform (no agent)</option>
+        {agents.map(a => (
+          <option key={a.id} value={a.id}>
+            {a.name}{a.token_id ? ` (#${a.token_id})` : ''}
+          </option>
+        ))}
+      </select>
     </div>
   );
 }
@@ -460,6 +529,23 @@ export default function DashboardPage() {
   const [entryAnimation, setEntryAnimation] = useState(false);
   const [entryChecked, setEntryChecked] = useState(false);
   const [pageEntered, setPageEntered] = useState(false);
+
+  // ── Agent selector ───────────────────────────────────────────────────────────
+  const { address } = useAccount();
+  const [userAgents, setUserAgents]           = useState<AgentOption[]>([]);
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!address) { setUserAgents([]); setSelectedAgentId(null); return; }
+    fetch(`/api/agents?owner=${address.toLowerCase()}`)
+      .then(r => r.json())
+      .then((data: { agents?: AgentOption[] }) => {
+        const active = (data.agents ?? []).filter(a => a.token_id);
+        setUserAgents(active);
+      })
+      .catch(() => {});
+  }, [address]);
+
   // ── Input state ─────────────────────────────────────────────────────────────
   const [input, setInput]               = useState('');
   const [forceReverify, setForceReverify] = useState(false);
@@ -858,6 +944,10 @@ export default function DashboardPage() {
           );
         }
         void fetchRecentScans();
+        sendScanNotification(
+          data.project?.name ?? 'Project',
+          realClaims,
+        );
       } catch {
         if (!cancelled) {
           setPhase('idle');
@@ -893,6 +983,8 @@ export default function DashboardPage() {
     setVisibleClaimsCount(0);
     setElapsed(0);
 
+    void requestNotificationPermission();
+
     console.group(`${TAG} ══ Verification run started ══`, STYLE);
     console.log('  contract :', address);
     console.log('  timestamp:', new Date().toISOString());
@@ -918,8 +1010,8 @@ export default function DashboardPage() {
         '/api/verify/orchestrate',
         '/api/verify/orchestrate',
         isUrlInput
-          ? { websiteUrl: address, forceReverify }
-          : { contractAddress: address, forceReverify },
+          ? { websiteUrl: address, forceReverify, agentId: selectedAgentId }
+          : { contractAddress: address, forceReverify, agentId: selectedAgentId },
       );
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Verification failed';
@@ -1074,10 +1166,11 @@ export default function DashboardPage() {
       );
     }
     void fetchRecentScans();
+    sendScanNotification(project.name, realClaims);
 
     console.log(`${TAG} ══ Run complete ══`, STYLE);
     console.groupEnd();
-  }, [input, forceReverify, addLog, fetchRecentScans, pollRunToCompletion]);
+  }, [input, forceReverify, addLog, fetchRecentScans, pollRunToCompletion, realClaims]);
 
   // ── Reset ──────────────────────────────────────────────────────────────────
   const handleSubmit = useCallback(() => {
@@ -1167,8 +1260,9 @@ export default function DashboardPage() {
       );
     }
     void fetchRecentScans();
+    sendScanNotification(v.project.name, realClaims);
     }
-  }, [phase, addLog, fetchRecentScans, pollRunToCompletion]);
+  }, [phase, addLog, fetchRecentScans, pollRunToCompletion, realClaims]);
 
   const handleReset = useCallback(() => {
     console.log(`${TAG} Reset triggered`, STYLE);
@@ -1313,12 +1407,17 @@ export default function DashboardPage() {
             </p>
           </motion.div>
 
-          {/* Contract input */}
+          {/* Contract input + agent selector */}
           <motion.div
             initial={{ opacity: 0, y: entryAnimation ? 26 : 18 }}
             animate={pageEntered ? { opacity: 1, y: 0 } : { opacity: 0, y: entryAnimation ? 26 : 18 }}
             transition={{ duration: 0.54, delay: 0.14, ease: [0.16, 1, 0.3, 1] }}
           >
+            <AgentSelector
+              agents={userAgents}
+              value={selectedAgentId}
+              onChange={setSelectedAgentId}
+            />
             <ContractRow
               value={input}
               onChange={setInput}

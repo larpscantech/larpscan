@@ -67,6 +67,7 @@ export interface DbProject {
 export interface DbVerificationRun {
   id: string;
   project_id: string;
+  agent_id: string | null;
   status: RunStatus;
   claims_extracted: number;
   created_at: string;
@@ -120,6 +121,21 @@ export interface DbClaimWithEvidence extends DbClaim {
     created_at: string;
   }>;
 }
+
+export interface DbAgent {
+  id:            string;
+  owner_address: string;
+  token_id:      string | null;
+  tx_hash:       string | null;
+  name:          string;
+  description:   string | null;
+  image:         string | null;
+  personality:   'larpscan' | 'custom';
+  system_prompt: string | null;
+  chain:         string;
+  created_at:    string;
+}
+
 
 // LLM output shape before persisting to DB
 export interface ExtractedClaim {

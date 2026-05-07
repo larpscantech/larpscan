@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server';
 import { supabase } from '@/lib/supabase';
 import { log } from '@/lib/logger';
-import { determineVerdict } from '@/lib/verdict';
+import { determineVerdict, type AgentContext } from '@/lib/verdict';
 import { routeVerification, type StructuredClaim } from '@/lib/verification-graph';
 import { ok, err, withErrorHandler } from '@/lib/api-helpers';
 import { getFastTrackVerdict, recordClaimResult } from '@/lib/platform-context';
@@ -48,6 +48,55 @@ export const POST = withErrorHandler(async (req: Request) => {
     .single<DbProject>();
 
   if (!project?.website) return err('Project or website not found', 404);
+
+  // ── Load NFA agent context (personality + memory) ─────────────────────────
+  let agentContext: AgentContext | undefined;
+  if (run.agent_id) {
+    const { data: agent } = await supabase
+      .from('agents')
+      .select('name, system_prompt, personality')
+      .eq('id', run.agent_id)
+      .maybeSingle();
+
+    // Fetch the agent's last 20 terminal claims from previous runs (not this run)
+    const { data: pastRuns } = await supabase
+      .from('verification_runs')
+      .select('id')
+      .eq('agent_id', run.agent_id)
+      .neq('id', runId)
+      .in('status', ['complete'])
+      .order('created_at', { ascending: false })
+      .limit(10);
+
+    const pastRunIds = (pastRuns ?? []).map(r => r.id as string);
+    let pastFindings: string[] = [];
+
+    if (pastRunIds.length > 0) {
+      const { data: pastClaims } = await supabase
+        .from('claims')
+        .select('claim, status')
+        .in('verification_run_id', pastRunIds)
+        .in('status', ['verified', 'larp', 'untestable'])
+        .order('created_at', { ascending: false })
+        .limit(20);
+
+      pastFindings = (pastClaims ?? []).map(c =>
+        `[${(c.status as string).toUpperCase()}] "${c.claim}"`,
+      );
+    }
+
+    agentContext = {
+      instructions: agent?.system_prompt ?? undefined,
+      pastFindings,
+    };
+
+    const agentName = agent?.name ?? 'Agent';
+    const memoryNote = pastFindings.length > 0
+      ? `${pastFindings.length} memor${pastFindings.length === 1 ? 'y' : 'ies'} loaded`
+      : 'no prior memory';
+    await log(runId, `Agent ${agentName} · ${memoryNote}`);
+    console.log(`[verify/claim] Agent context: name=${agentName}, personality=${agent?.personality ?? 'larpscan'}, memory=${pastFindings.length} entries`);
+  }
 
   console.log(`[verify/claim] ══ ${claim.claim.slice(0, 60)} ══`);
 
@@ -129,6 +178,7 @@ export const POST = withErrorHandler(async (req: Request) => {
     verifyResult?.signals,
     claim.feature_type ?? undefined,
     verifyResult?.finalScreenshotDataUrl,
+    agentContext,
   );
 
   console.log(`[verify/claim] Verdict: ${verdict.verdict} (${verdict.confidence})`, verdict.reasoning);
@@ -169,14 +219,12 @@ export const POST = withErrorHandler(async (req: Request) => {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-async function maybeCompleteRun(runId: string, origin: string) {
+async function maybeCompleteRun(runId: string, _origin: string) {
   const { data: remaining } = await supabase
     .from('claims')
     .select('id, status')
     .eq('verification_run_id', runId)
     .in('status', ['pending', 'checking']);
-
-  const pendingOnly = (remaining ?? []).filter((c) => c.status === 'pending');
 
   if (!remaining?.length) {
     await supabase
@@ -185,19 +233,8 @@ async function maybeCompleteRun(runId: string, origin: string) {
       .eq('id', runId);
     await log(runId, 'Verification complete');
     console.log('[verify/claim] All claims done — run marked complete');
-  } else if (pendingOnly.length > 0) {
-    // Daisy-chain: schedule the next pending claim after cooldown.
-    //
-    // MUST await: on Vercel/serverless the invocation freezes as soon as this
-    // route returns 200. A fire-and-forget dispatchNextClaim never reaches the
-    // 30s sleep or outbound POST — only the first claim in a run would run.
-    const { dispatchNextClaim } = await import('@/lib/claim-dispatcher');
-    try {
-      await dispatchNextClaim(runId, origin, 30_000);
-    } catch (e) {
-      console.error('[verify/claim] Failed to dispatch next claim:', e);
-    }
   }
+  // All claims were dispatched in parallel — no daisy-chain needed
 }
 
 async function saveEvidence(
