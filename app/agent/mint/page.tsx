@@ -301,11 +301,11 @@ export default function MintAgentPage() {
               Your agent is live on BNB Chain.
             </p>
             <Link
-              href="/dashboard"
-              data-testid="go-to-dashboard-btn"
+              href="/agents"
+              data-testid="go-to-agents-btn"
               className="text-[10px] font-semibold uppercase tracking-[0.22em] px-8 py-3.5 rounded-sm bg-red-600 text-white hover:bg-red-500 transition-all"
             >
-              Go to Dashboard →
+              View My Agents →
             </Link>
           </motion.div>
 
