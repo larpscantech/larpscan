@@ -181,7 +181,8 @@ export async function dispatchNextClaim(runId: string, origin: string, cooldownM
 function flushClaimRequest(claimId: string, runId: string, origin: string): Promise<void> {
   const payload   = JSON.stringify({ runId, claimId });
   const claimUrl  = new URL(`${origin}/api/verify/claim`);
-    const requestFn = claimUrl.protocol === 'https:' ? httpsRequest : httpRequest;
+  const requestFn = claimUrl.protocol === 'https:' ? httpsRequest : httpRequest;
+  const internalKey = process.env.INTERNAL_API_KEY ?? '';
 
   return new Promise((resolve, reject) => {
     const req = requestFn({
@@ -190,8 +191,9 @@ function flushClaimRequest(claimId: string, runId: string, origin: string): Prom
       path:     claimUrl.pathname,
       method:   'POST',
       headers:  {
-        'Content-Type':   'application/json',
-        'Content-Length': Buffer.byteLength(payload),
+        'Content-Type':    'application/json',
+        'Content-Length':  Buffer.byteLength(payload),
+        ...(internalKey ? { 'x-internal-key': internalKey } : {}),
       },
     });
 

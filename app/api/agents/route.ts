@@ -8,9 +8,10 @@ export async function GET(req: Request) {
     const owner = searchParams.get('owner')?.toLowerCase();
     const limit = Math.min(parseInt(searchParams.get('limit') ?? '50'), 100);
 
+    // Exclude system_prompt — it's a private agent configuration, not for public listing
     let query = supabase
       .from('agents')
-      .select('*')
+      .select('id, owner_address, token_id, tx_hash, name, description, image, personality, chain, created_at')
       .order('created_at', { ascending: false })
       .limit(limit);
 

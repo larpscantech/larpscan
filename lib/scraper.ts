@@ -328,7 +328,34 @@ async function fetchViaPlaywright(url: string, mobile = false, gotoTimeout = 25_
  *  2. If the result is below SPA_THRESHOLD (site is JS-rendered), re-fetch
  *     using a headless Playwright browser that executes the JavaScript.
  */
+/**
+ * Returns true when the hostname resolves to a private/loopback/link-local or
+ * cloud-metadata address that should never be reached from the server.
+ */
+function isBlockedHost(rawUrl: string): boolean {
+  try {
+    const { hostname } = new URL(rawUrl);
+    // Reject localhost and loopback
+    if (/^(localhost|127\.\d+\.\d+\.\d+|::1)$/i.test(hostname)) return true;
+    // Reject AWS/GCP/Azure metadata endpoints
+    if (/^169\.254\.\d+\.\d+$/.test(hostname)) return true;
+    if (/^fd[0-9a-f]{2}:/i.test(hostname)) return true; // IPv6 link-local
+    // Reject RFC1918 private ranges
+    if (/^10\.\d+\.\d+\.\d+$/.test(hostname)) return true;
+    if (/^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/.test(hostname)) return true;
+    if (/^192\.168\.\d+\.\d+$/.test(hostname)) return true;
+    // Reject internal-only TLDs
+    if (/\.(internal|local|corp|lan)$/i.test(hostname)) return true;
+  } catch {
+    return true; // unparseable URL — block it
+  }
+  return false;
+}
+
 export async function fetchWebsiteText(rawUrl: string): Promise<string> {
+  if (isBlockedHost(rawUrl)) {
+    throw new Error(`[scraper] Blocked: target URL resolves to a private/reserved address`);
+  }
   const normalized = normalizeUrl(rawUrl);
 
   // Always resolve redirect chains for known short-link hosts;
