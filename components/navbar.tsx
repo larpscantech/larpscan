@@ -112,6 +112,7 @@ export function Navbar({ contractContext }: NavbarProps = {}) {
     { label: copy.home, href: '/home' },
     { label: copy.docs, href: '/docs' },
     { label: locale === 'zh-TW' ? '代理人' : 'Agents', href: '/agents' },
+    { label: locale === 'zh-TW' ? '排行榜' : 'Leaderboard', href: '/leaderboard' },
     { label: locale === 'zh-TW' ? '鑄造代理' : 'Mint Agent', href: '/agent/mint' },
   ];
 
