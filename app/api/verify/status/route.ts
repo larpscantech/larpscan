@@ -120,29 +120,37 @@ export const GET = withErrorHandler(async (req: Request) => {
       .limit(20)
       .returns<{ id: string; created_at: string }[]>();
 
-    // Clean up dead pending runs ahead in queue:
-    // 1. Runs with no active claims (pending/checking), OR
-    // 2. Runs stuck in pending for >15 min (abandoned — never dispatched)
-    const ABANDONED_PENDING_MS = 5 * 60 * 1000; // 5 min — runs get promoted within ~30s; stuck longer = abandoned
+    // Clean up orphan pending runs ahead in queue (no claim rows at all).
+    // Never mark runs with pending/checking claims — avoids cross-user griefing.
+    const ABANDONED_PENDING_MS = 5 * 60 * 1000;
     for (const candidate of (pendingRuns ?? [])) {
       if (candidate.id === runId) break;
 
-      const { count: activeClaimCount } = await supabase
-        .from('claims')
-        .select('id', { count: 'exact', head: true })
-        .eq('verification_run_id', candidate.id)
-        .in('status', ['pending', 'checking']);
+      const [{ count: totalClaims }, { count: activeClaimCount }] = await Promise.all([
+        supabase
+          .from('claims')
+          .select('id', { count: 'exact', head: true })
+          .eq('verification_run_id', candidate.id),
+        supabase
+          .from('claims')
+          .select('id', { count: 'exact', head: true })
+          .eq('verification_run_id', candidate.id)
+          .in('status', ['pending', 'checking']),
+      ]);
 
       const candidateAge = Date.now() - new Date(candidate.created_at ?? 0).getTime();
-      const isAbandoned = activeClaimCount === 0 || candidateAge > ABANDONED_PENDING_MS;
+      const isOrphan =
+        (totalClaims ?? 0) === 0 &&
+        (activeClaimCount ?? 0) === 0 &&
+        candidateAge > ABANDONED_PENDING_MS;
 
-      if (isAbandoned) {
+      if (isOrphan) {
         await supabase
           .from('verification_runs')
           .update({ status: 'complete' })
           .eq('id', candidate.id)
           .eq('status', 'pending');
-        console.log(`[verify/status] Cleaned up stale pending run ${candidate.id} (age ${Math.round(candidateAge / 1000)}s, activeClaims=${activeClaimCount})`);
+        console.log(`[verify/status] Cleaned orphan pending run ${candidate.id}`);
       }
     }
 

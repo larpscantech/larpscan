@@ -2,6 +2,12 @@ import crypto from 'crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import { supabase } from '@/lib/supabase';
 import { ok } from '@/lib/api-helpers';
+import {
+  buildAgentEditMessage,
+  isTimestampFresh,
+  verifyWalletMessage,
+} from '@/lib/wallet-auth';
+import { stripInjectionPhrases } from '@/lib/prompt-safety';
 
 // ── Merkle helpers ────────────────────────────────────────────────────────────
 function sha256(data: string): string {
@@ -33,7 +39,7 @@ export async function GET(
 
     const { data: agent, error } = await supabase
       .from('agents')
-      .select('*')
+      .select('id, owner_address, token_id, tx_hash, name, description, image, personality, chain, created_at')
       .eq('id', id)
       .single();
 
@@ -131,6 +137,8 @@ export async function GET(
 // ── PATCH /api/agents/[id] ────────────────────────────────────────────────────
 interface EditBody {
   ownerAddress:  string;
+  signature:     string;
+  timestamp:     number;
   name?:         string;
   description?:  string;
   systemPrompt?: string;
@@ -143,11 +151,25 @@ export async function PATCH(
   try {
     const { id } = await params;
     const body = (await req.json()) as EditBody;
-    const { ownerAddress, name, description, systemPrompt } = body;
+    const { ownerAddress, signature, timestamp, name, description, systemPrompt } = body;
 
-    if (!ownerAddress) {
-      return new Response(JSON.stringify({ error: 'ownerAddress required' }), {
+    if (!ownerAddress || !signature || !timestamp) {
+      return new Response(JSON.stringify({ error: 'ownerAddress, signature, and timestamp required' }), {
         status: 400, headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    if (!isTimestampFresh(timestamp)) {
+      return new Response(JSON.stringify({ error: 'Signature expired' }), {
+        status: 401, headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    const editMessage = buildAgentEditMessage(id, timestamp);
+    const validSig = await verifyWalletMessage(ownerAddress, signature, editMessage);
+    if (!validSig) {
+      return new Response(JSON.stringify({ error: 'Invalid wallet signature' }), {
+        status: 401, headers: { 'Content-Type': 'application/json' },
       });
     }
 
@@ -173,7 +195,7 @@ export async function PATCH(
     if (name         !== undefined) updates.name        = name;
     if (description  !== undefined) updates.description = description;
     if (systemPrompt !== undefined && existing.personality === 'custom') {
-      updates.system_prompt = systemPrompt;
+      updates.system_prompt = stripInjectionPhrases(systemPrompt).slice(0, 4_000);
     }
 
     if (Object.keys(updates).length === 0) {

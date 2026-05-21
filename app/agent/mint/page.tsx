@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
-import { useAccount, useWriteContract, useReadContract, useWaitForTransactionReceipt } from 'wagmi';
+import { useAccount, useWriteContract, useReadContract, useWaitForTransactionReceipt, useSignMessage } from 'wagmi';
 import { ConnectButton } from '@rainbow-me/rainbowkit';
 import { motion, AnimatePresence } from 'framer-motion';
 import Link from 'next/link';
@@ -159,12 +159,13 @@ export default function MintAgentPage() {
   const { isLoading: isConfirming, isSuccess: isMintedOnChain, data: receipt } =
     useWaitForTransactionReceipt({ hash: txHash });
 
+  const { signMessageAsync } = useSignMessage();
+
   // ── Record agent in Supabase after on-chain confirm ───────────────────────
   useEffect(() => {
     if (!isMintedOnChain || !receipt || !address || recordedRef.current) return;
     recordedRef.current = true;
 
-    // Parse tokenId from ERC-721 Transfer event (4th topic = indexed tokenId)
     const transferLog = receipt.logs.find(
       l =>
         l.address.toLowerCase() === NFA_CONTRACT_ADDRESS.toLowerCase() &&
@@ -175,23 +176,37 @@ export default function MintAgentPage() {
       : undefined;
 
     setIsSaving(true);
-    fetch('/api/agent/record', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ownerAddress: address,
-        txHash:       receipt.transactionHash,
-        tokenId,
-        name:         form.name,
-        description:  form.description,
-        image:        form.image || null,
-        personality:  form.presetId,
-        systemPrompt: form.presetId === 'custom' ? form.systemPrompt : undefined,
-      }),
-    })
-      .catch(err => console.error('[mint] record error:', err))
-      .finally(() => { setIsSaving(false); setSaved(true); });
-  }, [isMintedOnChain, receipt, address, form]);
+    void (async () => {
+      try {
+        const timestamp = Date.now();
+        const message = `larpscan:record-agent:${receipt.transactionHash.toLowerCase()}:${timestamp}`;
+        const signature = await signMessageAsync({ message });
+
+        await fetch('/api/agent/record', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ownerAddress: address,
+            txHash:       receipt.transactionHash,
+            tokenId,
+            name:         form.name,
+            description:  form.description,
+            image:        form.image || null,
+            personality:  form.presetId,
+            systemPrompt: form.presetId === 'custom' ? form.systemPrompt : undefined,
+            signature,
+            timestamp,
+          }),
+        });
+        setSaved(true);
+      } catch (err) {
+        console.error('[mint] record error:', err);
+        recordedRef.current = false;
+      } finally {
+        setIsSaving(false);
+      }
+    })();
+  }, [isMintedOnChain, receipt, address, form, signMessageAsync]);
 
   const success = saved || (isMintedOnChain && !isSaving);
 

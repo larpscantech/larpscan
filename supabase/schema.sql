@@ -143,14 +143,14 @@ create table if not exists agents (
 create index if not exists idx_agents_owner on agents(owner_address);
 
 -- ── Row-level security ────────────────────────────────────────────────────────
--- All reads/writes go through the service role key in API routes,
--- so RLS is disabled for now. Enable and tighten once a user auth layer is added.
-alter table projects          disable row level security;
-alter table verification_runs disable row level security;
-alter table claims            disable row level security;
-alter table agent_logs        disable row level security;
-alter table evidence_items    disable row level security;
-alter table agents            disable row level security;
+-- RLS enabled: anon/authenticated roles are denied unless policies are added.
+-- API routes use SUPABASE_SERVICE_ROLE_KEY which bypasses RLS.
+alter table projects          enable row level security;
+alter table verification_runs enable row level security;
+alter table claims            enable row level security;
+alter table agent_logs        enable row level security;
+alter table evidence_items    enable row level security;
+alter table agents            enable row level security;
 
 -- ── Migration (run against existing DB instead of full schema reset) ──────────
 -- alter table agents add column if not exists ... (add future columns here)

@@ -322,10 +322,30 @@ export default function AgentsPage() {
   const fetchAgents = useCallback(async (activeTab: Tab, walletAddress?: string) => {
     setLoading(true);
     try {
-      const params = activeTab === 'mine' && walletAddress ? `?owner=${walletAddress.toLowerCase()}` : '';
-      const res    = await fetch(`/api/agents${params}`);
-      const data   = await res.json();
-      setAgents(data.agents ?? []);
+      if (activeTab === 'mine' && walletAddress) {
+        const res  = await fetch(`/api/agents?owner=${walletAddress.toLowerCase()}`);
+        const data = await res.json();
+        setAgents(data.agents ?? []);
+      } else {
+        const res  = await fetch('/api/agents/leaderboard');
+        const data = await res.json() as { leaderboard?: Array<{
+          id: string; name: string; image: string | null; personality: string;
+          owner_address: string; token_id: string | null; created_at: string;
+        }> };
+        setAgents((data.leaderboard ?? []).map(e => ({
+          id:            e.id,
+          owner_address: e.owner_address,
+          token_id:      e.token_id,
+          tx_hash:       null,
+          name:          e.name,
+          description:   null,
+          image:         e.image,
+          personality:   e.personality as 'larpscan' | 'custom',
+          system_prompt: null,
+          chain:         'bsc',
+          created_at:    e.created_at,
+        })));
+      }
     } catch {
       setAgents([]);
     } finally {

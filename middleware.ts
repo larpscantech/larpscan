@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { checkRateLimit, clientIpFromHeaders } from '@/lib/rate-limit';
 
 /**
  * Security middleware
@@ -13,6 +14,13 @@ import { NextRequest, NextResponse } from 'next/server';
  */
 
 const INTERNAL_ROUTES = ['/api/verify/claim', '/api/verify/run'];
+
+/** Expensive routes — per-IP limits (audit P6). */
+const RATE_LIMITS: Record<string, { limit: number; windowMs: number }> = {
+  '/api/verify/orchestrate':   { limit: 8,  windowMs: 10 * 60 * 1000 },
+  '/api/project/extract-text': { limit: 15, windowMs: 10 * 60 * 1000 },
+  '/api/agent/record':         { limit: 5,  windowMs: 60 * 60 * 1000 },
+};
 
 function getAllowedOrigins(): string[] {
   const origins: string[] = ['http://localhost:3000', 'http://localhost:3001'];
@@ -58,6 +66,22 @@ export function middleware(req: NextRequest) {
       return new NextResponse(JSON.stringify({ error: 'Unauthorized' }), {
         status: 401,
         headers: { 'Content-Type': 'application/json' },
+      });
+    }
+  }
+
+  // ── Rate limit expensive routes ───────────────────────────────────────────
+  const rateCfg = RATE_LIMITS[pathname];
+  if (rateCfg && req.method === 'POST') {
+    const ip = clientIpFromHeaders(req.headers);
+    const rl = checkRateLimit(`${pathname}:${ip}`, rateCfg.limit, rateCfg.windowMs);
+    if (!rl.ok) {
+      return new NextResponse(JSON.stringify({ error: 'Too many requests' }), {
+        status: 429,
+        headers: {
+          'Content-Type': 'application/json',
+          'Retry-After': String(rl.retryAfterSec),
+        },
       });
     }
   }

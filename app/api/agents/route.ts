@@ -8,16 +8,20 @@ export async function GET(req: Request) {
     const owner = searchParams.get('owner')?.toLowerCase();
     const limit = Math.min(parseInt(searchParams.get('limit') ?? '50'), 100);
 
-    // Exclude system_prompt — it's a private agent configuration, not for public listing
+    // Require owner filter — prevents full-table enumeration (audit P4)
+    if (!owner || !/^0x[0-9a-f]{40}$/.test(owner)) {
+      return NextResponse.json(
+        { error: 'owner query parameter required (0x… wallet address)' },
+        { status: 400 },
+      );
+    }
+
     let query = supabase
       .from('agents')
       .select('id, owner_address, token_id, tx_hash, name, description, image, personality, chain, created_at')
+      .eq('owner_address', owner)
       .order('created_at', { ascending: false })
       .limit(limit);
-
-    if (owner) {
-      query = query.eq('owner_address', owner);
-    }
 
     const { data, error } = await query;
 
