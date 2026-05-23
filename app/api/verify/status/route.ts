@@ -2,7 +2,13 @@ import { NextRequest } from 'next/server';
 import { supabase } from '@/lib/supabase';
 import { log } from '@/lib/logger';
 import { ok, err, withErrorHandler } from '@/lib/api-helpers';
-import { countActiveVerifyingRuns, dispatchClaimsForRun, MAX_CONCURRENT_RUNS } from '@/lib/claim-dispatcher';
+import {
+  countActiveVerifyingRuns,
+  dispatchClaimsForRun,
+  dispatchNextClaim,
+  INTER_CLAIM_COOLDOWN_MS,
+  MAX_CONCURRENT_RUNS,
+} from '@/lib/claim-dispatcher';
 import type { DbVerificationRun, DbAgentLog, DbClaimWithEvidence, DbProject } from '@/lib/db-types';
 
 const STUCK_CHECKING_MS = 15 * 60 * 1000; // 15 min — TOKEN_CREATION can take up to 12 min (Browserless retries + 6 min session)
@@ -103,6 +109,28 @@ export const GET = withErrorHandler(async (req: Request) => {
       } else {
         console.log(`[verify/status] Closing stale verifying run ${runId} — all claims already terminal`);
       }
+    }
+  }
+
+  // ── Resume stalled sequential dispatch ───────────────────────────────────
+  // If a daisy-chain link broke (serverless freeze, HTTP error), pending claims
+  // sit idle while no worker is in `checking`. Re-dispatch on the next poll.
+  // Require at least one terminal claim so we don't race initial dispatch
+  // (all-pending / no-checking is normal before the first worker stakes).
+  if (run.status === 'verifying') {
+    const pendingCount = claims.filter((c) => c.status === 'pending').length;
+    const checkingCount = claims.filter((c) => c.status === 'checking').length;
+    const terminalCount = claims.filter((c) =>
+      c.status !== 'pending' && c.status !== 'checking',
+    ).length;
+
+    if (pendingCount > 0 && checkingCount === 0 && terminalCount > 0) {
+      console.log(
+        `[verify/status] Resuming sequential dispatch for run ${runId} (${pendingCount} pending)`,
+      );
+      dispatchNextClaim(runId, origin, INTER_CLAIM_COOLDOWN_MS).catch((e) =>
+        console.error('[verify/status] Failed to resume claim dispatch:', e),
+      );
     }
   }
 

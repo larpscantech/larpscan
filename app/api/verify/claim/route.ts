@@ -4,6 +4,7 @@ import { log } from '@/lib/logger';
 import { determineVerdict, type AgentContext } from '@/lib/verdict';
 import { routeVerification, type StructuredClaim } from '@/lib/verification-graph';
 import { ok, err, withErrorHandler } from '@/lib/api-helpers';
+import { dispatchNextClaim, INTER_CLAIM_COOLDOWN_MS } from '@/lib/claim-dispatcher';
 import { getFastTrackVerdict, recordClaimResult } from '@/lib/platform-context';
 import type { DbClaim, DbProject, DbVerificationRun } from '@/lib/db-types';
 
@@ -219,7 +220,7 @@ export const POST = withErrorHandler(async (req: Request) => {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-async function maybeCompleteRun(runId: string, _origin: string) {
+async function maybeCompleteRun(runId: string, origin: string) {
   const { data: remaining } = await supabase
     .from('claims')
     .select('id, status')
@@ -233,8 +234,15 @@ async function maybeCompleteRun(runId: string, _origin: string) {
       .eq('id', runId);
     await log(runId, 'Verification complete');
     console.log('[verify/claim] All claims done — run marked complete');
+    return;
   }
-  // All claims were dispatched in parallel — no daisy-chain needed
+
+  const hasPending = remaining.some((c) => c.status === 'pending');
+  const hasChecking = remaining.some((c) => c.status === 'checking');
+
+  if (hasPending && !hasChecking) {
+    await dispatchNextClaim(runId, origin, INTER_CLAIM_COOLDOWN_MS);
+  }
 }
 
 async function saveEvidence(

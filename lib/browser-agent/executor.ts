@@ -694,6 +694,11 @@ STEP 3 — Click the submit button:
 - Some platforms use a TWO-STEP flow: first "Preview" shows a profile/summary, then a "Mint"/"Confirm" button appears
   → If you see "Preview" or "Next" button: CLICK IT first, then wait 2s, then look for the real "Mint"/"Create" button
   → NEVER stop after clicking "Preview" — always continue to the second "Mint" step
+- MULTI-STEP WIZARD (when you see "STEP X OF Y" on screen):
+  → Steps with NO empty text fields: click the yellow/footer "Next" button immediately — do NOT wait or scroll
+  → If a default option is already highlighted/selected, just click "Next" — do not re-configure
+  → Use "Skip, configure later" only if "Next" fails to advance after one attempt
+  → Advance through ALL intermediate steps until the final MINT/CREATE step, then click the submit button
 - If disabled after filling → check validation errors, fix inputs, retry
 - NEVER skip this step — clicking submit triggers the BSC transaction
 - WALLET LIMIT: if the page says "already minted / limit reached / no mint slots", return null — this wallet is at its limit
@@ -1202,6 +1207,202 @@ function isPassConditionMet(
   }
 
   return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Multi-step wizard helpers (generic — "STEP X OF Y" flows)
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface WizardProgress {
+  detected:     boolean;
+  currentStep:  number;
+  totalSteps:   number;
+  stepLabel:    string;
+  onFinalStep:  boolean;
+}
+
+async function detectWizardProgress(page: Page): Promise<WizardProgress> {
+  const none: WizardProgress = { detected: false, currentStep: 0, totalSteps: 0, stepLabel: '', onFinalStep: false };
+  return page.evaluate(() => {
+    const bodyText = (document.body?.innerText ?? '').replace(/\s+/g, ' ');
+    const stepMatch = bodyText.match(/STEP\s+(\d+)\s+OF\s+(\d+)/i);
+    if (!stepMatch) return null;
+
+    const currentStep = parseInt(stepMatch[1], 10);
+    const totalSteps  = parseInt(stepMatch[2], 10);
+    if (!Number.isFinite(currentStep) || !Number.isFinite(totalSteps) || totalSteps < 2) return null;
+
+    // Step label often appears as an uppercase token near the progress bar or as a heading.
+    let stepLabel = '';
+    const labelFromBar = bodyText.match(
+      new RegExp(`STEP\\s+${currentStep}\\s+OF\\s+${totalSteps}\\s+([A-Z][A-Z\\s]{1,20})`, 'i'),
+    );
+    if (labelFromBar) {
+      stepLabel = labelFromBar[1].trim();
+    } else {
+      const headings = Array.from(document.querySelectorAll('h1, h2, h3, h4, [class*="step-title"], [class*="wizard"]'))
+        .map((el) => ((el as HTMLElement).innerText ?? '').replace(/\s+/g, ' ').trim())
+        .filter((t) => t.length > 1 && t.length < 40 && !/step\s+\d/i.test(t));
+      stepLabel = headings[0] ?? '';
+    }
+
+    const onFinalStep =
+      currentStep >= totalSteps ||
+      /\bmint\b/i.test(stepLabel) ||
+      /\b(create agent|launch|deploy)\b/i.test(stepLabel);
+
+    return { detected: true, currentStep, totalSteps, stepLabel, onFinalStep };
+  }).then((r) => r ?? none).catch(() => none);
+}
+
+async function hasEmptyVisibleTextInputs(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const inputs = Array.from(
+      document.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([disabled]), textarea:not([disabled])'),
+    );
+    return inputs.some((el) => {
+      const s = window.getComputedStyle(el as Element);
+      const r = (el as HTMLElement).getBoundingClientRect();
+      if (s.display === 'none' || s.visibility === 'hidden' || r.width <= 0 || r.height <= 0) return false;
+      return !((el as HTMLInputElement).value ?? '').trim();
+    });
+  }).catch(() => false);
+}
+
+/** Click the wizard footer primary action (Next / Continue / Skip / final submit). */
+async function clickWizardFooterButton(page: Page, finalSubmit = false): Promise<string | null> {
+  return page.evaluate((wantFinal: boolean) => {
+    function isVisible(el: Element): boolean {
+      const s = window.getComputedStyle(el as HTMLElement);
+      const r = (el as HTMLElement).getBoundingClientRect();
+      return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+    }
+
+    function dispatchClick(el: HTMLElement) {
+      el.scrollIntoView({ block: 'center', inline: 'center' });
+      el.focus({ preventScroll: true });
+      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'] as const) {
+        el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+      }
+    }
+
+    const advanceRe = /^(next|continue)$/i;
+    const skipRe    = /^skip,?\s*configure later$/i;
+    const submitRe  = /^(create(\s+(agent|new agent|token))?|mint(\s+agent)?|launch|deploy|submit|confirm|build|publish|proceed|start)$/i;
+
+    const btns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'))
+      .filter((el) => {
+        if (!isVisible(el)) return false;
+        const disabled = (el as HTMLButtonElement).disabled || el.getAttribute('aria-disabled') === 'true';
+        return !disabled;
+      });
+
+    type Scored = { el: HTMLElement; text: string; score: number };
+    const scored: Scored[] = [];
+
+    for (const el of btns) {
+      const text = (el.textContent ?? '').replace(/\s+/g, ' ').trim();
+      if (!text || text.length > 80) continue;
+
+      const r = el.getBoundingClientRect();
+      let score = r.bottom + r.right * 0.01; // prefer footer / right-side CTAs
+
+      if (wantFinal) {
+        if (!submitRe.test(text)) continue;
+        score += 1000;
+      } else if (advanceRe.test(text)) {
+        score += 500;
+      } else if (skipRe.test(text)) {
+        score += 100;
+      } else {
+        continue;
+      }
+
+      scored.push({ el: el as HTMLElement, text, score });
+    }
+
+    scored.sort((a, b) => b.score - a.score);
+    const target = scored[0];
+    if (!target) return null;
+
+    dispatchClick(target.el);
+    return target.text;
+  }, finalSubmit).catch(() => null);
+}
+
+/**
+ * Deterministically advance a multi-step creation wizard.
+ * Returns true when the wizard step number increased or a final submit was clicked.
+ */
+async function tryAdvanceCreationWizard(page: Page): Promise<boolean> {
+  const before = await detectWizardProgress(page);
+  if (!before.detected) return false;
+
+  if (before.onFinalStep) {
+    const clicked = await clickWizardFooterButton(page, true);
+    if (clicked) {
+      console.log(`[executor] Wizard final submit: clicked "${clicked}" (step ${before.currentStep}/${before.totalSteps})`);
+      await page.waitForTimeout(2_500);
+      return true;
+    }
+    return false;
+  }
+
+  const needsFill = await hasEmptyVisibleTextInputs(page);
+  if (needsFill) return false;
+
+  const clicked = await clickWizardFooterButton(page, false);
+  if (!clicked) return false;
+
+  await page.waitForTimeout(1_500);
+  const after = await detectWizardProgress(page);
+  if (after.detected && after.currentStep > before.currentStep) {
+    console.log(
+      `[executor] Wizard advanced: step ${before.currentStep}→${after.currentStep}` +
+      (before.stepLabel ? ` (${before.stepLabel} → ${after.stepLabel || '?'})` : ''),
+    );
+    return true;
+  }
+
+  // Next did not advance — try "Skip, configure later" once.
+  if (!/^skip/i.test(clicked)) {
+    const skipClicked = await page.evaluate(() => {
+      const skipRe = /^skip,?\s*configure later$/i;
+      const btn = Array.from(document.querySelectorAll('button, [role="button"]')).find((el) => {
+        const s = window.getComputedStyle(el as HTMLElement);
+        const r = (el as HTMLElement).getBoundingClientRect();
+        const disabled = (el as HTMLButtonElement).disabled || el.getAttribute('aria-disabled') === 'true';
+        const text = (el.textContent ?? '').replace(/\s+/g, ' ').trim();
+        return !disabled && s.display !== 'none' && r.width > 0 && r.height > 0 && skipRe.test(text);
+      }) as HTMLElement | undefined;
+      if (!btn) return null;
+      btn.click();
+      return (btn.textContent ?? '').trim();
+    }).catch(() => null);
+
+    if (skipClicked) {
+      console.log(`[executor] Wizard skip fallback: clicked "${skipClicked}"`);
+      await page.waitForTimeout(1_500);
+      const afterSkip = await detectWizardProgress(page);
+      if (afterSkip.detected && afterSkip.currentStep > before.currentStep) return true;
+    }
+  }
+
+  console.log(`[executor] Wizard stuck at step ${before.currentStep}/${before.totalSteps} after "${clicked}"`);
+  return false;
+}
+
+/** Fast-path: advance through intermediate wizard steps without LLM budget. */
+async function autoProgressCreationWizard(page: Page, maxSteps = 4): Promise<number> {
+  let moves = 0;
+  for (let i = 0; i < maxSteps; i++) {
+    const wizard = await detectWizardProgress(page);
+    // Stop before the final MINT step — submit is handled by ReAct / last-chance logic.
+    if (!wizard.detected || wizard.onFinalStep) break;
+    if (!(await tryAdvanceCreationWizard(page))) break;
+    moves++;
+  }
+  return moves;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1979,16 +2180,33 @@ export async function executeSteps(
       : cachedPageState;
     if (pageState) cachedPageState = pageState;
     console.log(`[executor] ReAct step ${reactStepCount + 1}/${REACT_BUDGET}`);
+
+    // Wizard fast-path: blast through selection-only steps (e.g. Brain, Platforms)
+    // using the footer Next button — avoids LLM wait-loops on STEP X OF Y flows.
+    if (isCreationClaim) {
+      const wizardMoves = await autoProgressCreationWizard(page, 3);
+      if (wizardMoves > 0) {
+        console.log(`[executor] Wizard fast-path: ${wizardMoves} step(s) advanced without LLM`);
+        cachedPageState = undefined;
+        lastStepChangedUrl = true;
+        reactStepCount++; // consume budget so we cannot spin forever on wizard-only steps
+        continue;
+      }
+    }
+
     const action = await decideAdaptiveStep(page, options?.claim ?? '', options?.passCondition ?? '', runningNarratives, options?.investigationWalletAddress, options?.featureType, pageState, agentMemory, baseDomain, runSuffix).catch(() => null);
     if (!action) { console.log('[executor] ReAct: LLM returned null — done or stuck'); break; }
     // Handle wait action: pause — but cap consecutive waits to prevent infinite loop
     if (action.action === 'wait') {
       consecutiveWaits++;
       if (consecutiveWaits > MAX_CONSECUTIVE_WAITS) {
-        // LLM is stuck in wait-loop — break out and continue as if the page loaded
+        // LLM is stuck in wait-loop — break out and try deterministic wizard advance
         console.log(`[executor] ReAct: wait loop detected (${consecutiveWaits} consecutive waits) — forcing progress`);
         consecutiveWaits = 0;
         reactStepCount++; // count as a real step to prevent looping forever
+        if (isCreationClaim) {
+          await autoProgressCreationWizard(page, 2);
+        }
         continue;
       }
       const waitMs = ('ms' in action && typeof action.ms === 'number') ? action.ms : 3000;
@@ -2006,8 +2224,25 @@ export async function executeSteps(
     }
     const effectiveStep = applyFillInputSubstitutions(action, options);
     const urlBefore = page.url(); const textBefore = await capturePageText(page);
+    const wizardBeforeClick =
+      isCreationClaim &&
+      effectiveStep.action === 'click_text' &&
+      /^(next|continue)$/i.test('text' in effectiveStep ? (effectiveStep as { text: string }).text : '')
+        ? await detectWizardProgress(page)
+        : null;
     let stepSucceeded = false; let loadingTriggered = false;
     try { await performStep(page, effectiveStep, baseDomain, options?.investigationWalletAddress, options?.featureType); stepSucceeded = true; } catch (e) { console.error('[executor] ReAct step error:', e); }
+    // If LLM clicked "Next" but the wizard step did not advance, use footer click fallback.
+    if (wizardBeforeClick?.detected && stepSucceeded) {
+      await page.waitForTimeout(800);
+      const wizardAfterClick = await detectWizardProgress(page);
+      if (
+        wizardAfterClick.detected &&
+        wizardAfterClick.currentStep <= wizardBeforeClick.currentStep
+      ) {
+        await tryAdvanceCreationWizard(page);
+      }
+    }
     if (stepSucceeded && (effectiveStep.action === 'click_text' || effectiveStep.action === 'click_selector')) { await page.waitForTimeout(1_500); loadingTriggered = await waitForPageStable(page); if (loadingTriggered) { await page.evaluate(() => window.scrollBy({ top: 400, behavior: 'smooth' })).catch(() => {}); await page.waitForTimeout(600); } } else if (stepSucceeded) { await page.waitForTimeout(1_000); }
     const urlAfter = page.url(); const urlChanged = urlAfter !== urlBefore;
     // Re-establish wallet connection after navigating to a new page.
@@ -2194,7 +2429,18 @@ export async function executeSteps(
     // If the agent exhausted its budget without submitting, make one final
     // deterministic click on the visible submit/action button. The dApp will
     // dispatch its own transaction naturally — no platform-specific calldata.
-    const lastChanceCta = await findFormSubmitButton(page);
+    const wizardAtEnd = await detectWizardProgress(page);
+    if (wizardAtEnd.detected && wizardAtEnd.onFinalStep) {
+      const wizardSubmit = await clickWizardFooterButton(page, true);
+      if (wizardSubmit) {
+        console.log(`[executor] Last-chance wizard submit: clicking "${wizardSubmit}"`);
+        await page.waitForTimeout(5_000);
+        console.log('[executor] Last-chance wizard submit: button clicked — wallet tx dispatch pending (check signer logs)');
+      }
+    }
+    const lastChanceCta = wizardAtEnd.detected && wizardAtEnd.onFinalStep
+      ? null
+      : await findFormSubmitButton(page);
     if (lastChanceCta) {
       console.log(`[executor] Last-chance submit: clicking "${lastChanceCta}" after budget exhaustion`);
       try {
@@ -2421,6 +2667,20 @@ async function performStep(page: Page, step: AgentStep, baseDomain: string, wall
     case 'click_text': {
       if (!isSafeToInteract(step.text, featureType)) {
         throw new Error(`Blocked by safety filter: "${step.text}"`);
+      }
+
+      // Multi-step wizard: route Next/Continue through footer button clicker
+      // (avoids clicking the wrong "Next" or a non-interactive duplicate).
+      if (/^(next|continue)$/i.test(step.text.trim())) {
+        const wizard = await detectWizardProgress(page);
+        if (wizard.detected && !wizard.onFinalStep) {
+          const footerClicked = await clickWizardFooterButton(page, false);
+          if (footerClicked) {
+            console.log(`[executor] Wizard footer click: "${footerClicked}" (step ${wizard.currentStep}/${wizard.totalSteps})`);
+            await page.waitForTimeout(2_000);
+            break;
+          }
+        }
       }
 
       const isWalletConnect = /connect wallet|connect your wallet|連接錢包|連結錢包/i.test(step.text);

@@ -28,6 +28,9 @@ import type { DbClaim } from './db-types';
 /** One Browserless account → one run at a time keeps concurrent sessions inside plan limits. */
 export const MAX_CONCURRENT_RUNS = 1;
 
+/** Pause between Browserless sessions so the prior session can fully tear down. */
+export const INTER_CLAIM_COOLDOWN_MS = 5_000;
+
 /**
  * How long a run may stay in `verifying` status before it's considered stale
  * for queue purposes. A crashed server could leave a run stuck in `verifying`.
@@ -47,55 +50,13 @@ export async function countActiveVerifyingRuns(): Promise<number> {
 }
 
 /**
- * Kick off parallel claim processing for a run.
- *
- * Stakes ALL pending claims atomically then fires HTTP POSTs for all of them
- * simultaneously.  Each claim handler calls maybeCompleteRun independently —
- * no daisy-chain needed.
+ * Kick off sequential claim processing for a run — one Browserless session at a time.
+ * Each completed claim daisy-chains to the next via dispatchNextClaim in the claim route.
  */
 export async function dispatchClaimsForRun(runId: string, origin: string): Promise<void> {
-  const { data: allPending } = await supabase
-    .from('claims')
-    .select('*')
-    .eq('verification_run_id', runId)
-    .eq('status', 'pending')
-    .order('created_at', { ascending: true })
-    .returns<DbClaim[]>();
-
-  if (!allPending?.length) {
-    console.log(`[claim-dispatcher] No pending claims for run ${runId}`);
-    return;
-  }
-
-  // Priority features (WALLET_FLOW, TOKEN_CREATION) need the freshest session — run first
-  const sorted = [...allPending].sort((a, b) => {
-    const aPri = PRIORITY_FEATURE_TYPES.includes(a.feature_type ?? '') ? 0 : 1;
-    const bPri = PRIORITY_FEATURE_TYPES.includes(b.feature_type ?? '') ? 0 : 1;
-    return aPri - bPri;
-  });
-
-  // Stake all claims atomically before firing any (prevents duplicate workers)
-  const staked: DbClaim[] = [];
-  for (const claim of sorted) {
-    const { data: s } = await supabase
-      .from('claims')
-      .update({ status: 'checking' })
-      .eq('id', claim.id)
-      .eq('status', 'pending')
-      .select('id')
-      .single<{ id: string }>();
-    if (s) staked.push(claim);
-  }
-
-  if (!staked.length) {
-    console.log(`[claim-dispatcher] All claims already taken for run ${runId}`);
-    return;
-  }
-
-  await log(runId, `Dispatching ${staked.length} claim${staked.length > 1 ? 's' : ''} in parallel`);
-  console.log(`[claim-dispatcher] Firing ${staked.length} claims in parallel for run ${runId}`);
-
-  await Promise.all(staked.map(claim => flushClaimRequest(claim.id, runId, origin)));
+  console.log(`[claim-dispatcher] Starting sequential dispatch for run ${runId}`);
+  await log(runId, 'Starting sequential claim dispatch (one Browserless session at a time)');
+  await dispatchNextClaim(runId, origin, 0);
 }
 
 /**
@@ -120,12 +81,6 @@ const PRIORITY_FEATURE_TYPES = ['WALLET_FLOW', 'TOKEN_CREATION'];
  * freeze the isolate and the next claim never dispatches.
  */
 export async function dispatchNextClaim(runId: string, origin: string, cooldownMs = 0): Promise<void> {
-  // Optional cooldown — lets Browserless finish encoding and GC between sessions.
-  if (cooldownMs > 0) {
-    console.log(`[claim-dispatcher] Cooling down ${cooldownMs / 1_000}s before next claim (Browserless recovery)…`);
-    await new Promise<void>((r) => setTimeout(r, cooldownMs));
-  }
-
   // Fetch ALL pending claims so we can priority-sort before picking one.
   // WALLET_FLOW / TOKEN_CREATION are dispatched first: they require the freshest
   // Browserless session (no zombie CDP evaluates from prior sessions).
@@ -155,18 +110,23 @@ export async function dispatchNextClaim(runId: string, origin: string, cooldownM
     return;
   }
 
-  // Atomically stake the claim (prevents duplicate workers)
-    const { data: staked } = await supabase
-      .from('claims')
-      .update({ status: 'checking' })
-      .eq('id', claim.id)
-      .eq('status', 'pending')
-      .select('id')
-      .single<{ id: string }>();
+  // Stake before cooldown so status polls see `checking` and won't double-dispatch.
+  const { data: staked } = await supabase
+    .from('claims')
+    .update({ status: 'checking' })
+    .eq('id', claim.id)
+    .eq('status', 'pending')
+    .select('id')
+    .single<{ id: string }>();
 
-    if (!staked) {
-      console.log(`[claim-dispatcher] Claim ${claim.id} already taken — skipping`);
+  if (!staked) {
+    console.log(`[claim-dispatcher] Claim ${claim.id} already taken — skipping`);
     return;
+  }
+
+  if (cooldownMs > 0) {
+    console.log(`[claim-dispatcher] Cooling down ${cooldownMs / 1_000}s before next claim (Browserless recovery)…`);
+    await new Promise<void>((r) => setTimeout(r, cooldownMs));
   }
 
   await log(runId, `Dispatching claim: ${claim.claim.slice(0, 60)}`);

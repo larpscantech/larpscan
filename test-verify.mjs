@@ -94,7 +94,12 @@ async function screenshot(page, name) {
         }
         const runRes = await req.post(`${BASE}/api/verify/run`, {
           data: { runId: capturedRunId },
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...(process.env.INTERNAL_API_KEY
+              ? { 'x-internal-key': process.env.INTERNAL_API_KEY }
+              : {}),
+          },
         });
         runResult = runRes.ok()
           ? await runRes.json()
