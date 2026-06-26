@@ -14,6 +14,15 @@ import { cn, isSolanaMintAddress } from '@/lib/utils';
 import type { Phase, TokenProject, Claim, Verdict, RecentVerification } from '@/lib/types';
 import type { DbProject, DbClaim, DbClaimWithEvidence, DbVerificationRun } from '@/lib/db-types';
 
+/** When true, new token/website scans are blocked with a coming-soon message. */
+const SCANS_COMING_SOON = true;
+
+function comingSoonCopy(isZh: boolean) {
+  return isZh
+    ? '即將推出 — 代幣與網站掃描尚未開放，請稍後再試。'
+    : 'Coming soon — token and website scanning is not live yet. Check back shortly.';
+}
+
 // ─── Type converters: DB rows → frontend display types ────────────────────────
 
 function toTokenProject(p: DbProject): TokenProject {
@@ -269,8 +278,9 @@ function ContractRow({
           className={cn(
             'h-12 px-6 rounded-sm flex items-center gap-2.5 flex-shrink-0',
             'text-[11px] font-semibold uppercase tracking-[0.18em] whitespace-nowrap',
-            'bg-[#dc2626] text-white',
-            'hover:bg-[#b91c1c]',
+            SCANS_COMING_SOON
+              ? 'bg-[#1c1c22] text-zinc-500 border border-[#2a2a32] cursor-not-allowed'
+              : 'bg-[#dc2626] text-white hover:bg-[#b91c1c]',
             'disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none',
             'focus:outline-none focus:ring-2 focus:ring-[#dc2626]/40 transition-all duration-150',
           )}
@@ -280,6 +290,8 @@ function ContractRow({
               <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
               {isZh ? '掃描中...' : 'Scanning...'}
             </>
+          ) : SCANS_COMING_SOON ? (
+            <>{isZh ? '即將推出' : 'Coming soon'}</>
           ) : (
             <>{isZh ? '驗證' : 'Verify'} <ArrowRight className="w-3.5 h-3.5" /></>
           )}
@@ -307,6 +319,27 @@ function ContractRow({
         </span>
       </label>
     </div>
+  );
+}
+
+// ─── Coming soon banner ───────────────────────────────────────────────────────
+
+function ComingSoonBanner() {
+  const { locale } = useLocale();
+  const isZh = locale === 'zh-TW';
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -6 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="flex items-start gap-3 px-5 py-4 rounded-sm border border-amber-900/40 bg-[#1a1208] mb-6"
+    >
+      <span className="text-[10px] font-bold uppercase tracking-[0.2em] text-amber-500 flex-shrink-0 mt-0.5">
+        {isZh ? '即將推出' : 'Coming soon'}
+      </span>
+      <p className="text-[12px] text-amber-200/90 leading-relaxed flex-1">
+        {comingSoonCopy(isZh)}
+      </p>
+    </motion.div>
   );
 }
 
@@ -567,6 +600,7 @@ export default function DashboardPage() {
 
   // Enter verifying + show pipeline immediately for ?runId= (before status fetch returns).
   useLayoutEffect(() => {
+    if (SCANS_COMING_SOON) return;
     if (typeof window === 'undefined') return;
     const urlRunId = new URLSearchParams(window.location.search).get('runId')?.trim();
     if (!urlRunId || !/^[0-9a-f-]{36}$/i.test(urlRunId)) return;
@@ -605,6 +639,7 @@ export default function DashboardPage() {
   // Completed   → load result directly from /api/verify/status (skip orchestrate).
   // Idle phases only to avoid interrupting an in-progress scan.
   useEffect(() => {
+    if (SCANS_COMING_SOON) return;
     const trimmed = input.trim();
     const isCA  = isSolanaMintAddress(trimmed);
     const isURL = /^https?:\/\/.+/i.test(trimmed);
@@ -828,6 +863,7 @@ export default function DashboardPage() {
   // ── ?runId= deep link: hydrate from /status then poll until complete ─────────
   // Without this loop the UI showed a frozen first snapshot (no live checking state).
   useEffect(() => {
+    if (SCANS_COMING_SOON) return;
     if (typeof window === 'undefined') return;
     const urlRunId = new URLSearchParams(window.location.search).get('runId')?.trim();
     if (!urlRunId || !/^[0-9a-f-]{36}$/i.test(urlRunId)) return;
@@ -917,6 +953,8 @@ export default function DashboardPage() {
   // discover → dedup → scrape → extract → dispatch claim workers.
   // The client just calls orchestrate, then polls for results.
   const startVerification = useCallback(async (overrideAddress?: string) => {
+    if (SCANS_COMING_SOON) return;
+
     const myRunId = ++runIdRef.current;
     const alive   = () => runIdRef.current === myRunId;
     const sleep   = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -1124,6 +1162,10 @@ export default function DashboardPage() {
   // ── Reset ──────────────────────────────────────────────────────────────────
   const handleSubmit = useCallback(() => {
     if (!input.trim() || (phase !== 'idle' && phase !== 'complete')) return;
+    if (SCANS_COMING_SOON) {
+      setApiError(null);
+      return;
+    }
     startVerification();
   }, [input, phase, startVerification]);
 
@@ -1373,6 +1415,8 @@ export default function DashboardPage() {
               onInputModeChange={setInputMode}
             />
           </motion.div>
+
+          {SCANS_COMING_SOON && <ComingSoonBanner />}
 
           {/* Error banner */}
           <AnimatePresence>
