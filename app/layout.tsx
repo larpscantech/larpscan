@@ -1,7 +1,6 @@
 import type { Metadata } from 'next';
 import { Inter, JetBrains_Mono } from 'next/font/google';
 import './globals.css';
-import { LocaleProvider } from '@/components/locale-provider';
 import { ShaderBackground } from '@/components/shader-background';
 import { WalletProviderWrapper } from '@/components/wallet-provider';
 
@@ -29,7 +28,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body className="font-sans text-white antialiased">
         <ShaderBackground />
         <WalletProviderWrapper>
-          <LocaleProvider>{children}</LocaleProvider>
+          {children}
         </WalletProviderWrapper>
       </body>
     </html>

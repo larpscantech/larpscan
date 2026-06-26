@@ -4,7 +4,6 @@ import { Copy, ArrowUpRight } from 'lucide-react';
 import { StatusBadge } from './status-badge';
 import { truncateAddressPump } from '@/lib/utils';
 import type { RecentVerification } from '@/lib/types';
-import { useLocale } from '@/components/locale-provider';
 
 interface RecentVerificationsTableProps {
   verifications: RecentVerification[];
@@ -48,29 +47,22 @@ function QABar({ verified, total }: { verified: number; total: number }) {
   );
 }
 
-export function RecentVerificationsTable({ verifications, onSelect }: RecentVerificationsTableProps) {
-  const { locale } = useLocale();
-  const isZh = locale === 'zh-TW';
-  const COL_HEADERS = isZh
-    ? ['代幣', 'Mint 地址', '狀態', 'QA 分數', '預估時間', '']
-    : ['Token', 'Mint Address', 'Status', 'QA Score', 'Est. Time', ''];
+const COL_HEADERS = ['Token', 'Mint Address', 'Status', 'QA Score', 'Est. Time', ''];
 
+export function RecentVerificationsTable({ verifications, onSelect }: RecentVerificationsTableProps) {
   return (
     <div className="rounded-sm border border-[#1c1c22] bg-[#09090d] overflow-hidden">
-      {/* Panel header */}
       <div className="px-7 py-5 border-b border-[#1f1f27] flex items-center justify-between">
         <div>
           <p className="text-[11px] font-bold uppercase tracking-widest text-zinc-400">
-            {isZh ? '近期掃描' : 'Recent Scans'}
+            Recent Scans
           </p>
           <p className="text-xs text-zinc-700 mt-1">
-            {isZh
-              ? '最近 10 次執行中與已完成驗證'
-              : 'Most recent 10 active and completed verifications'}
+            Most recent 10 active and completed verifications
           </p>
         </div>
         <span className="text-[10px] font-mono font-bold text-zinc-700 bg-[#101015] border border-[#1f1f27] rounded-sm px-3 py-1.5">
-          {verifications.length} {isZh ? '總計' : 'total'}
+          {verifications.length} total
         </span>
       </div>
 
@@ -103,7 +95,6 @@ export function RecentVerificationsTable({ verifications, onSelect }: RecentVeri
                   i < verifications.length - 1 ? 'border-b border-[#1f1f27]' : '',
                 ].join(' ')}
               >
-                {/* Token */}
                 <td className="px-7 py-4">
                   <div className="flex items-center gap-3">
                     <div className={[
@@ -130,7 +121,6 @@ export function RecentVerificationsTable({ verifications, onSelect }: RecentVeri
                   </div>
                 </td>
 
-                {/* Address */}
                 <td className="px-7 py-4">
                   <div className="flex items-center">
                     <span className="font-mono text-[11px] text-zinc-500">
@@ -140,26 +130,22 @@ export function RecentVerificationsTable({ verifications, onSelect }: RecentVeri
                   </div>
                 </td>
 
-                {/* Status */}
                 <td className="px-7 py-4">
                   <StatusBadge
                     variant={v.status === 'in_progress' ? 'in-progress' : 'complete'}
                   />
                 </td>
 
-                {/* QA Score */}
                 <td className="px-7 py-4">
                   <QABar verified={v.claimsVerified} total={v.claimsTotal} />
                 </td>
 
-                {/* Est. Time */}
                 <td className="px-7 py-4">
                   <span className="font-mono text-[11px] text-zinc-600 tabular-nums">
                     {v.estTime ?? '—'}
                   </span>
                 </td>
 
-                {/* View arrow — only shown for clickable complete rows */}
                 <td className="px-4 py-4 w-8">
                   {isClickable && (
                     <ArrowUpRight className="w-3.5 h-3.5 text-zinc-700 group-hover:text-red-500 transition-colors" />

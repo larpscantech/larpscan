@@ -4,7 +4,6 @@ import { Globe, Copy } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { truncateAddressPump } from '@/lib/utils';
 import type { TokenProject } from '@/lib/types';
-import { useLocale } from '@/components/locale-provider';
 
 interface ProjectIdentityBarProps {
   project: TokenProject | null; // null = skeleton loading state
@@ -35,9 +34,6 @@ function Skeleton({ w, h = 'h-3' }: { w: string; h?: string }) {
 }
 
 export function ProjectIdentityBar({ project, claimCount }: ProjectIdentityBarProps) {
-  const { locale } = useLocale();
-  const isZh = locale === 'zh-TW';
-
   const normalizeWebsiteUrl = (website: string) =>
     /^https?:\/\//i.test(website) ? website : `https://${website}`;
 
@@ -125,9 +121,7 @@ export function ProjectIdentityBar({ project, claimCount }: ProjectIdentityBarPr
                 <div className="ml-auto flex items-center gap-3">
                   <span className="text-[10px] font-bold uppercase tracking-widest text-zinc-600">
                     {claimCount}{' '}
-                    {isZh
-                      ? `項宣稱已提取`
-                      : `${claimCount === 1 ? 'claim' : 'claims'} extracted`}
+                    {`${claimCount === 1 ? 'claim' : 'claims'} extracted`}
                   </span>
                   <span className="text-[10px] font-mono font-bold text-zinc-700 border border-[#1f1f27] rounded-sm px-2 py-1 bg-[#101015]">
                     Solana

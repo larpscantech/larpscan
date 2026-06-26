@@ -5,7 +5,6 @@ import Link from 'next/link';
 import { ArrowRight, ShieldCheck, Bot, Scale } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { Navbar } from '@/components/navbar';
-import { useLocale } from '@/components/locale-provider';
 
 function DocBlock({
   title,
@@ -52,8 +51,6 @@ function InfoCard({
 }
 
 export default function DocsPage() {
-  const { locale } = useLocale();
-  const isZh = locale === 'zh-TW';
   const [entered, setEntered] = useState(false);
 
   useEffect(() => {
@@ -61,91 +58,7 @@ export default function DocsPage() {
     return () => clearTimeout(t);
   }, []);
 
-  const copy = isZh
-    ? {
-        headerLabel: '文件',
-        heroTitleMain: 'LARPSCAN 文件',
-        heroTitleSub: '',
-        heroBody:
-          'LARPSCAN 驗證 Solana 上產品的真實行為，而不是行銷敘述。貼上 SPL mint 地址，系統會透過 pump.fun、DexScreener 等來源發現專案，再以 Phantom 錢包代理執行瀏覽器驗證。',
-        pills: ['Solana 主網', 'SOL 安全上限', '瀏覽器代理', '可重現判定'],
-        tocLabel: '本頁內容',
-        toc: ['總覽', '驗證流程', '證據輸出', '判定模型', '風險控制', 'API 端點', '運維指南'],
-        sectionTitles: {
-          overview: 'LARPSCAN 的核心工作',
-          pipeline: '驗證流程',
-          evidence: '證據輸出',
-          verdicts: '判定模型',
-          risk: '風險控制',
-          api: '核心 API 端點',
-          ops: '運維指南',
-        },
-        sectionSubtitles: {
-          overview: '總覽',
-          pipeline: '流程',
-          evidence: '輸出',
-          verdicts: '分類',
-          risk: '安全',
-          api: 'api 參考',
-          ops: '日常運維',
-        },
-        overviewParagraphs: [
-          'LARPSCAN 接收 Solana SPL mint 地址，透過 pump.fun、DexScreener、GeckoTerminal 等來源識別專案與網站，再提取可驗證宣稱，最後以 Phantom 錢包代理在真實瀏覽器中逐條驗證。',
-          '系統的目標不是生成敘事，而是把產品宣稱轉成可測試的 pass condition，並在每次驗證後留下清楚的可追溯證據。',
-          '每次執行都會產生證據物件：截圖、日誌、判定理由、Solana 交易簽名與 Solscan 連結，目標是可重現的信任。',
-        ],
-        flowCards: [
-          ['01 提取', '收集專案 metadata，並抓取真實產品文字內容。'],
-          ['02 分析', '生成可驗證宣稱與通過條件。'],
-          ['03 驗證', '在真實 UI 面執行瀏覽器代理操作。'],
-          ['04 報告', '寫入判定並保存證據。'],
-        ],
-        flowSketch: '// 流程草圖',
-        flowNotes: [
-          ['專案發現', '由 Solana mint 反推名稱、符號、網站與社群（pump.fun、DexScreener 等）。'],
-          ['宣稱提取', '從網站與文字上下文中萃取可驗證功能，而不是籠統敘事。'],
-          ['瀏覽器執行', 'Phantom 代理依序導覽、點擊、填寫、等待與重試，直到獲得正面或負面訊號。'],
-          ['結果重用', '若專案已有完成驗證結果，預設可直接讀取，只有 Force Reverify 才建立新執行。'],
-        ],
-        evidenceItems: [
-          ['截圖', '保存關鍵互動畫面與最終結果狀態。'],
-          ['代理日誌', '記錄每一步嘗試、等待、恢復與錯誤處理。'],
-          ['判定理由', '保留規則層與模型層最終得出結論的依據。'],
-          ['交易資訊', '若有 Solana 鏈上互動，保存交易簽名、確認狀態與 Solscan 連結。'],
-        ],
-        verdict: {
-          verified: ['已驗證', '觀測到與宣稱一致的行為，且具備支撐證據。'],
-          failed: ['LARP / 失敗', '宣稱功能不存在、故障，或與實際行為相矛盾。'],
-          untestable: [
-            '不可測',
-            '功能面看似存在，但被登入、資金不足、驗證碼或外部限制阻擋。',
-          ],
-        },
-        riskItems: [
-          'Solana 主網：所有 mint 驗證與鏈上互動均在 Solana 上執行。',
-          'SOL 安全上限：每次驗證的 SOL 支出有明確上限。',
-          'Phantom 代理：瀏覽器注入 Phantom mock，由伺服器調查錢包簽名。',
-          '結構化證據日誌，支援事後審計。',
-          '在語言模型判定前先套用規則層。',
-          '快取既有完成結果，避免不必要的重跑。',
-        ],
-        apiRows: [
-          ['POST /api/project/discover', '根據 Solana mint 解析專案身份（pump.fun、DexScreener 等）。'],
-          ['POST /api/project/extract-text', '抓取網站文字作為宣稱提取輸入。'],
-          ['POST /api/claims/extract', '從內容生成宣稱與通過條件。'],
-          ['POST /api/verify/start', '建立驗證執行紀錄。'],
-          ['POST /api/verify/run', '對提取宣稱執行瀏覽器驗證。'],
-          ['GET /api/verify/status', '讀取執行狀態與附證據宣稱。'],
-          ['GET /api/runs/recent', '取得儀表板近期執行摘要。'],
-        ],
-        opsParagraphs: [
-          '為了穩定運行，請保持代理提示詞可重現、強制交易安全上限，並以日誌與證據卡片監控，而非只看模型敘述。',
-          '調整行為時建議小步迭代，並搭配可回放的測試 URL 與明確 pass condition。',
-          '如果某一站點需要重新驗證，使用 Force Reverify；否則優先讀取最近一次完成結果，加快回應並保留一致性。',
-        ],
-        openDashboard: '開啟儀表板',
-      }
-    : {
+  const copy = {
         headerLabel: 'documentation',
         heroTitleMain: 'LARPSCAN docs',
         heroTitleSub: '',
@@ -238,7 +151,7 @@ export default function DocsPage() {
       <main className="pt-20">
         <AnimatePresence mode="wait" initial={false}>
           <motion.div
-            key={`docs-${locale}`}
+            key="docs"
             initial={{ opacity: 0, y: 22, filter: 'blur(8px)' }}
             animate={entered ? { opacity: 1, y: 0, filter: 'blur(0px)' } : { opacity: 0, y: 22, filter: 'blur(8px)' }}
             exit={{ opacity: 0, y: -18, filter: 'blur(6px)' }}
@@ -309,9 +222,7 @@ export default function DocsPage() {
               <DocBlock title={copy.sectionTitles.evidence} subtitle={copy.sectionSubtitles.evidence}>
                 <div id="evidence" className="-mt-20 pt-20" />
                 <p>
-                  {isZh
-                    ? 'LARPSCAN 不只給你一個標籤，還會輸出一整組可檢查的證據，用來回答「為什麼得到這個結論？」'
-                    : 'LARPSCAN does not just return a label. It returns a bundle of inspectable artifacts that answer why a verdict was assigned.'}
+                  LARPSCAN does not just return a label. It returns a bundle of inspectable artifacts that answer why a verdict was assigned.
                 </p>
                 <div className="grid md:grid-cols-2 gap-4">
                   {copy.evidenceItems.map(([title, body]) => (

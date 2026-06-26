@@ -3,10 +3,9 @@
 import { useState, useEffect, useMemo } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { AnimatePresence, motion } from 'framer-motion';
+import { motion } from 'framer-motion';
 import { Copy } from 'lucide-react';
 import { cn, truncateAddressPump } from '@/lib/utils';
-import { useLocale } from '@/components/locale-provider';
 import { ConnectWalletButton } from '@/components/connect-wallet-button';
 
 export type NavbarProps = {
@@ -80,38 +79,19 @@ function XIcon() {
   );
 }
 
+const NAV_LINKS = [
+  { label: 'Home', href: '/home' },
+  { label: 'Docs', href: '/docs' },
+];
+
 export function Navbar({ contractContext }: NavbarProps = {}) {
   const [scrolled, setScrolled] = useState(false);
   const pathname = usePathname();
-  const { locale, setLocale } = useLocale();
 
   const parsedContext = useMemo(
     () => parseContractContext(contractContext ?? null),
     [contractContext],
   );
-
-  const copy = locale === 'zh-TW'
-    ? {
-        home:      '首頁',
-        docs:      '文件',
-        open:      '進入儀表板',
-        labelCa:   'Mint',
-        labelUrl:  '網址',
-        copyLabel: '複製到剪貼簿',
-      }
-    : {
-        home:      'Home',
-        docs:      'Docs',
-        open:      'Enter Dashboard',
-        labelCa:   'Mint',
-        labelUrl:  'URL',
-        copyLabel: 'Copy to clipboard',
-      };
-
-  const NAV_LINKS = [
-    { label: copy.home, href: '/home' },
-    { label: copy.docs, href: '/docs' },
-  ];
 
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 24);
@@ -141,7 +121,7 @@ export function Navbar({ contractContext }: NavbarProps = {}) {
                 title={parsedContext.full}
               >
                 <span className="text-[8px] font-semibold uppercase tracking-[0.14em] text-zinc-500 flex-shrink-0">
-                  {parsedContext.kind === 'ca' ? copy.labelCa : copy.labelUrl}
+                  {parsedContext.kind === 'ca' ? 'Mint' : 'URL'}
                 </span>
                 <span className="font-mono text-[9px] sm:text-[10px] text-zinc-300 truncate tabular-nums">
                   {parsedContext.display}
@@ -154,7 +134,7 @@ export function Navbar({ contractContext }: NavbarProps = {}) {
                     } catch { /* noop */ }
                   }}
                   className="flex-shrink-0 p-0.5 text-zinc-600 hover:text-zinc-300 transition-colors"
-                  aria-label={copy.copyLabel}
+                  aria-label="Copy to clipboard"
                 >
                   <Copy className="w-2.5 h-2.5 sm:w-3 sm:h-3" />
                 </button>
@@ -167,7 +147,7 @@ export function Navbar({ contractContext }: NavbarProps = {}) {
               const active = pathname === link.href;
               return (
                 <Link
-                  key={link.label}
+                  key={link.href}
                   href={link.href}
                   className={cn(
                     'text-[10px] font-semibold uppercase tracking-[0.24em] transition-colors duration-150 relative',
@@ -176,18 +156,7 @@ export function Navbar({ contractContext }: NavbarProps = {}) {
                       : 'text-zinc-500 hover:text-zinc-200',
                   )}
                 >
-                  <AnimatePresence mode="wait" initial={false}>
-                    <motion.span
-                      key={`${locale}-${link.href}`}
-                      initial={{ opacity: 0, y: 8, filter: 'blur(4px)' }}
-                      animate={{ opacity: 1, y: 0, filter: 'blur(0px)' }}
-                      exit={{ opacity: 0, y: -8, filter: 'blur(4px)' }}
-                      transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
-                      className="block"
-                    >
-                      {link.label}
-                    </motion.span>
-                  </AnimatePresence>
+                  {link.label}
                   {active && (
                     <span className="absolute -bottom-1 left-0 right-0 h-px bg-red-500/70 rounded-full" />
                   )}
@@ -207,31 +176,6 @@ export function Navbar({ contractContext }: NavbarProps = {}) {
             >
               <XIcon />
             </a>
-            <div className="relative flex items-center border border-[#1f1f27] rounded-sm overflow-hidden bg-[#0a0a0e]">
-              <motion.div
-                className="absolute top-0 bottom-0 w-1/2 bg-[#16161d]"
-                animate={{ x: locale === 'en' ? '0%' : '100%' }}
-                transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
-              />
-              <button
-                onClick={() => setLocale('en')}
-                className={cn(
-                  'relative z-10 px-2.5 py-2 text-[10px] font-semibold uppercase tracking-[0.2em] transition-colors',
-                  locale === 'en' ? 'text-white' : 'text-zinc-500 hover:text-zinc-300',
-                )}
-              >
-                EN
-              </button>
-              <button
-                onClick={() => setLocale('zh-TW')}
-                className={cn(
-                  'relative z-10 px-2.5 py-2 text-[10px] font-semibold uppercase tracking-[0.2em] transition-colors',
-                  locale === 'zh-TW' ? 'text-white' : 'text-zinc-500 hover:text-zinc-300',
-                )}
-              >
-                zh
-              </button>
-            </div>
             <Link
               href="/dashboard"
               onClick={() => {
@@ -241,18 +185,7 @@ export function Navbar({ contractContext }: NavbarProps = {}) {
               }}
               className="text-[10px] font-semibold uppercase tracking-[0.22em] px-5 py-2.5 rounded-sm bg-red-600 text-white hover:bg-red-500 transition-all duration-150"
             >
-              <AnimatePresence mode="wait" initial={false}>
-                <motion.span
-                  key={`open-${locale}`}
-                  initial={{ opacity: 0, y: 8, filter: 'blur(4px)' }}
-                  animate={{ opacity: 1, y: 0, filter: 'blur(0px)' }}
-                  exit={{ opacity: 0, y: -8, filter: 'blur(4px)' }}
-                  transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
-                  className="block"
-                >
-                  {copy.open}
-                </motion.span>
-              </AnimatePresence>
+              Enter Dashboard
             </Link>
           </div>
         </div>

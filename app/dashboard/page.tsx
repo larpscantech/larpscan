@@ -9,7 +9,6 @@ import { ProjectIdentityBar } from '@/components/project-identity-bar';
 import { AuditClaimCard, AuditClaimCardSkeleton, AnimatedClaimCard } from '@/components/audit-claim-card';
 import { InlineLogs } from '@/components/inline-logs';
 import { RecentVerificationsTable } from '@/components/recent-verifications-table';
-import { useLocale } from '@/components/locale-provider';
 import { cn, isSolanaMintAddress } from '@/lib/utils';
 import type { Phase, TokenProject, Claim, Verdict, RecentVerification } from '@/lib/types';
 import type { DbProject, DbClaim, DbClaimWithEvidence, DbVerificationRun } from '@/lib/db-types';
@@ -17,11 +16,8 @@ import type { DbProject, DbClaim, DbClaimWithEvidence, DbVerificationRun } from 
 /** When true, new token/website scans are blocked with a coming-soon message. */
 const SCANS_COMING_SOON = true;
 
-function comingSoonCopy(isZh: boolean) {
-  return isZh
-    ? '即將推出 — 代幣與網站掃描尚未開放，請稍後再試。'
-    : 'Coming soon — token and website scanning is not live yet. Check back shortly.';
-}
+const COMING_SOON_COPY =
+  'Coming soon — token and website scanning is not live yet. Check back shortly.';
 
 // ─── Type converters: DB rows → frontend display types ────────────────────────
 
@@ -238,13 +234,11 @@ function ContractRow({
   forceReverify: boolean; onForceReverifyChange: (v: boolean) => void;
   inputMode: InputMode; onInputModeChange: (v: InputMode) => void;
 }) {
-  const { locale } = useLocale();
-  const isZh = locale === 'zh-TW';
   const isUrl = inputMode === 'website';
 
   const placeholder = isUrl
     ? 'https://yourproject.io'
-    : isZh ? '輸入 Solana 代幣 mint 地址...' : 'Enter Solana token mint address...';
+    : 'Enter Solana token mint address...';
 
   return (
     <div className="mb-12">
@@ -288,12 +282,12 @@ function ContractRow({
           {isLoading ? (
             <>
               <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-              {isZh ? '掃描中...' : 'Scanning...'}
+              Scanning...
             </>
           ) : SCANS_COMING_SOON ? (
-            <>{isZh ? '即將推出' : 'Coming soon'}</>
+            <>Coming soon</>
           ) : (
-            <>{isZh ? '驗證' : 'Verify'} <ArrowRight className="w-3.5 h-3.5" /></>
+            <>Verify <ArrowRight className="w-3.5 h-3.5" /></>
           )}
         </button>
       </div>
@@ -315,7 +309,7 @@ function ContractRow({
           )}
         </div>
         <span className="text-[10px] font-semibold uppercase tracking-widest text-zinc-600 group-hover:text-zinc-500 transition-colors">
-          {isZh ? '強制重新驗證' : 'Force Reverify'}
+          Force Reverify
         </span>
       </label>
     </div>
@@ -325,8 +319,6 @@ function ContractRow({
 // ─── Coming soon banner ───────────────────────────────────────────────────────
 
 function ComingSoonBanner() {
-  const { locale } = useLocale();
-  const isZh = locale === 'zh-TW';
   return (
     <motion.div
       initial={{ opacity: 0, y: -6 }}
@@ -334,10 +326,10 @@ function ComingSoonBanner() {
       className="flex items-start gap-3 px-5 py-4 rounded-sm border border-amber-900/40 bg-[#1a1208] mb-6"
     >
       <span className="text-[10px] font-bold uppercase tracking-[0.2em] text-amber-500 flex-shrink-0 mt-0.5">
-        {isZh ? '即將推出' : 'Coming soon'}
+        Coming soon
       </span>
       <p className="text-[12px] text-amber-200/90 leading-relaxed flex-1">
-        {comingSoonCopy(isZh)}
+        {COMING_SOON_COPY}
       </p>
     </motion.div>
   );
@@ -346,7 +338,6 @@ function ComingSoonBanner() {
 // ─── Error banner ─────────────────────────────────────────────────────────────
 
 function ErrorBanner({ message, onDismiss }: { message: string; onDismiss: () => void }) {
-  const { locale } = useLocale();
   return (
     <motion.div
       initial={{ opacity: 0, y: -8 }}
@@ -358,7 +349,7 @@ function ErrorBanner({ message, onDismiss }: { message: string; onDismiss: () =>
       <AlertCircle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
       <p className="text-[12px] text-red-300 leading-relaxed flex-1 font-mono">{message}</p>
       <button onClick={onDismiss} className="text-red-600 hover:text-red-400 text-[10px] font-bold uppercase tracking-widest flex-shrink-0">
-        {locale === 'zh-TW' ? '關閉' : 'Dismiss'}
+        Dismiss
       </button>
     </motion.div>
   );
@@ -367,29 +358,18 @@ function ErrorBanner({ message, onDismiss }: { message: string; onDismiss: () =>
 // ─── Empty state ──────────────────────────────────────────────────────────────
 
 function EmptyState() {
-  const { locale } = useLocale();
-  const isZh = locale === 'zh-TW';
   return (
     <div className="py-20 text-center mb-12">
       <div className="inline-flex items-center justify-center w-14 h-14 rounded-sm border border-[#1c1c22] bg-[#09090d] mb-6">
         <div className="w-5 h-5 rounded-md border-2 border-zinc-700" />
       </div>
       <p className="text-[11px] font-bold uppercase tracking-widest text-zinc-600 mb-3">
-        {isZh ? '目前沒有執行中的驗證' : 'No active verification'}
+        No active verification
       </p>
       <p className="text-xs text-zinc-700 max-w-xs mx-auto leading-relaxed">
-        {isZh ? (
-          <>
-            貼上 Solana mint 地址並點擊 <span className="text-zinc-500 font-mono">驗證 →</span>，
-            啟動 AI 驅動的產品審核流程。
-          </>
-        ) : (
-          <>
-            Paste a Solana token mint address and click{' '}
-            <span className="text-zinc-500 font-mono">Verify →</span> to run an AI-powered
-            product audit against the live project.
-          </>
-        )}
+        Paste a Solana token mint address and click{' '}
+        <span className="text-zinc-500 font-mono">Verify →</span> to run an AI-powered
+        product audit against the live project.
       </p>
     </div>
   );
@@ -522,8 +502,6 @@ function ClaimsSection({
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function DashboardPage() {
-  const { locale } = useLocale();
-  const isZh = locale === 'zh-TW';
   const [entryAnimation, setEntryAnimation] = useState(false);
   const [entryChecked, setEntryChecked] = useState(false);
   const [pageEntered, setPageEntered] = useState(false);
@@ -613,7 +591,7 @@ export default function DashboardPage() {
     if (!entryChecked) return;
     const t = window.setTimeout(() => setPageEntered(true), 40);
     return () => window.clearTimeout(t);
-  }, [entryChecked, locale]);
+  }, [entryChecked]);
 
   // ── Playwright / E2E test hook ───────────────────────────────────────────────
   // Expose window functions so automated tests can set the input and trigger
@@ -1280,17 +1258,12 @@ export default function DashboardPage() {
 
   const frontendClaims: Claim[] = realClaims.map(toFrontendClaim);
 
-  const claimSectionLabel = isZh
-    ? (phase === 'extracting' || phase === 'analyzing'
-      ? '提取宣稱'
-      : phase === 'verifying'
-      ? '即時驗證'
-      : '驗證報告')
-    : (phase === 'extracting' || phase === 'analyzing'
+  const claimSectionLabel =
+    phase === 'extracting' || phase === 'analyzing'
       ? 'Extracted Claims'
       : phase === 'verifying'
       ? 'Live Verification'
-      : 'Verification Report');
+      : 'Verification Report';
 
   // Inject the live run at the top while active, then fall back to DB history
   const tableData = useMemo<RecentVerification[]>(() => {
@@ -1337,7 +1310,7 @@ export default function DashboardPage() {
       <main className="pt-14">
         <AnimatePresence mode="wait" initial={false}>
           <motion.div
-            key={`dashboard-${locale}`}
+            key="dashboard"
             initial={{
               opacity: 0,
               y: entryAnimation ? 34 : 24,
@@ -1367,7 +1340,7 @@ export default function DashboardPage() {
             <div className="flex items-start justify-between mb-4">
               <div>
                 <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-zinc-600 mb-3">
-                  {isZh ? '驗證控制台' : 'Verification Console'}
+                  Verification Console
                 </p>
                 <h1 className="text-[36px] font-semibold text-white leading-tight tracking-[-0.03em]">
                   LARPSCAN<span className="text-[#dc2626]">.</span>
@@ -1385,16 +1358,14 @@ export default function DashboardPage() {
                       className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-zinc-600 hover:text-zinc-300 transition-colors"
                     >
                       <RotateCcw className="w-3 h-3" />
-                      {isZh ? '新掃描' : 'New Scan'}
+                      New Scan
                     </motion.button>
                   )}
                 </AnimatePresence>
               </div>
             </div>
             <p className="text-[14px] text-zinc-500 leading-relaxed max-w-2xl">
-              {isZh
-                ? '極簡介面，硬證據。系統會從真實產品面提取宣稱，再透過真實瀏覽器互動逐條驗證。'
-                : 'Minimal interface, hard evidence. We extract claims from live product surfaces, then verify each claim through real browser interaction.'}
+              Minimal interface, hard evidence. We extract claims from live product surfaces, then verify each claim through real browser interaction.
             </p>
           </motion.div>
 
@@ -1467,7 +1438,7 @@ export default function DashboardPage() {
 
           {!isActive && <EmptyState />}
 
-          <SectionDivider label={isZh ? '近期掃描' : 'Recent Scans'} />
+          <SectionDivider label="Recent Scans" />
           <RecentVerificationsTable verifications={tableData} onSelect={handleSelectRecentScan} />
           </motion.div>
         </AnimatePresence>

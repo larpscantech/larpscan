@@ -5,15 +5,12 @@ import Link from 'next/link';
 import { ArrowRight } from 'lucide-react';
 import { AnimatePresence, motion, useInView } from 'framer-motion';
 import { Navbar } from '@/components/navbar';
-import { useLocale } from '@/components/locale-provider';
 
 // Fill phase: 0 – 1800 ms  |  Exit: 2100 ms
 const FILL_END_MS = 1800;
 const EXIT_MS     = 2100;
 
 function IntroAnimation({ onComplete }: { onComplete: () => void }) {
-  const { locale } = useLocale();
-
   const [tick, setTick] = useState({ fillProgress: 0, waveT: 0, buildValue: 0 });
 
   useEffect(() => {
@@ -109,7 +106,7 @@ function IntroAnimation({ onComplete }: { onComplete: () => void }) {
           transition={{ duration: 0.4, delay: 0.15 }}
         >
           <span className="text-[15px] sm:text-[18px] text-zinc-500 uppercase tracking-[0.14em]">
-            {locale === 'zh-TW' ? '構建' : 'BUILD'}
+            BUILD
           </span>
           <span className="font-mono text-[15px] sm:text-[18px] text-red-400 tabular-nums min-w-[3ch]">
             {buildValue}
@@ -121,26 +118,15 @@ function IntroAnimation({ onComplete }: { onComplete: () => void }) {
 }
 
 function HeroSection() {
-  const { locale } = useLocale();
-  const copy = locale === 'zh-TW'
-    ? {
-        eyebrow: '極簡驗證系統',
-        titleA: '少些相信。',
-        titleB1: '多些',
-        titleB2: '證明。',
-        body: '貼上 CA。瀏覽器代理在 Solana 上審核專案，只回傳證據 — 沒有花俏承諾，沒有猜測。',
-        enter: '進入儀表板',
-        method: '我們的方法',
-      }
-    : {
-        eyebrow: 'minimal verification system',
-        titleA: 'verify less.',
-        titleB1: 'prove more',
-        titleB2: '.',
-        body: 'Post a CA. A browser agent audits projects on Solana in a real browser and returns only evidence — no glossy promises, no guessing.',
-        enter: 'enter dashboard',
-        method: 'our method',
-      };
+  const copy = {
+    eyebrow: 'minimal verification system',
+    titleA: 'verify less.',
+    titleB1: 'prove more',
+    titleB2: '.',
+    body: 'Post a CA. A browser agent audits projects on Solana in a real browser and returns only evidence — no glossy promises, no guessing.',
+    enter: 'enter dashboard',
+    method: 'our method',
+  };
 
   return (
     <section className="relative min-h-screen flex items-center overflow-hidden pt-24">
@@ -223,18 +209,11 @@ function HeroSection() {
 function MethodSection() {
   const ref = useRef<HTMLElement>(null);
   const inView = useInView(ref, { once: true, margin: '-120px' });
-  const { locale } = useLocale();
-  const items = locale === 'zh-TW'
-    ? [
-        { n: '01', title: '提取', body: '直接從真實頁面讀取產品宣稱。' },
-        { n: '02', title: '壓力測試', body: '在受控瀏覽器中執行真實流程。' },
-        { n: '03', title: '判定', body: '回傳可追溯、以證據為基礎的結論。' },
-      ]
-    : [
-        { n: '01', title: 'extract', body: 'Read claims directly from live pages.' },
-        { n: '02', title: 'stress-test', body: 'Run real flows in a controlled browser.' },
-        { n: '03', title: 'verdict', body: 'Return a deterministic evidence-backed label.' },
-      ];
+  const items = [
+    { n: '01', title: 'extract', body: 'Read claims directly from live pages.' },
+    { n: '02', title: 'stress-test', body: 'Run real flows in a controlled browser.' },
+    { n: '03', title: 'verdict', body: 'Return a deterministic evidence-backed label.' },
+  ];
 
   return (
     <section ref={ref} id="method" className="max-w-[1240px] mx-auto px-8 py-32">
@@ -245,7 +224,7 @@ function MethodSection() {
           animate={inView ? { opacity: 1, x: 0 } : {}}
           transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
         >
-          {locale === 'zh-TW' ? '方法' : 'method'}
+          method
         </motion.p>
         <div className="grid md:grid-cols-3 gap-10 md:gap-8">
           {items.map((item, i) => (
@@ -273,7 +252,6 @@ function MethodSection() {
 function StatementSection() {
   const ref = useRef<HTMLElement>(null);
   const inView = useInView(ref, { once: true, margin: '-120px' });
-  const { locale } = useLocale();
 
   return (
     <section ref={ref} className="max-w-[1240px] mx-auto px-8 pb-28">
@@ -289,7 +267,7 @@ function StatementSection() {
           animate={inView ? { opacity: 1, x: 0 } : {}}
           transition={{ duration: 0.5, delay: 0.08, ease: [0.16, 1, 0.3, 1] }}
         >
-          {locale === 'zh-TW' ? '聲明' : 'statement'}
+          statement
         </motion.p>
         <motion.h2
           className="text-[clamp(38px,6.4vw,94px)] leading-[0.94] font-medium text-white max-w-[980px]"
@@ -298,12 +276,8 @@ function StatementSection() {
           animate={inView ? { opacity: 1, x: 0 } : {}}
           transition={{ duration: 0.8, delay: 0.12, ease: [0.16, 1, 0.3, 1] }}
         >
-          {locale === 'zh-TW'
-            ? '如果產品無法在真實壓力下證明自己，'
-            : 'if the product cannot prove itself under real pressure,'}
-          <span className="text-zinc-600">
-            {locale === 'zh-TW' ? ' 那它就只是 larp。' : ' it is just larp.'}
-          </span>
+          if the product cannot prove itself under real pressure,
+          <span className="text-zinc-600"> it is just larp.</span>
         </motion.h2>
       </motion.div>
     </section>
@@ -313,7 +287,6 @@ function StatementSection() {
 function FinalCtaSection() {
   const ref = useRef<HTMLElement>(null);
   const inView = useInView(ref, { once: true, margin: '-80px' });
-  const { locale } = useLocale();
 
   return (
     <section ref={ref} className="max-w-[1240px] mx-auto px-8 pb-24">
@@ -329,7 +302,7 @@ function FinalCtaSection() {
           animate={inView ? { opacity: 1, x: 0 } : {}}
           transition={{ duration: 0.65, delay: 0.08, ease: [0.16, 1, 0.3, 1] }}
         >
-          {locale === 'zh-TW' ? '準備開始驗證' : 'ready to verify'}
+          ready to verify
         </motion.p>
         <motion.div
           initial={{ opacity: 0, x: 54 }}
@@ -340,7 +313,7 @@ function FinalCtaSection() {
             href="/dashboard"
             className="inline-flex items-center gap-2 border border-red-600/45 text-red-500 hover:bg-red-600 hover:text-white rounded-sm px-8 py-3.5 text-[11px] font-semibold uppercase tracking-[0.18em] transition-all duration-200"
           >
-            {locale === 'zh-TW' ? '開啟儀表板' : 'open dashboard'} <ArrowRight className="w-3.5 h-3.5" />
+            open dashboard <ArrowRight className="w-3.5 h-3.5" />
           </Link>
         </motion.div>
       </motion.div>
@@ -349,7 +322,6 @@ function FinalCtaSection() {
 }
 
 export default function HomeLandingPage() {
-  const { locale } = useLocale();
   const [introComplete, setIntroComplete] = useState(false);
   const [mounted, setMounted] = useState(false);
   const [introChecked, setIntroChecked] = useState(false);
@@ -383,7 +355,7 @@ export default function HomeLandingPage() {
       <AnimatePresence mode="wait">
         {introComplete && (
           <motion.div
-            key={`page-content-${locale}`}
+            key="page-content"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0, y: -10, filter: 'blur(6px)' }}
