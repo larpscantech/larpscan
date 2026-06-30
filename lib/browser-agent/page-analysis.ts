@@ -106,18 +106,6 @@ const BLOCKER_PATTERNS: Array<{ type: BlockerType; patterns: RegExp[] }> = [
     ],
   },
   {
-    type: 'coming_soon',
-    patterns: [
-      // English
-      /coming soon/i, /under construction/i, /not available yet/i, /launching soon/i,
-      /under maintenance/i, /scheduled maintenance/i, /temporarily unavailable/i,
-      /we.?re working on it/i, /check back later/i,
-      // Traditional Chinese
-      /即將推出/, /敬請期待/, /建設中/, /即將上線/, /功能開發中/,
-      /維護中/, /系統維護/, /暫時不可用/,
-    ],
-  },
-  {
     type: 'route_missing',
     patterns: [
       // English
@@ -186,12 +174,7 @@ function detectBlockers(text: string, bodyLength: number): BlockerType[] {
   // when the visible text is short (< 600 chars), indicating a gate/modal.
   const WEAK_AUTH_PATTERNS = [/\bsign in\b/i, /\blog in\b/i, /\blogin\b/i];
   const WEAK_WALLET_PATTERNS = [/connect wallet/i, /please connect/i];
-  // "coming soon" often appears as a badge on one section of a full functional page.
-  // Only treat it as a real blocker when the page has sparse content (< 800 chars),
-  // meaning the WHOLE page is "coming soon", not just a roadmap item.
-  const WEAK_COMING_SOON_PATTERNS = [/coming soon/i, /launching soon/i, /not available yet/i];
   const isShort = text.length < 600;
-  const isSparse = text.length < 800; // for coming_soon
 
   for (const { type, patterns } of BLOCKER_PATTERNS) {
     const effective = patterns.filter((re) => {
@@ -199,8 +182,6 @@ function detectBlockers(text: string, bodyLength: number): BlockerType[] {
         if (type === 'auth_required' && WEAK_AUTH_PATTERNS.some((w) => w.source === re.source)) return false;
         if (type === 'wallet_required' && WEAK_WALLET_PATTERNS.some((w) => w.source === re.source)) return false;
       }
-      // coming_soon in nav/footer/badge on a rich page is not a real blocker
-      if (!isSparse && type === 'coming_soon' && WEAK_COMING_SOON_PATTERNS.some((w) => w.source === re.source)) return false;
       return true;
     });
     if (effective.some((re) => re.test(text))) found.push(type);

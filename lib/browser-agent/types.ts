@@ -9,7 +9,6 @@ export type BlockerType =
   | 'feature_disabled'  // UI present but interaction is disabled
   | 'route_missing'     // 404 / page not found
   | 'page_broken'       // blank page, JS crash, white screen
-  | 'coming_soon'       // coming soon / under construction
   | 'bot_protection'    // Cloudflare / CAPTCHA
   | 'validation_error'  // form rejected with visible error
   | 'empty_state'       // page loaded but no data (e.g. empty leaderboard)

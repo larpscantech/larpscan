@@ -103,13 +103,16 @@ Classify each claim as one of:
 - API_FEATURE     → publicly accessible REST/JSON endpoint (no auth)
 - BOT             → Telegram or Discord bot interaction
 - CLI_TOOL        → command-line tool or script
-- WALLET_FLOW     → any on-chain action requiring wallet connection (agent deployment, staking, competition entry, funding, creation flow via external link/bot)
+- WALLET_FLOW     → on-chain transactions that require a connected wallet: staking, funding, competition entry, purchasing, on-chain creation flows through external sites or bots
 - DATA_DASHBOARD  → leaderboard, stats table, charts, live data feed (read-only, no transaction)
 
 CRITICAL classification rules:
-- If the claim involves DEPLOYING, CREATING, LAUNCHING, FUNDING, or STAKING anything on-chain → WALLET_FLOW (even if done via Telegram bot or CLI)
+- If the claim involves STAKING, FUNDING, PURCHASING, or COMPETITION ENTRY on-chain → WALLET_FLOW
+- If the claim involves CREATING or DEPLOYING an on-chain asset (token, NFT, smart contract) → TOKEN_CREATION
 - If the claim involves TRADING, SWAPPING, BUYING, SELLING on-chain → DEX_SWAP
 - If the claim involves VIEWING stats, leaderboard, or data (no wallet needed) → DATA_DASHBOARD
+- If the claim involves SUBMITTING a form, URL, address, or query to trigger a web-based tool, analysis, or automated service (no wallet required) → UI_FEATURE
+- Do NOT use WALLET_FLOW for web-based form submissions, search tools, verification tools, or any feature that does not require signing a blockchain transaction
 - Do NOT classify claims as DATA_DASHBOARD just because they mention competition rankings — only if the data is publicly viewable without a transaction
 
 Verification strategy per type:

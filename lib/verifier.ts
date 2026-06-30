@@ -786,7 +786,7 @@ async function recordInteraction(
     // NOTE: auth_required and wallet_required are intentionally excluded here —
     // on web3 creation/wallet pages these often just mean "wallet not connected yet",
     // and the early wallet connect + agent interaction can navigate past them.
-    const HARD_BLOCKERS = ['bot_protection', 'page_broken', 'coming_soon', 'geo_blocked'];
+    const HARD_BLOCKERS = ['bot_protection', 'page_broken', 'geo_blocked'];
     const hasHardBlocker = pageState.blockers.some((b) => HARD_BLOCKERS.includes(b));
 
     if (hasHardBlocker) {

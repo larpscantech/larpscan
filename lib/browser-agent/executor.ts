@@ -305,9 +305,6 @@ function detectBlockerFromText(text: string): BlockerType | undefined {
   // rate_limited
   if (/too many requests|rate limit|slow down|try again later/i.test(text)) return 'rate_limited';
   if (/請求過多|操作太頻繁/.test(text))                         return 'rate_limited';
-  // coming_soon — English + Traditional Chinese
-  if (/coming soon|under construction|under maintenance|scheduled maintenance/i.test(text)) return 'coming_soon';
-  if (/即將推出|敬請期待|建設中|即將上線|維護中/.test(text))      return 'coming_soon';
   // route_missing — English + Traditional Chinese
   if (/page not found|\b404\b|this page doesn.?t exist/i.test(text)) return 'route_missing';
   if (/頁面不存在|找不到頁面/.test(text))                       return 'route_missing';

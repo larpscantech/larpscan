@@ -112,7 +112,6 @@ Blocker types:
   - route_missing     → 404 / page not found on the attempted surface.
   - page_broken       → blank page, JS crash, white screen.
   - bot_protection    → Cloudflare / CAPTCHA blocked the agent.
-  - coming_soon       → feature not yet live.
   - geo_blocked       → region restriction.
 
 No-op actions ≠ LARP.
