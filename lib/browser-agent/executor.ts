@@ -1794,6 +1794,10 @@ export async function executeSteps(
     if (/0\.0+/.test(ph) || /\bsol\b|\beth\b|dev.buy|initial.buy|amount|fee/i.test(hint)) return '0';
     // Strategy / risk / mode (agent forms)
     if (/strategy|risk.?level|risk.?mode|trade.?mode|stop.?loss|take.?profit/i.test(hint)) return 'balanced';
+    // Solana mint / contract address — fill with a known valid pump.fun program address
+    if (/mint.?address|contract.?address|token.?address|solana.?address|ca\b|enter.*mint|paste.*mint|paste.*token/i.test(hint) ||
+        /^(mint|contractAddress|tokenAddress|ca|mintAddress)$/i.test(nm))
+      return 'pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn';
     // API key / secret
     if (/api.?key|secret|token.?key/i.test(hint)) return `testkey${runSuffix}`;
     // Email
@@ -1903,6 +1907,44 @@ export async function executeSteps(
     }).catch(() => {}),
       new Promise<void>((r) => setTimeout(r, 5_000)),
     ]).catch(() => {});
+
+    // ── Single mint/CA address input (e.g. verification dashboards) ────────────
+    // Detect a lone input that expects a Solana mint / contract address and fill
+    // it with a known valid CA so the form actually submits rather than silently
+    // no-op-ing on an empty or invalid placeholder value.
+    const FALLBACK_CA = 'pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn';
+    const mintAddressInput = visibleInputs.length === 1 && visibleInputs[0] &&
+      (/mint.?address|contract.?address|token.?address|solana.?address|enter.*mint|paste.*mint|paste.*token|mint.*token|verify.*token/i.test(visibleInputs[0].placeholder) ||
+       /^(mint|contractAddress|tokenAddress|ca|mintAddress)$/i.test(visibleInputs[0].name))
+      ? visibleInputs[0]
+      : null;
+
+    if (mintAddressInput && !mintAddressInput.value) {
+      try {
+        await page.locator(mintAddressInput.selector).first().fill(FALLBACK_CA, { timeout: 4_000 });
+        console.log(`[executor] Mint address fill: "${mintAddressInput.placeholder || mintAddressInput.name}" = "${FALLBACK_CA}"`);
+        await page.waitForTimeout(500);
+        // Click the submit/verify button
+        const submitClicked = await page.evaluate(() => {
+          const re = /^(verify|submit|scan|check|search|run|start|analyze)\b/i;
+          const btns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'));
+          const btn = btns.find((el) => {
+            const t = (el.textContent ?? '').trim();
+            const s = window.getComputedStyle(el as HTMLElement);
+            const r = (el as HTMLElement).getBoundingClientRect();
+            return re.test(t) && s.display !== 'none' && r.width > 0 && r.height > 0;
+          });
+          if (btn) { (btn as HTMLElement).click(); return (btn.textContent ?? '').trim().slice(0, 40); }
+          return null;
+        });
+        if (submitClicked) {
+          console.log(`[executor] Mint address submit: clicked "${submitClicked}"`);
+          await page.waitForTimeout(3_000);
+        }
+      } catch (e) {
+        console.warn('[executor] Mint address fill failed:', String(e).slice(0, 80));
+      }
+    }
 
     // ── Creation form detection (broader than token-only) ───────────────────
     // Covers: token creation, agent deployment, NFT minting, profile creation, etc.
