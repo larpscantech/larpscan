@@ -14,7 +14,7 @@ import type { Phase, TokenProject, Claim, Verdict, RecentVerification } from '@/
 import type { DbProject, DbClaim, DbClaimWithEvidence, DbVerificationRun } from '@/lib/db-types';
 
 /** When true, new token/website scans are blocked with a coming-soon message. */
-const SCANS_COMING_SOON = true;
+const SCANS_COMING_SOON = false;
 
 const COMING_SOON_COPY =
   'Coming soon — token and website scanning is not live yet. Check back shortly.';
