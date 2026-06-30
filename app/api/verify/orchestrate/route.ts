@@ -112,7 +112,7 @@ async function handleRunCreation(
   // ── 4. Create new run ─────────────────────────────────────────────────────
   const { data: run, error: runError } = await supabase
     .from('verification_runs')
-    .insert({ project_id: project.id, status: 'pending', agent_id: null })
+    .insert({ project_id: project.id, status: 'pending' })
     .select()
     .single<DbVerificationRun>();
 
