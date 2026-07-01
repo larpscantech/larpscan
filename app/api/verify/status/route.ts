@@ -11,7 +11,7 @@ import {
 } from '@/lib/claim-dispatcher';
 import type { DbVerificationRun, DbAgentLog, DbClaimWithEvidence, DbProject } from '@/lib/db-types';
 
-const STUCK_CHECKING_MS = 15 * 60 * 1000; // 15 min — TOKEN_CREATION can take up to 12 min (Browserless retries + 6 min session)
+const STUCK_CHECKING_MS = 5 * 60 * 1000; // 5 min — claim sessions timeout at ~4 min; stuck beyond this means the worker died
 
 function claimStartTimes(logs: DbAgentLog[]): Map<string, number> {
   const map = new Map<string, number>();
@@ -113,10 +113,11 @@ export const GET = withErrorHandler(async (req: Request) => {
   }
 
   // ── Resume stalled sequential dispatch ───────────────────────────────────
-  // If a daisy-chain link broke (serverless freeze, HTTP error), pending claims
-  // sit idle while no worker is in `checking`. Re-dispatch on the next poll.
-  // Require at least one terminal claim so we don't race initial dispatch
-  // (all-pending / no-checking is normal before the first worker stakes).
+  // If a daisy-chain link broke (serverless freeze, HTTP error, Vercel timeout),
+  // pending claims sit idle while no worker is in `checking`. Re-dispatch.
+  // Also handles the case where ALL claims are stuck in `checking` after the
+  // auto-heal above reset them to `untestable` — those now appear as terminal,
+  // allowing any remaining pending claims to be re-dispatched.
   if (run.status === 'verifying') {
     const pendingCount = claims.filter((c) => c.status === 'pending').length;
     const checkingCount = claims.filter((c) => c.status === 'checking').length;
@@ -124,9 +125,14 @@ export const GET = withErrorHandler(async (req: Request) => {
       c.status !== 'pending' && c.status !== 'checking',
     ).length;
 
-    if (pendingCount > 0 && checkingCount === 0 && terminalCount > 0) {
+    // Re-dispatch if there are pending claims with no active worker.
+    // Allow re-dispatch even with no terminal claims when run is old enough
+    // to avoid racing the initial dispatch (which stakes claims within ~1s).
+    const runAgeMs = Date.now() - new Date(run.created_at).getTime();
+    const OLD_ENOUGH_MS = 30_000; // 30s — well past normal initial dispatch window
+    if (pendingCount > 0 && checkingCount === 0 && (terminalCount > 0 || runAgeMs > OLD_ENOUGH_MS)) {
       console.log(
-        `[verify/status] Resuming sequential dispatch for run ${runId} (${pendingCount} pending)`,
+        `[verify/status] Resuming sequential dispatch for run ${runId} (${pendingCount} pending, ${terminalCount} terminal)`,
       );
       dispatchNextClaim(runId, origin, INTER_CLAIM_COOLDOWN_MS).catch((e) =>
         console.error('[verify/status] Failed to resume claim dispatch:', e),

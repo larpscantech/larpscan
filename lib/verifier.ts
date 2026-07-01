@@ -1226,13 +1226,11 @@ export async function verifyClaim(
     : path.join(process.cwd(), 'public', 'recordings');
   await fs.mkdir(recordingsDir, { recursive: true });
 
-  // WALLET_FLOW / TOKEN_CREATION claims get a larger session budget: they need
-  // to navigate to a create-token page, fill a multi-field form, and await a
-  // Solana transaction — all within a single Browserless session.  The Vercel
-  // maxDuration is 540 s, so cap just below that.
+  // Keep browser sessions well within the 4-min CLAIM_TIMEOUT_MS so the claim
+  // route has time to write results to DB before it's killed.
   const maxSessionMs = (effectiveFeature === 'WALLET_FLOW' || effectiveFeature === 'TOKEN_CREATION')
-    ? 510_000
-    : 450_000;
+    ? 210_000  // 3.5 min — wallet flows need more time for form fill + tx
+    : 180_000; // 3 min — UI/dashboard claims complete in < 2 min normally
 
   const recording = await recordInteraction(
     startUrl,

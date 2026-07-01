@@ -715,7 +715,7 @@ export default function DashboardPage() {
   ): Promise<boolean> => {
     setPhase('verifying');
 
-    const maxPollMs = 10 * 60 * 1000;
+    const maxPollMs = 20 * 60 * 1000;
     const pollStart = Date.now();
     let finalStatus: { claims: DbClaimWithEvidence[]; logs: { message: string }[] } | null = null;
     let dispatchRetried = false;

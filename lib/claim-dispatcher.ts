@@ -34,9 +34,9 @@ export const INTER_CLAIM_COOLDOWN_MS = 5_000;
 /**
  * How long a run may stay in `verifying` status before it's considered stale
  * for queue purposes. A crashed server could leave a run stuck in `verifying`.
- * Set generously: max claim duration (10 min) + recording/upload overhead.
+ * Set to 6 min: claim sessions are capped at ~5 min; anything longer is a zombie.
  */
-const STALE_VERIFYING_MS = 20 * 60 * 1000; // 20 min
+const STALE_VERIFYING_MS = 6 * 60 * 1000; // 6 min
 
 /** Returns the number of non-stale runs currently in `verifying` state. */
 export async function countActiveVerifyingRuns(): Promise<number> {

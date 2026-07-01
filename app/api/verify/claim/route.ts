@@ -9,13 +9,11 @@ import { getFastTrackVerdict, recordClaimResult } from '@/lib/platform-context';
 import type { DbClaim, DbProject, DbVerificationRun } from '@/lib/db-types';
 
 export const runtime = 'nodejs';
-export const maxDuration = 540; // Must exceed STUCK_CHECKING_MS (8 min = 480s) with overhead
+export const maxDuration = 300; // 5 min — Vercel Pro limit; must be < STUCK_CHECKING_MS (5 min)
 
-// Hard wall: abort the browser session well before Vercel kills the whole function.
-// Increased to 550s on local dev to allow TOKEN_CREATION enough time to:
-// - Retry through Browserless 429s / timeouts (up to 315s of retries)  
-// - Run the actual browser session (up to 370s session kill)
-const CLAIM_TIMEOUT_MS = 550_000;
+// Hard wall: abort the browser session before Vercel kills the function.
+// Set to 4 min so the claim can write results to DB before the 5-min Vercel kill.
+const CLAIM_TIMEOUT_MS = 240_000; // 4 min
 
 function summarizeBrowserFailure(error: unknown): string {
   const msg = error instanceof Error ? error.message : 'Unknown Playwright error';
@@ -51,6 +49,10 @@ export const POST = withErrorHandler(async (req: Request) => {
   if (!project?.website) return err('Project or website not found', 404);
 
   console.log(`[verify/claim] ══ ${claim.claim.slice(0, 60)} ══`);
+  // #region agent log
+  const _claimT0 = Date.now();
+  fetch('http://127.0.0.1:7488/ingest/1aa19189-3291-441a-aa5d-1b07eacb3a64',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'acd53a'},body:JSON.stringify({sessionId:'acd53a',location:'verify/claim:start',message:'claim-route-entered',data:{claimId,runId,feature_type:claim.feature_type,strategy:claim.verification_strategy},timestamp:Date.now(),hypothesisId:'H-C'})}).catch(()=>{});
+  // #endregion
 
   // ── Mark as checking if still pending, and record actual start time ───────
   await supabase.from('claims').update({ status: 'checking' }).eq('id', claimId).eq('status', 'pending');
@@ -85,6 +87,9 @@ export const POST = withErrorHandler(async (req: Request) => {
   };
 
   try {
+    // #region agent log
+    fetch('http://127.0.0.1:7488/ingest/1aa19189-3291-441a-aa5d-1b07eacb3a64',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'acd53a'},body:JSON.stringify({sessionId:'acd53a',location:'verify/claim:routeVerification',message:'browser-session-starting',data:{claimId,website:project.website,feature_type:claim.feature_type},timestamp:Date.now(),hypothesisId:'H-C'})}).catch(()=>{});
+    // #endregion
     verifyResult = await Promise.race([
       routeVerification(project.website, structuredClaim, project.contract_address),
       new Promise<never>((_, reject) =>
@@ -99,6 +104,9 @@ export const POST = withErrorHandler(async (req: Request) => {
     videoUrl          = verifyResult.videoUrl;
 
     if (videoUrl) console.log(`[verify/claim] Video: ${videoUrl}`);
+    // #region agent log
+    fetch('http://127.0.0.1:7488/ingest/1aa19189-3291-441a-aa5d-1b07eacb3a64',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'acd53a'},body:JSON.stringify({sessionId:'acd53a',location:'verify/claim:routeVerification',message:'browser-session-done',data:{claimId,elapsedMs:Date.now()-_claimT0,siteLoaded:verifyResult?.siteLoaded,blocked:verifyResult?.blocked},timestamp:Date.now(),hypothesisId:'H-C'})}).catch(()=>{});
+    // #endregion
 
     const lines = evidenceSummary.split('\n').filter(Boolean);
     for (const line of lines) {
@@ -120,6 +128,9 @@ export const POST = withErrorHandler(async (req: Request) => {
     console.error('[verify/claim] Playwright error:', e);
     evidenceSummary = summarizeBrowserFailure(e);
     await log(runId, evidenceSummary);
+    // #region agent log
+    fetch('http://127.0.0.1:7488/ingest/1aa19189-3291-441a-aa5d-1b07eacb3a64',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'acd53a'},body:JSON.stringify({sessionId:'acd53a',location:'verify/claim:catch',message:'browser-session-error',data:{claimId,error:(e instanceof Error?e.message:String(e)),elapsedMs:Date.now()-_claimT0},timestamp:Date.now(),hypothesisId:'H-D'})}).catch(()=>{});
+    // #endregion
   }
 
   // ── Two-layer verdict ─────────────────────────────────────────────────────
