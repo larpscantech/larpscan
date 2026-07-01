@@ -49,10 +49,7 @@ export const POST = withErrorHandler(async (req: Request) => {
   if (!project?.website) return err('Project or website not found', 404);
 
   console.log(`[verify/claim] ══ ${claim.claim.slice(0, 60)} ══`);
-  // #region agent log
   const _claimT0 = Date.now();
-  fetch('http://127.0.0.1:7488/ingest/1aa19189-3291-441a-aa5d-1b07eacb3a64',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'acd53a'},body:JSON.stringify({sessionId:'acd53a',location:'verify/claim:start',message:'claim-route-entered',data:{claimId,runId,feature_type:claim.feature_type,strategy:claim.verification_strategy},timestamp:Date.now(),hypothesisId:'H-C'})}).catch(()=>{});
-  // #endregion
 
   // ── Mark as checking if still pending, and record actual start time ───────
   await supabase.from('claims').update({ status: 'checking' }).eq('id', claimId).eq('status', 'pending');
@@ -87,9 +84,6 @@ export const POST = withErrorHandler(async (req: Request) => {
   };
 
   try {
-    // #region agent log
-    fetch('http://127.0.0.1:7488/ingest/1aa19189-3291-441a-aa5d-1b07eacb3a64',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'acd53a'},body:JSON.stringify({sessionId:'acd53a',location:'verify/claim:routeVerification',message:'browser-session-starting',data:{claimId,website:project.website,feature_type:claim.feature_type},timestamp:Date.now(),hypothesisId:'H-C'})}).catch(()=>{});
-    // #endregion
     verifyResult = await Promise.race([
       routeVerification(project.website, structuredClaim, project.contract_address),
       new Promise<never>((_, reject) =>
@@ -104,9 +98,7 @@ export const POST = withErrorHandler(async (req: Request) => {
     videoUrl          = verifyResult.videoUrl;
 
     if (videoUrl) console.log(`[verify/claim] Video: ${videoUrl}`);
-    // #region agent log
-    fetch('http://127.0.0.1:7488/ingest/1aa19189-3291-441a-aa5d-1b07eacb3a64',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'acd53a'},body:JSON.stringify({sessionId:'acd53a',location:'verify/claim:routeVerification',message:'browser-session-done',data:{claimId,elapsedMs:Date.now()-_claimT0,siteLoaded:verifyResult?.siteLoaded,blocked:verifyResult?.blocked},timestamp:Date.now(),hypothesisId:'H-C'})}).catch(()=>{});
-    // #endregion
+    console.log(`[verify/claim] Session done in ${Date.now() - _claimT0}ms`);
 
     const lines = evidenceSummary.split('\n').filter(Boolean);
     for (const line of lines) {
@@ -128,9 +120,6 @@ export const POST = withErrorHandler(async (req: Request) => {
     console.error('[verify/claim] Playwright error:', e);
     evidenceSummary = summarizeBrowserFailure(e);
     await log(runId, evidenceSummary);
-    // #region agent log
-    fetch('http://127.0.0.1:7488/ingest/1aa19189-3291-441a-aa5d-1b07eacb3a64',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'acd53a'},body:JSON.stringify({sessionId:'acd53a',location:'verify/claim:catch',message:'browser-session-error',data:{claimId,error:(e instanceof Error?e.message:String(e)),elapsedMs:Date.now()-_claimT0},timestamp:Date.now(),hypothesisId:'H-D'})}).catch(()=>{});
-    // #endregion
   }
 
   // ── Two-layer verdict ─────────────────────────────────────────────────────
