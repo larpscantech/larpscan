@@ -620,7 +620,7 @@ export default function DashboardPage() {
     if (SCANS_COMING_SOON) return;
     const trimmed = input.trim();
     const isCA  = isSolanaMintAddress(trimmed);
-    const isURL = /^https?:\/\/.+/i.test(trimmed);
+    const isURL = inputMode === 'website' ? trimmed.length > 2 : /^https?:\/\/.+/i.test(trimmed);
     if (!trimmed || (!isCA && !isURL)) return;
     if (phaseRef.current !== 'idle') return;
 
@@ -954,15 +954,19 @@ export default function DashboardPage() {
     console.log('  contract :', address);
     console.log('  timestamp:', new Date().toISOString());
 
-    const isUrlInput = /^https?:\/\//i.test(address);
+    // In URL mode, treat any input as a website URL — prepend https:// if missing
+    const isUrlInput = inputMode === 'website' || /^https?:\/\//i.test(address);
+    const normalizedAddress = isUrlInput && !/^https?:\/\//i.test(address)
+      ? `https://${address}`
+      : address;
 
     // ── PHASE 1 — Call orchestrate (server does discover + scrape + extract + dispatch)
     setPhase('extracting');
     addLog('Initializing verification job...');
     if (isUrlInput) {
-      addLog(`Scanning website: ${address}`);
+      addLog(`Scanning website: ${normalizedAddress}`);
     } else {
-      addLog(`Resolving mint: ${address.slice(0, 10)}...`);
+      addLog(`Resolving mint: ${normalizedAddress.slice(0, 10)}...`);
     }
 
     let orchResult: { runId: string; project: DbProject; status: 'started' | 'joined' | 'complete' };
@@ -975,8 +979,8 @@ export default function DashboardPage() {
         '/api/verify/orchestrate',
         '/api/verify/orchestrate',
         isUrlInput
-          ? { websiteUrl: address, forceReverify }
-          : { contractAddress: address, forceReverify },
+          ? { websiteUrl: normalizedAddress, forceReverify }
+          : { contractAddress: normalizedAddress, forceReverify },
       );
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Verification failed';
@@ -1001,10 +1005,10 @@ export default function DashboardPage() {
     if (typeof window !== 'undefined') {
       const url = new URL(window.location.href);
       if (isUrlInput) {
-        url.searchParams.set('url', address);
+        url.searchParams.set('url', normalizedAddress);
         url.searchParams.delete('ca');
       } else {
-        url.searchParams.set('ca', address);
+        url.searchParams.set('ca', normalizedAddress);
         url.searchParams.delete('url');
       }
       url.searchParams.set('runId', runId);
