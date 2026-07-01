@@ -79,6 +79,8 @@ Run `supabase/schema.sql` in your Supabase SQL editor.
 | `HELIUS_API_KEY` | No | Free tier — richer token metadata |
 | `X_BEARER_TOKEN` | No | Optional X scraping |
 | `INTERNAL_API_KEY` | Yes in prod | Free |
+| `ENABLE_VOICE_NARRATION` | No | Set to `true` to overlay AI voice commentary on verification videos |
+| `AGENT_VOICE` | No | OpenAI TTS voice for narration — `onyx` (default), `alloy`, `ash`, `ballad`, `coral`, `echo`, `fable`, `nova`, `sage`, `shimmer` |
 
 **Free to develop locally:** Supabase free tier + public Solana RPC + local Playwright (no Browserless).
 
