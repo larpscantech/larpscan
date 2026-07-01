@@ -1226,11 +1226,11 @@ export async function verifyClaim(
     : path.join(process.cwd(), 'public', 'recordings');
   await fs.mkdir(recordingsDir, { recursive: true });
 
-  // Keep browser sessions well within the 4-min CLAIM_TIMEOUT_MS so the claim
-  // route has time to write results to DB before it's killed.
+  // Keep browser sessions well within CLAIM_TIMEOUT_MS (7 min) so the claim
+  // route has time to write results to DB before Vercel kills at 8 min.
   const maxSessionMs = (effectiveFeature === 'WALLET_FLOW' || effectiveFeature === 'TOKEN_CREATION')
-    ? 210_000  // 3.5 min — wallet flows need more time for form fill + tx
-    : 180_000; // 3 min — UI/dashboard claims complete in < 2 min normally
+    ? 360_000  // 6 min — wallet flows need extra time for form fill + tx
+    : 300_000; // 5 min — UI/dashboard claims should complete within 5 min
 
   const recording = await recordInteraction(
     startUrl,

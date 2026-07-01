@@ -9,11 +9,11 @@ import { getFastTrackVerdict, recordClaimResult } from '@/lib/platform-context';
 import type { DbClaim, DbProject, DbVerificationRun } from '@/lib/db-types';
 
 export const runtime = 'nodejs';
-export const maxDuration = 300; // 5 min — Vercel Pro limit; must be < STUCK_CHECKING_MS (5 min)
+export const maxDuration = 480; // 8 min — must exceed CLAIM_TIMEOUT_MS + verdict/save overhead
 
-// Hard wall: abort the browser session before Vercel kills the function.
-// Set to 4 min so the claim can write results to DB before the 5-min Vercel kill.
-const CLAIM_TIMEOUT_MS = 240_000; // 4 min
+// Hard wall: abort the browser session and let the function write its verdict to DB.
+// Session max is 5 min; leave 2 min for LLM verdict + DB writes before Vercel kills at 8 min.
+const CLAIM_TIMEOUT_MS = 420_000; // 7 min
 
 function summarizeBrowserFailure(error: unknown): string {
   const msg = error instanceof Error ? error.message : 'Unknown Playwright error';

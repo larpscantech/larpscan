@@ -11,7 +11,7 @@ import {
 } from '@/lib/claim-dispatcher';
 import type { DbVerificationRun, DbAgentLog, DbClaimWithEvidence, DbProject } from '@/lib/db-types';
 
-const STUCK_CHECKING_MS = 5 * 60 * 1000; // 5 min — claim sessions timeout at ~4 min; stuck beyond this means the worker died
+const STUCK_CHECKING_MS = 10 * 60 * 1000; // 10 min — claim sessions timeout at ~7 min; stuck beyond this means the worker died
 
 function claimStartTimes(logs: DbAgentLog[]): Map<string, number> {
   const map = new Map<string, number>();
